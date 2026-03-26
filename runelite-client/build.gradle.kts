@@ -80,6 +80,7 @@ dependencies {
     api(libs.lwjgl.core)
     api(libs.lwjgl.opengl)
     api(libs.lwjgl.opencl)
+    api(libs.lwjgl.openxr)
 
     for (platform in listOf(
         "linux",
@@ -92,6 +93,17 @@ dependencies {
     )) {
         runtimeOnly(variantOf(libs.lwjgl.core) { classifier("natives-$platform") })
         runtimeOnly(variantOf(libs.lwjgl.opengl) { classifier("natives-$platform") })
+    }
+
+    // OpenXR has no macOS runtime; only include natives for supported platforms
+    for (platform in listOf(
+        "linux",
+        "linux-arm64",
+        "windows-x86",
+        "windows",
+        "windows-arm64",
+    )) {
+        runtimeOnly(variantOf(libs.lwjgl.openxr) { classifier("natives-$platform") })
     }
 
     testImplementation(libs.junit)

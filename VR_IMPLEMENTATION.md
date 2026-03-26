@@ -295,9 +295,9 @@ On macOS: OpenXR is not supported (no runtime).
 ## 11. Task List
 
 ### Phase 0 — Build setup
-- [ ] **T0.1** Add `lwjgl-openxr` to `libs.versions.toml`
-- [ ] **T0.2** Add OpenXR api + per-platform runtimeOnly natives to `runelite-client/build.gradle.kts`
-- [ ] **T0.3** Verify `./gradlew build` still passes after dep addition
+- [x] **T0.1** Add `lwjgl-openxr` to `libs.versions.toml` — Added `lwjgl-openxr = { module = "org.lwjgl:lwjgl-openxr", version.ref = "lwjgl" }` entry alongside existing lwjgl entries.
+- [x] **T0.2** Add OpenXR api + per-platform runtimeOnly natives to `runelite-client/build.gradle.kts` — Added `api(libs.lwjgl.openxr)` and a separate natives loop for non-macOS platforms (OpenXR has no macOS runtime).
+- [x] **T0.3** Verify `./gradlew build` still passes after dep addition — `:client:compileJava` builds successfully; `gradle/verification-metadata.xml` updated with sha256 checksums for all lwjgl-openxr artifacts.
 
 ### Phase 1 — Package scaffold
 - [ ] **T1.1** Create package `net.runelite.client.plugins.vrgpu`
@@ -368,6 +368,7 @@ On macOS: OpenXR is not supported (no runtime).
 
 ## 13. Out of Scope (Deliberately)
 
+- **Plugin Hub distribution** — `VrGpuPlugin` owns the OpenGL context and replaces the render loop entirely; Plugin Hub plugins run as guests inside an existing pipeline and cannot do this.
 - VR controller input — regular mouse is used
 - Locomotion / teleportation
 - First-person view
