@@ -189,6 +189,17 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Eye views located this frame; comes from xrContext.locateViews(). */
 	private XrView.Buffer vrViews;
 
+	/**
+	 * Number of VAOs in {@code vaoO} that were drawn (but not reset) during the
+	 * left-eye drawPass. Replayed and reset in the right-eye pass.
+	 */
+	private int vrPassOpaqueCount;
+	/**
+	 * Number of VAOs in {@code vaoPO} that were drawn (but not reset) during the
+	 * left-eye drawPass. Replayed and reset in the right-eye pass.
+	 */
+	private int vrPassPlayerCount;
+
 	private boolean lwjglInitted = false;
 	private GLCapabilities glCapabilities;
 
@@ -1112,6 +1123,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrAlphaZones.clear();
 			vrAlphaProjs.clear();
 			vrScene = scene;
+			vrPassOpaqueCount = 0;
+			vrPassPlayerCount = 0;
 
 			// Sample world anchor Y from initial eye height (once per session).
 			if (Float.isNaN(vrWorldAnchorY))
@@ -1329,6 +1342,28 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 
+			// Replay drawPass geometry: scene underlay tiles + opaque actors (NPCs, players).
+			// These were drawn but not reset during the left-eye drawPass; reset them here.
+			glUniform3i(uniBase, 0, 0, 0);
+			glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
+			for (int i = 0; i < vrPassOpaqueCount; i++)
+			{
+				vaoO.vaos.get(i).draw();
+				vaoO.vaos.get(i).reset();
+			}
+			vrPassOpaqueCount = 0;
+
+			if (vrPassPlayerCount > 0)
+			{
+				glDepthMask(false);
+				for (int i = 0; i < vrPassPlayerCount; i++) { vaoPO.vaos.get(i).draw(); }
+				glDepthMask(true);
+				glColorMask(false, false, false, false);
+				for (int i = 0; i < vrPassPlayerCount; i++) { vaoPO.vaos.get(i).draw(); vaoPO.vaos.get(i).reset(); }
+				glColorMask(true, true, true, true);
+				vrPassPlayerCount = 0;
+			}
+
 			// Replay alpha zones from left-eye pass (already sorted during left-eye pass)
 			vaoA.unmap();
 			for (int i = 0; i < vrAlphaZones.size(); i++)
@@ -1499,30 +1534,26 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				int sz = vaoO.unmap();
 				for (int i = 0; i < sz; ++i)
 				{
-					VAO vao = vaoO.vaos.get(i);
-					vao.draw();
-					vao.reset();
+					vaoO.vaos.get(i).draw();
+					if (!xrFrameStarted) { vaoO.vaos.get(i).reset(); }
 				}
+				if (xrFrameStarted) { vrPassOpaqueCount = sz; }
 
 				sz = vaoPO.unmap();
 				if (sz > 0)
 				{
 					glDepthMask(false);
-					for (int i = 0; i < sz; ++i)
-					{
-						VAO vao = vaoPO.vaos.get(i);
-						vao.draw();
-					}
+					for (int i = 0; i < sz; ++i) { vaoPO.vaos.get(i).draw(); }
 					glDepthMask(true);
 
 					glColorMask(false, false, false, false);
 					for (int i = 0; i < sz; ++i)
 					{
-						VAO vao = vaoPO.vaos.get(i);
-						vao.draw();
-						vao.reset();
+						vaoPO.vaos.get(i).draw();
+						if (!xrFrameStarted) { vaoPO.vaos.get(i).reset(); }
 					}
 					glColorMask(true, true, true, true);
+					if (xrFrameStarted) { vrPassPlayerCount = sz; }
 				}
 			}
 		}
