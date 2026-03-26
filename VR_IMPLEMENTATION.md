@@ -366,7 +366,20 @@ On macOS: OpenXR is not supported (no runtime).
 
 ---
 
-## 13. Out of Scope (Deliberately)
+## 13. Known Test Failures
+
+Running `./gradlew :client:test` will report some failures that are **not caused by VR changes**:
+
+| Test | Failure reason | Status |
+|---|---|---|
+| `SpecialCounterPluginTest` (3 tests) | Pre-existing bug in upstream RuneLite code | Ignore — fails on unmodified master too |
+| `EmojiPluginTest`, `ClientConfigLoaderTest`, `PluginManagerTest` (network tests) | Flaky network/TLS tests that only fail on a cold Gradle cache (`--rerun-tasks` or `clean`) | Ignore — pass on incremental runs and in isolation |
+
+**Rule of thumb:** a normal incremental run (`./gradlew :client:test` without `clean`) should show exactly **3 failures** (SpecialCounter). Any additional failures are worth investigating. A `clean` run may show up to ~9 additional flaky failures that are pre-existing.
+
+---
+
+## 14. Out of Scope (Deliberately)
 
 - **Plugin Hub distribution** — `VrGpuPlugin` owns the OpenGL context and replaces the render loop entirely; Plugin Hub plugins run as guests inside an existing pipeline and cannot do this.
 - VR controller input — regular mouse is used
