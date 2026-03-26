@@ -37,7 +37,7 @@ import net.runelite.client.plugins.vrgpu.config.UIScalingMode;
 @ConfigGroup(VrGpuPluginConfig.GROUP)
 public interface VrGpuPluginConfig extends Config
 {
-	String GROUP = "gpu";
+	String GROUP = "vrgpu";
 
 	@Range(
 		max = MAX_DISTANCE
