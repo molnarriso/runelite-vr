@@ -307,23 +307,21 @@ On macOS: OpenXR is not supported (no runtime).
 - [x] **T1.5** Verify it compiles and starts up as a normal (non-VR) GPU plugin clone — `:client:compileJava` BUILD SUCCESSFUL with zero errors.
 
 ### Phase 2 — OpenXR session management
-- [ ] **T2.1** Create `openxr/XrContext.java` — wraps instance, system, session lifecycle
-  - `init(long hglrc, long hdc)` — creates XR instance + session
-  - `destroy()`
-  - Extensions to request: `XR_KHR_opengl_enable`, optionally `XR_EXT_debug_utils`
-- [ ] **T2.2** Create `openxr/XrEyeSwapchain.java` — per-eye swapchain
-  - `init(XrSession, int width, int height, int format)`
-  - `acquireImage()` → returns FBO handle backed by current swapchain texture
-  - `releaseImage()`
-  - `destroy()`
-- [ ] **T2.3** Integrate XrContext into VrGpuPlugin.startUp() / shutDown()
-  - After `awtContext.createGLContext()`, call `xrContext.init(wglGetCurrentContext(), wglGetCurrentDC())`
-  - Create reference space (STAGE)
-  - Create per-eye swapchains using recommended view dimensions from XrViewConfigurationView
-- [ ] **T2.4** Add `xrWaitFrame` / `xrBeginFrame` / `xrEndFrame` skeleton to the draw loop
-- [ ] **T2.5** Handle session state changes (READY → SYNCHRONIZED → VISIBLE → FOCUSED → STOPPING)
+- [x] **T2.1** Create `openxr/XrContext.java` — wraps instance, system, session lifecycle — Full lifecycle implemented: `init(hglrc, hdc)` creates XR instance, gets HMD system, creates Win32 GL-bound session, creates STAGE reference space, queries per-eye recommended resolution; `pollEvents()` drives session state machine (READY→begin, STOPPING→end, EXITING→signal shutdown); `destroy()` tears down in reverse order.
+- [x] **T2.2** Create `openxr/XrEyeSwapchain.java` — per-eye swapchain — `init()` creates an `XrSwapchain`, enumerates GL texture names from the runtime, allocates one FBO per image (color = swapchain texture, depth = shared RBO), and validates each FBO; `acquireImage()` calls `xrAcquireSwapchainImage` + `xrWaitSwapchainImage` and returns the ready FBO; `releaseImage()` calls `xrReleaseSwapchainImage`; `destroy()` deletes FBOs, depth RBO, and the swapchain. Compiles successfully.
+- [x] **T2.3** Integrate XrContext into VrGpuPlugin.startUp() / shutDown() — After `GL.createCapabilities()`, calls `WGL.wglGetCurrentContext/DC()` and `xrContext.init()`, then creates both `XrEyeSwapchain`s at the recommended resolution; wraps everything in a try/catch so the plugin degrades gracefully to non-VR mode when no runtime is present. Cleanup via `destroyXr()` helper (swapchains first, then session/instance) is called inside the `lwjglInitted` block of `shutDown()`.
+- [x] **T2.4** Add `xrWaitFrame` / `xrBeginFrame` / `xrEndFrame` skeleton to the draw loop — `XrContext.beginXrFrame()` calls `xrWaitFrame`+`xrBeginFrame` and stores `pendingDisplayTime`; `endXrFrame()` calls `xrEndFrame` with no layers (compositor receives frames, headset shows nothing until T3.x). Both called from `VrGpuPlugin.draw()` guarded by `xrFrameStarted` flag.
+- [x] **T2.5** Handle session state changes (READY → SYNCHRONIZED → VISIBLE → FOCUSED → STOPPING) — `XrContext.pollEvents()` drives the state machine each frame: auto-calls `xrBeginSession` on READY, `xrEndSession` on STOPPING, returns `false` on EXITING/LOSS_PENDING which triggers plugin shutdown from `draw()`.
 
 ### Phase 3 — Stereo rendering
+
+> **2D menu / login screen:** When the game is not in `LOGGED_IN` state, `preSceneDraw` /
+> `drawZoneOpaque` / `drawZoneAlpha` are not called and `sceneFboValid` is false.
+> During this phase, continue submitting empty XR frames (no projection layers) — the
+> headset stays black and the player logs in using the desktop mirror window / mouse.
+> The stereo render path in T3.x must be guarded by `sceneFboValid` (already set only
+> when the 3D scene FBO has been drawn into).
+
 - [ ] **T3.1** Replace single `fboScene` with per-eye FBOs backed by XR swapchain images
 - [ ] **T3.2** In `preSceneDraw()` equivalent: loop over eyes, compute `worldProj[eye]` from:
   - XrFovf → perspective matrix (implement `Mat4.fromXrFov(XrFovf fov, float near, float far)`)

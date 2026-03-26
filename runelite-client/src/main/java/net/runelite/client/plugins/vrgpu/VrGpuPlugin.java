@@ -87,8 +87,11 @@ import static org.lwjgl.opengl.GL45C.GL_ZERO_TO_ONE;
 import static org.lwjgl.opengl.GL45C.glClipControl;
 import org.lwjgl.opengl.GLCapabilities;
 import org.lwjgl.opengl.GLUtil;
+import org.lwjgl.opengl.WGL;
 import org.lwjgl.system.Callback;
 import org.lwjgl.system.Configuration;
+import net.runelite.client.plugins.vrgpu.openxr.XrContext;
+import net.runelite.client.plugins.vrgpu.openxr.XrEyeSwapchain;
 
 @PluginDescriptor(
 	name = "VR GPU",
@@ -136,6 +139,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private Canvas canvas;
 	private AWTContext awtContext;
 	private Callback debugCallback;
+
+	/** OpenXR context — null if no VR runtime is available. */
+	private XrContext xrContext;
+	/** Per-eye swapchains — null if xrContext is null. Index 0 = left, 1 = right. */
+	private XrEyeSwapchain[] eyeSwapchains;
+	/** True between a successful beginXrFrame() and the matching endXrFrame() call. */
+	private boolean xrFrameStarted;
 
 	private boolean lwjglInitted = false;
 	private GLCapabilities glCapabilities;
@@ -273,6 +283,24 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	protected void startUp()
 	{
+		// Explicitly stop GPU plugin so the conflict is resolved immediately on
+		// every launch without relying on saved profile state.
+		pluginManager.getPlugins().stream()
+			.filter(p -> p.getClass().getSimpleName().equals("GpuPlugin"))
+			.findFirst()
+			.ifPresent(gpuPlugin ->
+			{
+				try
+				{
+					pluginManager.setPluginEnabled(gpuPlugin, false);
+					pluginManager.stopPlugin(gpuPlugin);
+				}
+				catch (PluginInstantiationException e)
+				{
+					log.warn("Could not stop GpuPlugin", e);
+				}
+			});
+
 		root = new SceneContext(NUM_ZONES, NUM_ZONES);
 		subs = new SceneContext[MAX_WORLDVIEWS];
 		clientUploader = new SceneUploader(renderCallbackManager);
@@ -347,6 +375,33 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				}
 
 				setupSyncMode();
+
+				// Initialise OpenXR. Fails gracefully if no runtime / headset is present
+				// so the plugin still works as a regular GPU plugin during development.
+				try
+				{
+					long hglrc = WGL.wglGetCurrentContext();
+					long hdc   = WGL.wglGetCurrentDC();
+					xrContext  = new XrContext();
+					xrContext.init(hglrc, hdc);
+
+					eyeSwapchains = new XrEyeSwapchain[2];
+					for (int eye = 0; eye < 2; eye++)
+					{
+						eyeSwapchains[eye] = new XrEyeSwapchain();
+						eyeSwapchains[eye].init(
+							xrContext.getSession(),
+							xrContext.getEyeWidth()[eye],
+							xrContext.getEyeHeight()[eye],
+							GL_RGBA8);
+					}
+					log.info("OpenXR initialised — VR rendering enabled");
+				}
+				catch (Exception e)
+				{
+					log.warn("OpenXR unavailable, running in non-VR mode: {}", e.getMessage());
+					destroyXr();
+				}
 
 				initBuffers();
 				initVao();
@@ -444,6 +499,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				shutdownVao();
 				shutdownBuffers();
 				shutdownFbo();
+				destroyXr();
 			}
 
 			if (awtContext != null)
@@ -789,6 +845,26 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			glDeleteRenderbuffers(rboDepthBuffer);
 			rboDepthBuffer = 0;
+		}
+	}
+
+	private void destroyXr()
+	{
+		if (eyeSwapchains != null)
+		{
+			for (XrEyeSwapchain sc : eyeSwapchains)
+			{
+				if (sc != null)
+				{
+					sc.destroy();
+				}
+			}
+			eyeSwapchains = null;
+		}
+		if (xrContext != null)
+		{
+			xrContext.destroy();
+			xrContext = null;
 		}
 	}
 
@@ -1407,6 +1483,34 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		// --- OpenXR frame lifecycle (T2.4 / T2.5) ---
+		xrFrameStarted = false;
+		if (xrContext != null)
+		{
+			if (!xrContext.pollEvents())
+			{
+				// Runtime signalled EXITING or LOSS_PENDING — stop the plugin.
+				SwingUtilities.invokeLater(() ->
+				{
+					try
+					{
+						pluginManager.stopPlugin(this);
+					}
+					catch (PluginInstantiationException ex)
+					{
+						log.error("error stopping plugin after XR exit", ex);
+					}
+				});
+				return;
+			}
+
+			if (xrContext.isSessionRunning())
+			{
+				xrContext.beginXrFrame();
+				xrFrameStarted = true;
+			}
+		}
+
 		final TextureProvider textureProvider = client.getTextureProvider();
 		if (textureArrayId == -1 && textureProvider != null)
 		{
@@ -1472,6 +1576,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		drawManager.processDrawComplete(this::screenshot);
 
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+
+		// Submit the XR frame (empty layers until T3.x adds stereo rendering).
+		if (xrFrameStarted)
+		{
+			xrContext.endXrFrame();
+			xrFrameStarted = false;
+		}
 
 		checkGLErrors();
 	}
