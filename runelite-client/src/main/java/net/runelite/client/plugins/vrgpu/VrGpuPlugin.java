@@ -1389,6 +1389,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					!close || (vrScene.getOverrideAmount() > 0));
 			}
 
+			// Cleanup temp alpha models deferred from left-eye PASS_ALPHA
+			for (int x = 0; x < root.sizeX; ++x)
+			{
+				for (int z = 0; z < root.sizeZ; ++z)
+				{
+					root.zones[x][z].removeTemp();
+				}
+			}
+
 			glDisable(GL_BLEND);
 			glCullFace(GL_BACK); // restore default before leaving VR render path
 			glDisable(GL_CULL_FACE);
@@ -1564,6 +1573,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		else if (pass == DrawCallbacks.PASS_ALPHA)
 		{
+			// In VR left-eye pass, defer removeTemp() so the right eye can still draw temp alpha models.
+			// For sub-scenes (non-TOPLEVEL) there is no right-eye replay, so clean up immediately.
+			if (xrFrameStarted && scene.getWorldViewId() == WorldView.TOPLEVEL)
+			{
+				return;
+			}
 			for (int x = 0; x < ctx.sizeX; ++x)
 			{
 				for (int z = 0; z < ctx.sizeZ; ++z)
