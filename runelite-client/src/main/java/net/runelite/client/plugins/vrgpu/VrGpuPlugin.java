@@ -1271,8 +1271,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glUniformBlockBinding(glProgram, uniBlockMain, 0);
 		glUniform1i(uniTextures, 1); // texture sampler array is bound to texture1
 
-		// Enable face culling
+		// Enable face culling.
+		// In VR mode the Y scale is negated, which reverses winding order for every
+		// triangle.  Switch to GL_FRONT so the rasterizer still discards the correct side.
 		glEnable(GL_CULL_FACE);
+		if (xrFrameStarted) { glCullFace(GL_FRONT); }
 
 		// Enable blending
 		glEnable(GL_BLEND);
@@ -1323,6 +1326,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glUniform4i(uniEntityTint, 0, 0, 0, 0);
 
 			glEnable(GL_CULL_FACE);
+			glCullFace(GL_FRONT); // Y-flip reverses winding; cull front to discard actual back faces
 			glEnable(GL_BLEND);
 			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
 			glDepthFunc(GL_GREATER);
@@ -1386,6 +1390,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			}
 
 			glDisable(GL_BLEND);
+			glCullFace(GL_BACK); // restore default before leaving VR render path
 			glDisable(GL_CULL_FACE);
 			glDisable(GL_DEPTH_TEST);
 			eyeSwapchains[1].releaseImage();
