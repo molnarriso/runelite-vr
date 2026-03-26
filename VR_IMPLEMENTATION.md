@@ -300,11 +300,11 @@ On macOS: OpenXR is not supported (no runtime).
 - [x] **T0.3** Verify `./gradlew build` still passes after dep addition — `:client:compileJava` builds successfully; `gradle/verification-metadata.xml` updated with sha256 checksums for all lwjgl-openxr artifacts.
 
 ### Phase 1 — Package scaffold
-- [ ] **T1.1** Create package `net.runelite.client.plugins.vrgpu`
-- [ ] **T1.2** Copy all files from `plugins/gpu/` into `plugins/vrgpu/` (rename GpuPlugin → VrGpuPlugin, GpuConfig → VrGpuConfig)
-- [ ] **T1.3** Update all internal package references in copied files
-- [ ] **T1.4** Add `@PluginDescriptor(name="VR GPU", conflicts="GPU")` to VrGpuPlugin
-- [ ] **T1.5** Verify it compiles and starts up as a normal (non-VR) GPU plugin clone
+- [x] **T1.1** Create package `net.runelite.client.plugins.vrgpu` — Package directory created as part of copying all GPU plugin files.
+- [x] **T1.2** Copy all files from `plugins/gpu/` into `plugins/vrgpu/` (rename GpuPlugin → VrGpuPlugin, GpuConfig → VrGpuConfig) — All 21 Java source files and 13 resource files copied; `GpuPlugin` → `VrGpuPlugin`, `GpuPluginConfig` → `VrGpuPluginConfig`.
+- [x] **T1.3** Update all internal package references in copied files — All `plugins.gpu` package declarations, imports, and static imports updated to `plugins.vrgpu`; body-level `GpuPlugin.*` references updated to `VrGpuPlugin.*`.
+- [x] **T1.4** Add `@PluginDescriptor(name="VR GPU", conflicts="GPU")` to VrGpuPlugin — Descriptor set with `name="VR GPU"`, `description="OpenXR VR rendering — replaces GPU Plugin"`, `conflicts="GPU"`.
+- [x] **T1.5** Verify it compiles and starts up as a normal (non-VR) GPU plugin clone — `:client:compileJava` BUILD SUCCESSFUL with zero errors.
 
 ### Phase 2 — OpenXR session management
 - [ ] **T2.1** Create `openxr/XrContext.java` — wraps instance, system, session lifecycle
