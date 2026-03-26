@@ -190,6 +190,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private XrView.Buffer vrViews;
 
 	/**
+	 * Projection built from the left VR eye pose each frame, used by the face-priority sorter
+	 * in drawTemp/drawDynamic so that player models are backface-culled relative to the VR
+	 * camera direction rather than the fixed OSRS 2D camera direction.
+	 */
+	private Projection vrSorterProjection;
+
+	/**
 	 * Number of VAOs in {@code vaoO} that were drawn (but not reset) during the
 	 * left-eye drawPass. Replayed and reset in the right-eye pass.
 	 */
@@ -1039,6 +1046,104 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		};
 	}
 
+	/**
+	 * Build a {@link Projection} for the face-priority sorter that uses the VR eye's view
+	 * direction rather than the OSRS 2D camera direction.
+	 * <p>
+	 * The sorter uses {@code project()} to:
+	 * <ol>
+	 *   <li>Clip vertices behind the camera ({@code p[2] < 50}).</li>
+	 *   <li>Compute 2D positions ({@code p[0]/p[2]}, {@code p[1]/p[2]}) for a cross-product
+	 *       winding test that decides which faces are front-facing.</li>
+	 *   <li>Sort faces by depth ({@code p[2] - zero}).</li>
+	 * </ol>
+	 * Returns {@code [clipX, -clipY, clipW / DEFAULT_WORLD_SCALE]}:
+	 * <ul>
+	 *   <li>clipX/clipY come from the VR eye perspective transform.</li>
+	 *   <li>Y is negated to restore CCW-front convention after the Y-scale flip
+	 *       (same reason we use {@code glCullFace(GL_FRONT)} in VR mode).</li>
+	 *   <li>clipW (view-space depth in VR metres) is divided by the world scale
+	 *       to convert back to OSRS units so that the {@code > 50} clip threshold holds.</li>
+	 * </ul>
+	 */
+	private Projection buildVrSorterProjection(int eye)
+	{
+		XrView view = vrViews.get(eye);
+		XrPosef pose = view.pose();
+		XrFovf fov = view.fov();
+
+		float qx = pose.orientation().x();
+		float qy = pose.orientation().y();
+		float qz = pose.orientation().z();
+		float qw = pose.orientation().w();
+		float px = pose.position$().x();
+		float py = pose.position$().y();
+		float pz = pose.position$().z();
+
+		// R^T rows (view rotation matrix, same derivation as buildInvEyePose)
+		final float r00 = 1 - 2 * (qy * qy + qz * qz);
+		final float r01 = 2 * (qx * qy + qw * qz);
+		final float r02 = 2 * (qx * qz - qw * qy);
+		final float r10 = 2 * (qx * qy - qw * qz);
+		final float r11 = 1 - 2 * (qx * qx + qz * qz);
+		final float r12 = 2 * (qy * qz + qw * qx);
+		final float r20 = 2 * (qx * qz + qw * qy);
+		final float r21 = 2 * (qy * qz - qw * qx);
+		final float r22 = 1 - 2 * (qx * qx + qy * qy);
+
+		// Translation t = -R^T * eyePos
+		final float tx = -(r00 * px + r01 * py + r02 * pz);
+		final float ty = -(r10 * px + r11 * py + r12 * pz);
+		final float tz = -(r20 * px + r21 * py + r22 * pz);
+
+		// Asymmetric perspective scale/offset from FOV angles
+		float tanL = (float) Math.tan(fov.angleLeft());
+		float tanR = (float) Math.tan(fov.angleRight());
+		float tanU = (float) Math.tan(fov.angleUp());
+		float tanD = (float) Math.tan(fov.angleDown());
+		final float a = 2f / (tanR - tanL);
+		final float b = (tanR + tanL) / (tanR - tanL);
+		final float c = 2f / (tanU - tanD);
+		final float d = (tanU + tanD) / (tanU - tanD);
+
+		final float s = DEFAULT_WORLD_SCALE;
+		final float oy = vrWorldAnchorY;
+		final float oz = -1.5f;
+		final float camX = root.cameraX;
+		final float camY = root.cameraY;
+		final float camZ = root.cameraZ;
+
+		return new Projection()
+		{
+			@Override
+			public float[] project(float wx, float wy, float wz)
+			{
+				return project(wx, wy, wz, new float[3]);
+			}
+
+			@Override
+			public float[] project(float wx, float wy, float wz, float[] out)
+			{
+				// Translate by -camera, scale (OSRS→VR metres, Y-flip), add world offset
+				float vx = (wx - camX) * s;
+				float vy = -(wy - camY) * s + oy;
+				float vz = (wz - camZ) * s + oz;
+
+				// View rotation R^T + translation → eye space
+				float ex = r00 * vx + r01 * vy + r02 * vz + tx;
+				float ey = r10 * vx + r11 * vy + r12 * vz + ty;
+				float ez = r20 * vx + r21 * vy + r22 * vz + tz;
+
+				// Perspective: clip_w = -ez (positive for front objects, camera looks -Z)
+				float clipW = -ez;
+				out[0] = a * ex + b * ez;  // clip_x
+				out[1] = c * ey + d * ez;  // clip_y: Y-up, consistent with worldProjection
+				out[2] = clipW / s;        // depth in OSRS units (so >50 clip test holds)
+				return out;
+			}
+		};
+	}
+
 	// -------------------------------------------------------------------------
 
 	static void updateEntityProjection(Projection projection)
@@ -1133,6 +1238,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				vrWorldAnchorY = initialEyeY - 0.7f;
 				log.info("VR world anchor Y set to {} (eyeY={} - 0.7)", vrWorldAnchorY, initialEyeY);
 			}
+
+			// Build sorter projection after vrWorldAnchorY is guaranteed non-NaN.
+			vrSorterProjection = buildVrSorterProjection(0);
 
 			vrLeftEyeFbo = eyeSwapchains[0].acquireImage();
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, vrLeftEyeFbo);
@@ -1670,9 +1778,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 			int start = a.vbo.vb.position();
 			m.calculateBoundsCylinder();
+			// In VR mode use the VR eye's projection for face sorting/culling instead of the
+			// OSRS 2D camera projection, which only shows faces visible from one fixed direction.
+			Projection sortProj = xrFrameStarted ? vrSorterProjection : worldProjection;
 			try
 			{
-				facePrioritySorter.uploadSortedModel(worldProjection, m, orient, x, y, z, o.vbo.vb, a.vbo.vb);
+				facePrioritySorter.uploadSortedModel(sortProj, m, orient, x, y, z, o.vbo.vb, a.vbo.vb);
 			}
 			catch (Exception ex)
 			{
