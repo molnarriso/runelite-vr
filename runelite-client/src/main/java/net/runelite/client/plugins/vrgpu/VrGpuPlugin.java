@@ -1045,7 +1045,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float cameraX, float cameraY, float cameraZ, float cameraPitch, float cameraYaw,
 		int minLevel, int level, int maxLevel, Set<Integer> hideRoofIds)
 	{
-		log.info("preSceneDraw: worldViewId={}", scene.getWorldViewId());
 		SceneContext ctx = context(scene);
 		if (ctx != null)
 		{
@@ -1103,7 +1102,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int viewportHeight = client.getViewportHeight();
 		final int viewportWidth = client.getViewportWidth();
 
-		log.info("preSceneDrawToplevel: xrFrameStarted={}", xrFrameStarted);
 		if (xrFrameStarted)
 		{
 			// VR path — left eye setup (T3.1)
@@ -1898,7 +1896,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// xrWaitFrame inside beginXrFrame will pace us to the display rate.
 		if (xrContext != null && xrContext.isSessionRunning())
 		{
-			log.info("draw: beginXrFrame for next frame");
 			xrContext.beginXrFrame();
 			xrFrameStarted = true;
 		}
