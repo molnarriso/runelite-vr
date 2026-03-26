@@ -6,6 +6,15 @@
 
 ---
 
+## 0. Working Conventions
+
+> **NEVER commit without explicit permission from the user.**
+> The user must say something like "commit this", "let's commit", or "commit for now" in that specific message.
+> A previous commit approval does NOT carry forward. Ask every single time.
+> Write the code and stop. Do not commit speculatively, after fixes, or after "successful" changes.
+
+---
+
 ## 1. Vision
 
 RuneLite VR renders Old School RuneScape as a **mixed-reality tabletop experience**.
