@@ -322,15 +322,11 @@ On macOS: OpenXR is not supported (no runtime).
 > The stereo render path in T3.x must be guarded by `sceneFboValid` (already set only
 > when the 3D scene FBO has been drawn into).
 
-- [ ] **T3.1** Replace single `fboScene` with per-eye FBOs backed by XR swapchain images
-- [ ] **T3.2** In `preSceneDraw()` equivalent: loop over eyes, compute `worldProj[eye]` from:
-  - XrFovf → perspective matrix (implement `Mat4.fromXrFov(XrFovf fov, float near, float far)`)
-  - XrPosef eye pose → view matrix (implement `Mat4.fromXrPose(XrPosef pose)` as inverse pose matrix)
-  - WorldAnchor matrix from config (scale × rotateY(worldYaw) × translate(worldOffset))
-  - Final: `worldProj = perspectiveMatrix × viewMatrix × worldAnchor`
-- [ ] **T3.3** Call `drawZoneOpaque` + `drawZoneAlpha` once per eye with correct `worldProj`
-- [ ] **T3.4** Extract approximate OSRS-space camera position from eye pose for UBO (fog)
-- [ ] **T3.5** Blit left eye to AWT canvas in `draw()` for desktop mirror
+- [x] **T3.1** Replace single `fboScene` with per-eye FBOs backed by XR swapchain images — In `preSceneDrawToplevel()`, when `xrFrameStarted`, call `xrContext.locateViews()` then `eyeSwapchains[0].acquireImage()` and bind the left-eye FBO instead of `fboScene`; the right-eye pass is driven from `postDrawToplevel()` by replaying all recorded zone draws into `eyeSwapchains[1]`.
+- [x] **T3.2** Per-eye projection matrix from XrFovf + XrPosef + WorldAnchor — `buildVrProjection(XrFovf, near)` builds an asymmetric perspective compatible with the OSRS hyperbolic depth convention (clip_w = -z, GL_GREATER + clearDepth=0); `buildInvEyePose(XrPosef)` computes R^T × Translate(-p) from the quaternion; `computeVrWorldProj(eye)` chains Projection × InvPose × Scale(worldScale) × Translate(-cam).
+- [x] **T3.3** Double-draw zone geometry once per eye — Left eye uses normal engine callbacks (drawZoneOpaque/Alpha) which also record zone coords+projections; right-eye pass in `postDrawToplevel()` replays `renderOpaque` and `renderAlpha` on the stored zones with the right-eye worldProj uniform.
+- [x] **T3.4** Camera UBO for fog — OSRS camera position (cameraX/Y/Z set in UBO by the preSceneDrawToplevel call) is reused for both eyes; IPD difference (~3 cm) is negligible relative to the fog draw-distance (tiles × 128 units).
+- [x] **T3.5** Desktop mirror — In `postDrawToplevel()`, after the right-eye pass, `glBlitFramebuffer` copies the left-eye swapchain FBO to the AWT default framebuffer (DPI-scaled to canvas size) before releasing the left-eye image; `draw()` skips the old `blitSceneFbo()` in VR mode and calls `endXrFrameStereo()` which submits the proper `XrCompositionLayerProjection` with both eye swapchains and located views.
 
 ### Phase 4 — World anchor config
 - [ ] **T4.1** Add worldScale, worldOffsetX/Y/Z, worldYaw config items to VrGpuConfig

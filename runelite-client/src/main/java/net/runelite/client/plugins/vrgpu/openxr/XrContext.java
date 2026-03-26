@@ -151,6 +151,11 @@ public class XrContext
 	 */
 	public void destroy()
 	{
+		if (views != null)
+		{
+			views.free();
+			views = null;
+		}
 		if (sessionRunning)
 		{
 			checkXr("xrEndSession (destroy)", xrEndSession(session));
@@ -265,8 +270,7 @@ public class XrContext
 
 	/**
 	 * Signal frame end to the compositor with no projection layers.
-	 * This is the T2.4 skeleton — T3.x will replace the empty layer list
-	 * with a real {@code XrCompositionLayerProjection}.
+	 * Used when the 3D scene has not been rendered (e.g. login screen).
 	 */
 	public void endXrFrame()
 	{
@@ -276,7 +280,85 @@ public class XrContext
 				.type(XR_TYPE_FRAME_END_INFO)
 				.displayTime(pendingDisplayTime)
 				.environmentBlendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
-			// no layers — headset shows nothing until T3.x
+			checkXr("xrEndFrame", xrEndFrame(session, endInfo));
+		}
+	}
+
+	/**
+	 * Locate both eye views (pose + FOV) for the current frame into {@link #views}.
+	 * Must be called after {@link #beginXrFrame()} and before rendering each eye.
+	 * The returned buffer is reused each frame — do not hold a reference across frames.
+	 *
+	 * @return 2-element buffer with left (index 0) and right (index 1) eye views
+	 */
+	public XrView.Buffer locateViews()
+	{
+		if (views == null)
+		{
+			views = XrView.calloc(2);
+			views.get(0).type(XR_TYPE_VIEW);
+			views.get(1).type(XR_TYPE_VIEW);
+		}
+		try (MemoryStack stack = stackPush())
+		{
+			XrViewLocateInfo locateInfo = XrViewLocateInfo.calloc(stack)
+				.type(XR_TYPE_VIEW_LOCATE_INFO)
+				.viewConfigurationType(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+				.displayTime(pendingDisplayTime)
+				.space(stageSpace);
+			XrViewState viewState = XrViewState.calloc(stack)
+				.type(XR_TYPE_VIEW_STATE);
+			IntBuffer viewCount = stack.mallocInt(1);
+			checkXr("xrLocateViews",
+				xrLocateViews(session, locateInfo, viewState, viewCount, views));
+		}
+		views.position(0);
+		return views;
+	}
+
+	/**
+	 * Signal frame end to the compositor with a stereo projection layer.
+	 * Must be called after both eye swapchain images have been released.
+	 *
+	 * @param locatedViews  the 2-element view buffer from {@link #locateViews()}
+	 * @param leftSwapchain XrSwapchain handle for the left eye
+	 * @param rightSwapchain XrSwapchain handle for the right eye
+	 */
+	public void endXrFrameStereo(XrView.Buffer locatedViews,
+		XrSwapchain leftSwapchain, XrSwapchain rightSwapchain)
+	{
+		try (MemoryStack stack = stackPush())
+		{
+			XrCompositionLayerProjectionView.Buffer projViews =
+				XrCompositionLayerProjectionView.calloc(2, stack);
+
+			for (int i = 0; i < 2; i++)
+			{
+				XrSwapchain sc = (i == 0) ? leftSwapchain : rightSwapchain;
+				int w = eyeWidth[i];
+				int h = eyeHeight[i];
+				XrCompositionLayerProjectionView pv = projViews.get(i);
+				pv.type(XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW)
+					.pose(locatedViews.get(i).pose())
+					.fov(locatedViews.get(i).fov());
+				pv.subImage().swapchain(sc);
+				pv.subImage().imageRect().offset().x(0).y(0);
+				pv.subImage().imageRect().extent().width(w).height(h);
+			}
+
+			XrCompositionLayerProjection layer = XrCompositionLayerProjection.calloc(stack)
+				.type(XR_TYPE_COMPOSITION_LAYER_PROJECTION)
+				.space(stageSpace)
+				.views(projViews);
+
+			PointerBuffer layers = stack.pointers(layer.address());
+
+			XrFrameEndInfo endInfo = XrFrameEndInfo.calloc(stack)
+				.type(XR_TYPE_FRAME_END_INFO)
+				.displayTime(pendingDisplayTime)
+				.environmentBlendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+				.layers(layers);
+
 			checkXr("xrEndFrame", xrEndFrame(session, endInfo));
 		}
 	}

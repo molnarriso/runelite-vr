@@ -37,7 +37,9 @@ import java.awt.image.DataBufferInt;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -88,6 +90,9 @@ import static org.lwjgl.opengl.GL45C.glClipControl;
 import org.lwjgl.opengl.GLCapabilities;
 import org.lwjgl.opengl.GLUtil;
 import org.lwjgl.opengl.WGL;
+import org.lwjgl.openxr.XrFovf;
+import org.lwjgl.openxr.XrPosef;
+import org.lwjgl.openxr.XrView;
 import org.lwjgl.system.Callback;
 import org.lwjgl.system.Configuration;
 import net.runelite.client.plugins.vrgpu.openxr.XrContext;
@@ -146,6 +151,43 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private XrEyeSwapchain[] eyeSwapchains;
 	/** True between a successful beginXrFrame() and the matching endXrFrame() call. */
 	private boolean xrFrameStarted;
+
+	// --- Stereo rendering state (T3.x) ---
+
+	/**
+	 * Default world scale: meters per OSRS local unit.
+	 * 1 tile = 128 units ≈ 0.1 m → 0.1 / 128 ≈ 0.000781.
+	 */
+	private static final float DEFAULT_WORLD_SCALE = 0.000781f;
+
+	/**
+	 * Stage-space Y of the world anchor (where the OSRS camera maps to).
+	 * Sampled once from the first VR frame as (initialEyeY - 0.7 m).
+	 * NaN until that first frame runs.
+	 */
+	private float vrWorldAnchorY = Float.NaN;
+
+	/** Which eye is currently being rendered: 0 = left, 1 = right, -1 = no VR. */
+	private int currentEye = -1;
+
+	/** FBO handle acquired for the left eye this frame (valid until releaseImage). */
+	private int vrLeftEyeFbo;
+
+	/** Opaque zone coords [zx, zz] recorded during the left-eye pass. */
+	private final List<int[]> vrOpaqueZones = new ArrayList<>(256);
+	/** Entity projections parallel to {@link #vrOpaqueZones}. */
+	private final List<Projection> vrOpaqueProjs = new ArrayList<>(256);
+
+	/** Alpha zone coords [level, zx, zz] recorded during the left-eye pass. */
+	private final List<int[]> vrAlphaZones = new ArrayList<>(256);
+	/** Entity projections parallel to {@link #vrAlphaZones}. */
+	private final List<Projection> vrAlphaProjs = new ArrayList<>(256);
+
+	/** Toplevel scene saved during preSceneDrawToplevel, used in the right-eye replay. */
+	private Scene vrScene;
+
+	/** Eye views located this frame; comes from xrContext.locateViews(). */
+	private XrView.Buffer vrViews;
 
 	private boolean lwjglInitted = false;
 	private GLCapabilities glCapabilities;
@@ -866,7 +908,127 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			xrContext.destroy();
 			xrContext = null;
 		}
+		vrWorldAnchorY = Float.NaN;
 	}
+
+	// -------------------------------------------------------------------------
+	// VR helper methods (T3.2)
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Compute the worldProj matrix for the given eye from the located XrView.
+	 * <p>
+	 * The chain is: VrProjection(fov) × InvEyePose × Scale(worldScale) × Translate(-cam)
+	 * <p>
+	 * This maps OSRS local-unit world coordinates to OpenXR clip space using
+	 * the OSRS hyperbolic depth convention (clip_w = -z_eye, clearDepth=0, GL_GREATER).
+	 *
+	 * @param eye 0 = left, 1 = right
+	 */
+	private float[] computeVrWorldProj(int eye)
+	{
+		XrView view = vrViews.get(eye);
+
+		// World anchor: fixed in stage space so head tracking gives correct parallax.
+		// vrWorldAnchorY is sampled from the initial eye height on the first VR frame.
+		// X=0 (stage centre), Z=-1.5m (1.5 m in front of stage origin).
+		// OSRS Y increases downward, so the Y scale is negated to flip it upright.
+		float worldOffsetX = 0;
+		float worldOffsetY = vrWorldAnchorY;  // set once from initial eye height - 0.7 m
+		float worldOffsetZ = -1.5f;
+
+		// Chain: Proj × InvEyePose × Translate(worldOffset) × Scale(s,-s,s) × Translate(-cam)
+		float[] proj = buildVrProjection(view.fov(), 0.05f);
+		Mat4.mul(proj, buildInvEyePose(view.pose()));
+		Mat4.mul(proj, Mat4.translate(worldOffsetX, worldOffsetY, worldOffsetZ));
+		Mat4.mul(proj, Mat4.scale(DEFAULT_WORLD_SCALE, -DEFAULT_WORLD_SCALE, DEFAULT_WORLD_SCALE));
+		Mat4.mul(proj, Mat4.translate(-root.cameraX, -root.cameraY, -root.cameraZ));
+		return proj;
+	}
+
+	/**
+	 * Build an asymmetric perspective projection matrix compatible with the OSRS depth
+	 * convention.
+	 * <p>
+	 * Input: OpenXR eye space (X right, Y up, Z backward; z &lt; 0 for front objects).
+	 * Output: clip space where clip_w = -z (positive for front objects), enabling
+	 * GL_GREATER depth with clearDepth=0.
+	 *
+	 * @param fov  XrFovf with angleLeft/Right/Up/Down in radians
+	 * @param near near plane distance in meters (e.g. 0.05)
+	 */
+	private static float[] buildVrProjection(XrFovf fov, float near)
+	{
+		float tanL = (float) Math.tan(fov.angleLeft());   // negative
+		float tanR = (float) Math.tan(fov.angleRight());  // positive
+		float tanU = (float) Math.tan(fov.angleUp());     // positive
+		float tanD = (float) Math.tan(fov.angleDown());   // negative
+
+		float a = 2.0f / (tanR - tanL);                          // x scale
+		float b = (tanR + tanL) / (tanR - tanL);                 // x asymmetric offset
+		float c = 2.0f / (tanU - tanD);                          // y scale
+		float d = (tanU + tanD) / (tanU - tanD);                 // y asymmetric offset
+		float n2 = 2.0f * near;                                  // 2*near for clip_z
+
+		// Column-major 4×4 (columns stored contiguously).
+		// clip = M * [x, y, z, 1]:
+		//   clip_x = a*x + b*z     → ndc_x in [-1,1] across angleLeft..angleRight
+		//   clip_y = c*y + d*z     → ndc_y in [-1,1] across angleDown..angleUp  (Y-up)
+		//   clip_z = 2n            → constant; gives hyperbolic depth ndc_z = 2n/(-z)
+		//   clip_w = -z            → positive for front objects (z < 0 in OpenXR)
+		return new float[]{
+			a,  0,  0,  0,   // col 0
+			0,  c,  0,  0,   // col 1
+			b,  d,  0, -1,   // col 2
+			0,  0, n2,  0,   // col 3
+		};
+	}
+
+	/**
+	 * Build the inverse-pose view matrix from an XrPosef.
+	 * <p>
+	 * InvPose = R^T × Translate(-position), stored column-major for OpenGL.
+	 *
+	 * @param pose eye pose in stage space
+	 */
+	private static float[] buildInvEyePose(XrPosef pose)
+	{
+		// Quaternion components
+		float qx = pose.orientation().x();
+		float qy = pose.orientation().y();
+		float qz = pose.orientation().z();
+		float qw = pose.orientation().w();
+		// Eye position
+		float px = pose.position$().x();
+		float py = pose.position$().y();
+		float pz = pose.position$().z();
+
+		// Build rotation matrix R from unit quaternion
+		float r00 = 1 - 2 * (qy * qy + qz * qz);
+		float r01 = 2 * (qx * qy + qw * qz);
+		float r02 = 2 * (qx * qz - qw * qy);
+		float r10 = 2 * (qx * qy - qw * qz);
+		float r11 = 1 - 2 * (qx * qx + qz * qz);
+		float r12 = 2 * (qy * qz + qw * qx);
+		float r20 = 2 * (qx * qz + qw * qy);
+		float r21 = 2 * (qy * qz - qw * qx);
+		float r22 = 1 - 2 * (qx * qx + qy * qy);
+
+		// t = -(R^T * p).  With code's r_ab = R^T[a][b], row a of R^T = (r_a0, r_a1, r_a2).
+		float tx = -(r00 * px + r01 * py + r02 * pz);
+		float ty = -(r10 * px + r11 * py + r12 * pz);
+		float tz = -(r20 * px + r21 * py + r22 * pz);
+
+		// Column-major R^T: col j = (R^T[0][j], R^T[1][j], R^T[2][j]) = (r0j, r1j, r2j).
+		return new float[]{
+			r00, r10, r20, 0,   // col 0
+			r01, r11, r21, 0,   // col 1
+			r02, r12, r22, 0,   // col 2
+			tx,  ty,  tz,  1,   // col 3
+		};
+	}
+
+	// -------------------------------------------------------------------------
 
 	static void updateEntityProjection(Projection projection)
 	{
@@ -883,6 +1045,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float cameraX, float cameraY, float cameraZ, float cameraPitch, float cameraYaw,
 		int minLevel, int level, int maxLevel, Set<Integer> hideRoofIds)
 	{
+		log.info("preSceneDraw: worldViewId={}", scene.getWorldViewId());
 		SceneContext ctx = context(scene);
 		if (ctx != null)
 		{
@@ -940,8 +1103,32 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int viewportHeight = client.getViewportHeight();
 		final int viewportWidth = client.getViewportWidth();
 
-		// Setup FBO and anti-aliasing
+		log.info("preSceneDrawToplevel: xrFrameStarted={}", xrFrameStarted);
+		if (xrFrameStarted)
 		{
+			// VR path — left eye setup (T3.1)
+			vrViews = xrContext.locateViews();
+			currentEye = 0;
+			vrOpaqueZones.clear();
+			vrOpaqueProjs.clear();
+			vrAlphaZones.clear();
+			vrAlphaProjs.clear();
+			vrScene = scene;
+
+			// Sample world anchor Y from initial eye height (once per session).
+			if (Float.isNaN(vrWorldAnchorY))
+			{
+				float initialEyeY = vrViews.get(0).pose().position$().y();
+				vrWorldAnchorY = initialEyeY - 0.7f;
+				log.info("VR world anchor Y set to {} (eyeY={} - 0.7)", vrWorldAnchorY, initialEyeY);
+			}
+
+			vrLeftEyeFbo = eyeSwapchains[0].acquireImage();
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, vrLeftEyeFbo);
+		}
+		else
+		{
+			// Desktop path — setup FBO and anti-aliasing
 			final AntiAliasingMode antiAliasingMode = config.antiAliasingMode();
 			final Dimension stretchedDimensions = client.getStretchedDimensions();
 
@@ -990,32 +1177,40 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		// Setup viewport
-		int renderWidthOff = client.getViewportXOffset();
-		int renderHeightOff = client.getViewportYOffset();
-		int renderCanvasHeight = canvasHeight;
-		int renderViewportHeight = viewportHeight;
-		int renderViewportWidth = viewportWidth;
-		if (client.isStretchedEnabled())
+		if (xrFrameStarted)
 		{
-			Dimension dim = client.getStretchedDimensions();
-			renderCanvasHeight = dim.height;
-
-			double scaleFactorY = dim.getHeight() / canvasHeight;
-			double scaleFactorX = dim.getWidth() / canvasWidth;
-
-			// Pad the viewport a little because having ints for our viewport dimensions can introduce off-by-one errors.
-			final int padding = 1;
-
-			// Ceil the sizes because even if the size is 599.1 we want to treat it as size 600 (i.e. render to the x=599 pixel).
-			renderViewportHeight = (int) Math.ceil(scaleFactorY * (renderViewportHeight)) + padding * 2;
-			renderViewportWidth = (int) Math.ceil(scaleFactorX * (renderViewportWidth)) + padding * 2;
-
-			// Floor the offsets because even if the offset is 4.9, we want to render to the x=4 pixel anyway.
-			renderHeightOff = (int) Math.floor(scaleFactorY * (renderHeightOff)) - padding;
-			renderWidthOff = (int) Math.floor(scaleFactorX * (renderWidthOff)) - padding;
+			// VR: render to full left-eye swapchain resolution
+			glViewport(0, 0, eyeSwapchains[0].getWidth(), eyeSwapchains[0].getHeight());
 		}
+		else
+		{
+			int renderWidthOff = client.getViewportXOffset();
+			int renderHeightOff = client.getViewportYOffset();
+			int renderCanvasHeight = canvasHeight;
+			int renderViewportHeight = viewportHeight;
+			int renderViewportWidth = viewportWidth;
+			if (client.isStretchedEnabled())
+			{
+				Dimension dim = client.getStretchedDimensions();
+				renderCanvasHeight = dim.height;
 
-		glDpiAwareViewport(renderWidthOff, renderCanvasHeight - renderViewportHeight - renderHeightOff, renderViewportWidth, renderViewportHeight);
+				double scaleFactorY = dim.getHeight() / canvasHeight;
+				double scaleFactorX = dim.getWidth() / canvasWidth;
+
+				// Pad the viewport a little because having ints for our viewport dimensions can introduce off-by-one errors.
+				final int padding = 1;
+
+				// Ceil the sizes because even if the size is 599.1 we want to treat it as size 600 (i.e. render to the x=599 pixel).
+				renderViewportHeight = (int) Math.ceil(scaleFactorY * (renderViewportHeight)) + padding * 2;
+				renderViewportWidth = (int) Math.ceil(scaleFactorX * (renderViewportWidth)) + padding * 2;
+
+				// Floor the offsets because even if the offset is 4.9, we want to render to the x=4 pixel anyway.
+				renderHeightOff = (int) Math.floor(scaleFactorY * (renderHeightOff)) - padding;
+				renderWidthOff = (int) Math.floor(scaleFactorX * (renderWidthOff)) - padding;
+			}
+
+			glDpiAwareViewport(renderWidthOff, renderCanvasHeight - renderViewportHeight - renderHeightOff, renderViewportWidth, renderViewportHeight);
+		}
 
 		glUseProgram(glProgram);
 
@@ -1041,15 +1236,23 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		// Calculate projection matrix
-		float[] projectionMatrix = Mat4.scale(client.getScale(), client.getScale(), 1);
-		Mat4.mul(projectionMatrix, Mat4.projection(viewportWidth, viewportHeight, 50));
-		Mat4.mul(projectionMatrix, Mat4.rotateX(cameraPitch));
-		Mat4.mul(projectionMatrix, Mat4.rotateY(cameraYaw));
-		Mat4.mul(projectionMatrix, Mat4.translate(-cameraX, -cameraY, -cameraZ));
+		final float[] projectionMatrix;
+		if (xrFrameStarted)
+		{
+			// VR: per-eye perspective from HMD pose + world anchor (T3.2)
+			projectionMatrix = computeVrWorldProj(0);
+		}
+		else
+		{
+			projectionMatrix = Mat4.scale(client.getScale(), client.getScale(), 1);
+			Mat4.mul(projectionMatrix, Mat4.projection(viewportWidth, viewportHeight, 50));
+			Mat4.mul(projectionMatrix, Mat4.rotateX(cameraPitch));
+			Mat4.mul(projectionMatrix, Mat4.rotateY(cameraYaw));
+			Mat4.mul(projectionMatrix, Mat4.translate(-cameraX, -cameraY, -cameraZ));
+		}
 		glUniformMatrix4fv(uniWorldProj, false, projectionMatrix);
 
-		projectionMatrix = Mat4.identity();
-		glUniformMatrix4fv(uniEntityProj, false, projectionMatrix);
+		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
 
 		glUniform4i(uniEntityTint, 0, 0, 0, 0);
 
@@ -1089,6 +1292,88 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glDisable(GL_BLEND);
 		glDisable(GL_CULL_FACE);
 		glDisable(GL_DEPTH_TEST);
+
+		if (xrFrameStarted)
+		{
+			// ---- Right eye pass (T3.3) ----
+			int rightFbo = eyeSwapchains[1].acquireImage();
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rightFbo);
+
+			int sky = client.getSkyboxColor();
+			glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
+			glClearDepth(0d);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+			glViewport(0, 0, eyeSwapchains[1].getWidth(), eyeSwapchains[1].getHeight());
+
+			glUseProgram(glProgram);
+			glUniformMatrix4fv(uniWorldProj, false, computeVrWorldProj(1));
+			glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
+			glUniform4i(uniEntityTint, 0, 0, 0, 0);
+
+			glEnable(GL_CULL_FACE);
+			glEnable(GL_BLEND);
+			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
+			glDepthFunc(GL_GREATER);
+			glEnable(GL_DEPTH_TEST);
+
+			// Replay opaque zones from left-eye pass
+			final int offset = SCENE_OFFSET >> 3;
+			for (int i = 0; i < vrOpaqueZones.size(); i++)
+			{
+				int[] zz = vrOpaqueZones.get(i);
+				updateEntityProjection(vrOpaqueProjs.get(i));
+				Zone z = root.zones[zz[0]][zz[1]];
+				if (z.initialized)
+				{
+					z.renderOpaque(zz[0] - offset, zz[1] - offset,
+						root.minLevel, root.level, root.maxLevel, root.hideRoofIds);
+				}
+			}
+
+			// Replay alpha zones from left-eye pass (already sorted during left-eye pass)
+			vaoA.unmap();
+			for (int i = 0; i < vrAlphaZones.size(); i++)
+			{
+				int[] za = vrAlphaZones.get(i);
+				int level = za[0], zx = za[1], zzc = za[2];
+				Zone z = root.zones[zx][zzc];
+				if (!z.initialized)
+				{
+					continue;
+				}
+				updateEntityProjection(vrAlphaProjs.get(i));
+				glUniform4i(uniEntityTint, 0, 0, 0, 0);
+				int dx = root.cameraX - ((zx - offset) << 10);
+				int dz = root.cameraZ - ((zzc - offset) << 10);
+				boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
+				z.renderAlpha(zx - offset, zzc - offset, cameraYaw, cameraPitch,
+					root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
+					!close || (vrScene.getOverrideAmount() > 0));
+			}
+
+			glDisable(GL_BLEND);
+			glDisable(GL_CULL_FACE);
+			glDisable(GL_DEPTH_TEST);
+			eyeSwapchains[1].releaseImage();
+
+			// ---- Desktop mirror: blit left eye to AWT canvas (T3.5) ----
+			int defaultFbo = awtContext.getFramebuffer(false);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, vrLeftEyeFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, defaultFbo);
+			int mirrorW = getScaledValue(clientUI.getGraphicsConfiguration().getDefaultTransform().getScaleX(), client.getCanvasWidth());
+			int mirrorH = getScaledValue(clientUI.getGraphicsConfiguration().getDefaultTransform().getScaleY(), client.getCanvasHeight());
+			glBlitFramebuffer(0, 0, eyeSwapchains[0].getWidth(), eyeSwapchains[0].getHeight(),
+				0, 0, mirrorW, mirrorH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+			glBindFramebuffer(GL_READ_FRAMEBUFFER, defaultFbo);
+
+			eyeSwapchains[0].releaseImage();
+			currentEye = -1;
+
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, defaultFbo);
+			sceneFboValid = true;
+			return;
+		}
 
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, awtContext.getFramebuffer(false));
 		sceneFboValid = true;
@@ -1134,6 +1419,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		// Record zone for right-eye replay (T3.3)
+		if (currentEye == 0)
+		{
+			vrOpaqueZones.add(new int[]{zx, zz});
+			vrOpaqueProjs.add(entityProjection);
+		}
+
 		int offset = scene.getWorldViewId() == WorldView.TOPLEVEL ? (SCENE_OFFSET >> 3) : 0;
 		z.renderOpaque(zx - offset, zz - offset, ctx.minLevel, ctx.level, ctx.maxLevel, ctx.hideRoofIds);
 
@@ -1158,6 +1450,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (!z.initialized)
 		{
 			return;
+		}
+
+		// Record zone for right-eye replay (T3.3)
+		if (currentEye == 0)
+		{
+			vrAlphaZones.add(new int[]{level, zx, zz});
+			vrAlphaProjs.add(entityProjection);
 		}
 
 		updateEntityProjection(entityProjection);
@@ -1483,13 +1782,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		// --- OpenXR frame lifecycle (T2.4 / T2.5) ---
-		xrFrameStarted = false;
+		// --- OpenXR event polling (frame begin moved to end of draw) ---
 		if (xrContext != null)
 		{
 			if (!xrContext.pollEvents())
 			{
 				// Runtime signalled EXITING or LOSS_PENDING — stop the plugin.
+				// End any in-flight frame before stopping.
+				if (xrFrameStarted)
+				{
+					xrContext.endXrFrame();
+					xrFrameStarted = false;
+				}
 				SwingUtilities.invokeLater(() ->
 				{
 					try
@@ -1502,12 +1806,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					}
 				});
 				return;
-			}
-
-			if (xrContext.isSessionRunning())
-			{
-				xrContext.beginXrFrame();
-				xrFrameStarted = true;
 			}
 		}
 
@@ -1535,7 +1833,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glClearColor(0, 0, 0, 1);
 		glClear(GL_COLOR_BUFFER_BIT);
 
-		if (sceneFboValid)
+		// In VR mode the left eye was already blitted to the AWT canvas in postDrawToplevel.
+		if (sceneFboValid && !xrFrameStarted)
 		{
 			blitSceneFbo();
 		}
@@ -1577,11 +1876,31 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
 
-		// Submit the XR frame (empty layers until T3.x adds stereo rendering).
+		// Submit the XR frame with stereo projection layers when the scene was rendered,
+		// or with empty layers on the login/loading screen.
 		if (xrFrameStarted)
 		{
-			xrContext.endXrFrame();
+			if (sceneFboValid && xrContext.getViews() != null)
+			{
+				xrContext.endXrFrameStereo(
+					xrContext.getViews(),
+					eyeSwapchains[0].getSwapchain(),
+					eyeSwapchains[1].getSwapchain());
+			}
+			else
+			{
+				xrContext.endXrFrame();
+			}
 			xrFrameStarted = false;
+		}
+
+		// Begin the NEXT frame now so xrFrameStarted=true when preSceneDraw fires.
+		// xrWaitFrame inside beginXrFrame will pace us to the display rate.
+		if (xrContext != null && xrContext.isSessionRunning())
+		{
+			log.info("draw: beginXrFrame for next frame");
+			xrContext.beginXrFrame();
+			xrFrameStarted = true;
 		}
 
 		checkGLErrors();
