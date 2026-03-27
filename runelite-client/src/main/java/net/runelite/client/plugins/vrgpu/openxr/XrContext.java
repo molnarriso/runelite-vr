@@ -103,6 +103,7 @@ public class XrContext
 	private boolean sessionRunning = false;
 
 	/** Display time (ns) captured by {@link #beginXrFrame()}, consumed by {@link #endXrFrame()}. */
+	@Getter
 	private long pendingDisplayTime;
 
 	/** Recommended swapchain width per eye (index 0 = left, 1 = right). */

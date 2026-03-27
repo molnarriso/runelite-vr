@@ -97,6 +97,8 @@ import org.lwjgl.system.Callback;
 import org.lwjgl.system.Configuration;
 import net.runelite.client.plugins.vrgpu.openxr.XrContext;
 import net.runelite.client.plugins.vrgpu.openxr.XrEyeSwapchain;
+import net.runelite.client.plugins.vrgpu.openxr.XrInput;
+import org.lwjgl.BufferUtils;
 
 @PluginDescriptor(
 	name = "VR GPU",
@@ -149,6 +151,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private XrContext xrContext;
 	/** Per-eye swapchains — null if xrContext is null. Index 0 = left, 1 = right. */
 	private XrEyeSwapchain[] eyeSwapchains;
+	/** Controller input — null if xrContext is null. */
+	private XrInput xrInput;
 	/** True between a successful beginXrFrame() and the matching endXrFrame() call. */
 	private boolean xrFrameStarted;
 
@@ -196,6 +200,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private Projection vrSorterProjection;
 
+	// --- Debug ray visualisation ---
+	private int glDebugProgram;
+	private int uniDebugWorldProj;
+	private int debugVboId;
+	private int debugVaoId;
+	/** Scratch buffer for per-frame debug vertices (max 16 verts × 7 floats). */
+	private java.nio.FloatBuffer debugRayFb;
+	/** Scratch buffers for depth-buffer picking (single pixel read). */
+	private java.nio.FloatBuffer depthReadBuf;
+	private java.nio.IntBuffer fboReadBuf;
+	/** Right controller depth-buffer hit in OSRS world coords; null if no hit last frame. */
+	private float[] vrRightRayHit;
+
 	/**
 	 * Number of VAOs in {@code vaoO} that were drawn (but not reset) during the
 	 * left-eye drawPass. Replayed and reset in the right-eye pass.
@@ -217,6 +234,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	static final Shader UI_PROGRAM = new Shader()
 		.add(GL_VERTEX_SHADER, "vertui.glsl")
 		.add(GL_FRAGMENT_SHADER, "fragui.glsl");
+
+	static final Shader DEBUG_PROGRAM = new Shader()
+		.add(GL_VERTEX_SHADER, "debug_vert.glsl")
+		.add(GL_FRAGMENT_SHADER, "debug_frag.glsl");
 
 	static int glProgram;
 	private int glUiProgram;
@@ -444,6 +465,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					long hdc   = WGL.wglGetCurrentDC();
 					xrContext  = new XrContext();
 					xrContext.init(hglrc, hdc);
+
+					xrInput = new XrInput();
+					xrInput.init(xrContext.getInstance(), xrContext.getSession());
 
 					eyeSwapchains = new XrEyeSwapchain[2];
 					for (int eye = 0; eye < 2; eye++)
@@ -692,9 +716,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		Template template = createTemplate();
 		glProgram = PROGRAM.compile(template);
 		glUiProgram = UI_PROGRAM.compile(template);
+		glDebugProgram = DEBUG_PROGRAM.compile(template);
+		uniDebugWorldProj = glGetUniformLocation(glDebugProgram, "worldProj");
 
 		glBindVertexArray(0);
 
+		initDebugVao();
 		initUniforms();
 	}
 
@@ -732,6 +759,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glDeleteProgram(glUiProgram);
 		glUiProgram = 0;
+
+		if (glDebugProgram != 0) { glDeleteProgram(glDebugProgram); glDebugProgram = 0; }
+		if (debugVaoId != 0) { glDeleteVertexArrays(debugVaoId); debugVaoId = 0; }
+		if (debugVboId != 0) { glDeleteBuffers(debugVboId); debugVboId = 0; }
 	}
 
 	private void initVao()
@@ -910,6 +941,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private void destroyXr()
 	{
+		if (xrInput != null)
+		{
+			xrInput.destroy();
+			xrInput = null;
+		}
 		if (eyeSwapchains != null)
 		{
 			for (XrEyeSwapchain sc : eyeSwapchains)
@@ -1044,6 +1080,247 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			r02, r12, r22, 0,   // col 2
 			tx,  ty,  tz,  1,   // col 3
 		};
+	}
+
+	// -------------------------------------------------------------------------
+	// Debug ray visualisation
+	// -------------------------------------------------------------------------
+
+	private void initDebugVao()
+	{
+		debugVaoId = glGenVertexArrays();
+		debugVboId = glGenBuffers();
+		debugRayFb  = BufferUtils.createFloatBuffer(128); // max 16 verts × 7 floats + margin
+		depthReadBuf = BufferUtils.createFloatBuffer(1);
+		fboReadBuf   = BufferUtils.createIntBuffer(1);
+
+		glBindVertexArray(debugVaoId);
+		glBindBuffer(GL_ARRAY_BUFFER, debugVboId);
+		// Pre-allocate GPU buffer for the max vertex count.
+		glBufferData(GL_ARRAY_BUFFER, (long) 128 * Float.BYTES, GL_STREAM_DRAW);
+
+		// Attribute 0: vec3 position (OSRS world coords)
+		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(0, 3, GL_FLOAT, false, 7 * Float.BYTES, 0L);
+		// Attribute 1: vec4 colour (RGBA)
+		glEnableVertexAttribArray(1);
+		glVertexAttribPointer(1, 4, GL_FLOAT, false, 7 * Float.BYTES, (long) (3 * Float.BYTES));
+
+		glBindVertexArray(0);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+	}
+
+	/**
+	 * Build controller ray vertices into {@link #debugRayFb}.
+	 * Each ray: 2 line verts (origin → endpoint) + 6 cross verts at endpoint.
+	 * {@code rightHit}: if non-null, overrides the right-hand endpoint with a depth-sampled
+	 * OSRS world position; otherwise a fixed 5 m endpoint is used.
+	 * Returns number of floats written.
+	 */
+	private int buildDebugRayVerts(float[] rightHit)
+	{
+		final float s = DEFAULT_WORLD_SCALE;
+		final float oy = vrWorldAnchorY;
+		final float oz = -1.5f;
+		final float camX = root.cameraX;
+		final float camY = root.cameraY;
+		final float camZ = root.cameraZ;
+		final float RAY_M = 5f;          // ray length in metres
+		final float CROSS = 50f;         // crosshair arm half-length in OSRS units
+
+		debugRayFb.clear();
+
+		float[][] controllers = {
+			// px, py, pz, dx, dy, dz, r, g, b  (pressed: red)
+			xrInput.isLeftActive()  ? new float[]{
+				xrInput.getLeftPosX(),  xrInput.getLeftPosY(),  xrInput.getLeftPosZ(),
+				xrInput.getLeftDirX(),  xrInput.getLeftDirY(),  xrInput.getLeftDirZ(),
+				xrInput.getLeftTrigger()  > 0.7f ? 1f : 0f,
+				xrInput.getLeftTrigger()  > 0.7f ? 0f : 1f,
+				0f
+			} : null,
+			xrInput.isRightActive() ? new float[]{
+				xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
+				xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ(),
+				xrInput.getRightTrigger() > 0.7f ? 1f : 0f,
+				0f,
+				xrInput.getRightTrigger() > 0.7f ? 0f : 1f
+			} : null,
+		};
+
+		for (int ci = 0; ci < controllers.length; ci++)
+		{
+			float[] c = controllers[ci];
+			if (c == null) continue;
+			float px = c[0], py = c[1], pz = c[2];
+			float dx = c[3], dy = c[4], dz = c[5];
+			float r = c[6], g = c[7], b = c[8];
+
+			// Convert stage-space (metres) to OSRS world coordinates.
+			float ox2 = camX + px / s;
+			float oy2 = camY - (py - oy) / s;
+			float oz2 = camZ + (pz - oz) / s;
+
+			float ex, ey, ez;
+			if (ci == 1 && rightHit != null)
+			{
+				// Use depth-sampled intersection point for right controller crosshair.
+				ex = rightHit[0]; ey = rightHit[1]; ez = rightHit[2];
+			}
+			else
+			{
+				ex = camX + (px + dx * RAY_M) / s;
+				ey = camY - ((py + dy * RAY_M) - oy) / s;
+				ez = camZ + ((pz + dz * RAY_M) - oz) / s;
+			}
+
+			// Ray line: origin → endpoint
+			debugRayFb.put(ox2).put(oy2).put(oz2).put(r).put(g).put(b).put(1f);
+			debugRayFb.put(ex) .put(ey) .put(ez) .put(r).put(g).put(b).put(1f);
+
+			// Crosshair at endpoint (X, Y, Z arms)
+			debugRayFb.put(ex - CROSS).put(ey).put(ez).put(r).put(g).put(b).put(1f);
+			debugRayFb.put(ex + CROSS).put(ey).put(ez).put(r).put(g).put(b).put(1f);
+			debugRayFb.put(ex).put(ey - CROSS).put(ez).put(r).put(g).put(b).put(1f);
+			debugRayFb.put(ex).put(ey + CROSS).put(ez).put(r).put(g).put(b).put(1f);
+			debugRayFb.put(ex).put(ey).put(ez - CROSS).put(r).put(g).put(b).put(1f);
+			debugRayFb.put(ex).put(ey).put(ez + CROSS).put(r).put(g).put(b).put(1f);
+		}
+
+		debugRayFb.flip();
+		return debugRayFb.limit();
+	}
+
+	/**
+	 * Project the given stage-space ray into the eye's viewport, read the depth buffer at
+	 * that pixel, and reconstruct the OSRS world-space intersection point.
+	 *
+	 * @return float[3] OSRS world coords, or null if no geometry was hit (depth == 0).
+	 */
+	private float[] sampleDepthAtRay(int eye,
+		float rox, float roy, float roz,
+		float rdx, float rdy, float rdz)
+	{
+		// Project a point far along the ray to find the viewport direction.
+		final float FAR = 10f;
+		final float s = DEFAULT_WORLD_SCALE;
+		final float anchorY = vrWorldAnchorY;
+		final float anchorZ = -1.5f;
+
+		float testX = rox + rdx * FAR;
+		float testY = roy + rdy * FAR;
+		float testZ = roz + rdz * FAR;
+
+		// Stage space → OSRS world
+		float wx = root.cameraX + testX / s;
+		float wy = root.cameraY - (testY - anchorY) / s;
+		float wz = root.cameraZ + (testZ - anchorZ) / s;
+
+		// OSRS world → clip space
+		float[] proj = computeVrWorldProj(eye);
+		float cx  = proj[0]*wx + proj[4]*wy + proj[8]*wz  + proj[12];
+		float cy  = proj[1]*wx + proj[5]*wy + proj[9]*wz  + proj[13];
+		float cw  = proj[3]*wx + proj[7]*wy + proj[11]*wz + proj[15];
+		if (cw <= 0) return null; // behind camera
+
+		float ndcX = cx / cw;
+		float ndcY = cy / cw;
+
+		int vpW = eyeSwapchains[eye].getWidth();
+		int vpH = eyeSwapchains[eye].getHeight();
+
+		// NDC → pixel (GL_LOWER_LEFT, GL_ZERO_TO_ONE: Y up from bottom)
+		int px = Math.round((ndcX + 1f) * 0.5f * vpW);
+		int py = Math.round((ndcY + 1f) * 0.5f * vpH);
+		px = Math.max(0, Math.min(vpW - 1, px));
+		py = Math.max(0, Math.min(vpH - 1, py));
+
+		// Read depth: bind the current draw FBO also as read so glReadPixels sees scene depth.
+		fboReadBuf.clear();
+		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, fboReadBuf);
+		int eyeFbo = fboReadBuf.get(0);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, eyeFbo);
+
+		depthReadBuf.clear();
+		glReadPixels(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, depthReadBuf);
+		float depth = depthReadBuf.get(0);
+
+		if (depth < 0.001f) return null; // no geometry (background)
+
+		// Reconstruct eye-space position: depth = 2*near / (-z_eye)
+		final float near = 0.05f;
+		float zEye = -2f * near / depth;
+
+		// Get per-eye FOV params to unproject X and Y
+		XrView view = vrViews.get(eye);
+		XrFovf fov = view.fov();
+		float tanL = (float) Math.tan(fov.angleLeft());
+		float tanR = (float) Math.tan(fov.angleRight());
+		float tanU = (float) Math.tan(fov.angleUp());
+		float tanD = (float) Math.tan(fov.angleDown());
+		float a  = 2f / (tanR - tanL);
+		float b  = (tanR + tanL) / (tanR - tanL);
+		float c2 = 2f / (tanU - tanD);
+		float d  = (tanU + tanD) / (tanU - tanD);
+
+		// ndc_x = -a*xEye/zEye - b  →  xEye = -(ndcX + b) * zEye / a
+		float xEye = -(ndcX + b) * zEye / a;
+		float yEye = -(ndcY + d) * zEye / c2;
+
+		// Eye space → stage space: stagePos = R * eyePos + eyeOrigin
+		XrPosef pose = view.pose();
+		float qx = pose.orientation().x(), qy = pose.orientation().y();
+		float qz = pose.orientation().z(), qw = pose.orientation().w();
+		float epx = pose.position$().x(), epy = pose.position$().y(), epz = pose.position$().z();
+
+		float r00 = 1-2*(qy*qy+qz*qz), r01 = 2*(qx*qy-qw*qz), r02 = 2*(qx*qz+qw*qy);
+		float r10 = 2*(qx*qy+qw*qz), r11 = 1-2*(qx*qx+qz*qz), r12 = 2*(qy*qz-qw*qx);
+		float r20 = 2*(qx*qz-qw*qy), r21 = 2*(qy*qz+qw*qx), r22 = 1-2*(qx*qx+qy*qy);
+
+		float stX = r00*xEye + r01*yEye + r02*zEye + epx;
+		float stY = r10*xEye + r11*yEye + r12*zEye + epy;
+		float stZ = r20*xEye + r21*yEye + r22*zEye + epz;
+
+		// Stage space → OSRS world
+		float osrsX = root.cameraX + stX / s;
+		float osrsY = root.cameraY - (stY - anchorY) / s;
+		float osrsZ = root.cameraZ + (stZ - anchorZ) / s;
+
+		return new float[]{osrsX, osrsY, osrsZ};
+	}
+
+	/**
+	 * Draw controller aim rays for the given eye using the debug line shader.
+	 * Must be called with blend/cull/depth already disabled.
+	 */
+	private void drawDebugRays(int eye)
+	{
+		if (xrInput == null || Float.isNaN(vrWorldAnchorY)) return;
+		if (!xrInput.isLeftActive() && !xrInput.isRightActive()) return;
+
+		// Sample right-eye depth buffer to find where the right controller ray hits geometry.
+		// Done on eye=1 so the right-eye FBO is bound and contains fresh scene depth.
+		if (eye == 1 && xrInput.isRightActive())
+		{
+			vrRightRayHit = sampleDepthAtRay(1,
+				xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
+				xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ());
+		}
+
+		int n = buildDebugRayVerts(vrRightRayHit);
+		if (n == 0) return;
+
+		glBindVertexArray(debugVaoId);
+		glBindBuffer(GL_ARRAY_BUFFER, debugVboId);
+		glBufferSubData(GL_ARRAY_BUFFER, 0, debugRayFb);
+
+		glUseProgram(glDebugProgram);
+		glUniformMatrix4fv(uniDebugWorldProj, false, computeVrWorldProj(eye));
+		glLineWidth(3f);
+		glDrawArrays(GL_LINES, 0, n / 7);
+
+		glBindVertexArray(0);
+		glUseProgram(glProgram);
 	}
 
 	/**
@@ -1222,6 +1499,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			// VR path — left eye setup (T3.1)
 			vrViews = xrContext.locateViews();
+			if (xrInput != null)
+			{
+				xrInput.sync(xrContext.getSession(), xrContext.getStageSpace(),
+					xrContext.getPendingDisplayTime());
+			}
 			currentEye = 0;
 			vrOpaqueZones.clear();
 			vrOpaqueProjs.clear();
@@ -1417,6 +1699,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		if (xrFrameStarted)
 		{
+			// Draw controller rays over left eye (state: blend/cull/depth already disabled).
+			drawDebugRays(0);
+
 			// ---- Right eye pass (T3.3) ----
 			int rightFbo = eyeSwapchains[1].acquireImage();
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rightFbo);
@@ -1510,6 +1795,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glCullFace(GL_BACK); // restore default before leaving VR render path
 			glDisable(GL_CULL_FACE);
 			glDisable(GL_DEPTH_TEST);
+			// Draw controller rays over right eye before releasing swapchain image.
+			drawDebugRays(1);
 			eyeSwapchains[1].releaseImage();
 
 			// ---- Desktop mirror: blit left eye to AWT canvas (T3.5) ----

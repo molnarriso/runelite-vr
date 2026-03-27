@@ -94,6 +94,10 @@ void main() {
   vec3 mixedColor = mix(c.rgb, fogColor.rgb, fFogAmount);
   FragColor = vec4(mixedColor, c.a);
 
+  // DEPTH DEBUG: uncomment to visualize depth buffer (black=near, white=far).
+  //float d = gl_FragCoord.z;
+  //FragColor = vec4(d, d, d, 1.0);
+
 #ifdef FRAG_UVS
   if (fTextureId > 0) {
     FragColor = vec4(fUv.x, 0, fUv.y, 1);
