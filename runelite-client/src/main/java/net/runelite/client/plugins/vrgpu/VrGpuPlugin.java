@@ -188,7 +188,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float DEFAULT_WORLD_SCALE = 0.000781f;
 	private static final float VR_STAGE_CHARACTER_OFFSET_Y = -1.0f;
 	private static final float VR_STAGE_CHARACTER_OFFSET_Z = -0.5f;
-	private static final int VR_DESKTOP_AIM_PITCH = 228; // ~40 degrees from horizon in JAU
+	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
 
 	/**
 	 * Stage-space Y of the world anchor (where the OSRS camera maps to).
@@ -2209,8 +2209,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private float[] computeDesktopWorldProj()
 	{
-		float desktopCameraPitch = (float) client.getCameraFpPitch();
-		float desktopCameraYaw = (float) client.getCameraFpYaw();
+		float desktopCameraPitch = getSafeDesktopCameraPitch();
+		float desktopCameraYaw = getSafeDesktopCameraYaw();
 		float desktopCameraX = (float) client.getCameraFpX();
 		float desktopCameraY = (float) client.getCameraFpZ();
 		float desktopCameraZ = (float) client.getCameraFpY();
@@ -2248,15 +2248,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		ensureDesktopSceneFbo();
 		int sky = client.getSkyboxColor();
 		DesktopViewport vp = getDesktopViewport();
-		int desktopCameraYaw = (int) client.getCameraFpYaw();
-		int desktopCameraPitch = (int) client.getCameraFpPitch();
+		int desktopCameraYaw = getSafeDesktopCameraYaw();
+		int desktopCameraPitch = getSafeDesktopCameraPitch();
 		int desktopCameraX = (int) client.getCameraFpX();
 		int desktopCameraY = (int) client.getCameraFpZ();
 		int desktopCameraZ = (int) client.getCameraFpY();
 
 		uploadMainCameraUniforms(
-			(float) client.getCameraFpYaw(),
-			(float) client.getCameraFpPitch(),
+			(float) desktopCameraYaw,
+			(float) desktopCameraPitch,
 			(float) client.getCameraFpX(),
 			(float) client.getCameraFpZ(),
 			(float) client.getCameraFpY());
@@ -2343,6 +2343,36 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Restore the main-scene camera uniforms before continuing with the stereo VR path.
 		uploadMainCameraUniforms(cameraYaw, cameraPitch, root.cameraX, root.cameraY, root.cameraZ);
+	}
+
+	private int getSafeDesktopCameraYaw()
+	{
+		double yaw = client.getCameraFpYaw();
+		if (yaw < 0)
+		{
+			yaw = client.getCameraYaw();
+		}
+		return normalizeJau((int) Math.round(yaw));
+	}
+
+	private int getSafeDesktopCameraPitch()
+	{
+		double pitch = client.getCameraFpPitch();
+		if (pitch < 0)
+		{
+			pitch = client.getCameraPitch();
+		}
+		return normalizeJau((int) Math.round(pitch));
+	}
+
+	private static int normalizeJau(int angle)
+	{
+		angle %= 2048;
+		if (angle < 0)
+		{
+			angle += 2048;
+		}
+		return angle;
 	}
 
 	private void blitSceneFbo()
