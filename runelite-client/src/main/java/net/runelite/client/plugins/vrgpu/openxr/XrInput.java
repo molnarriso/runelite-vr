@@ -66,6 +66,7 @@ public class XrInput
 	private XrActionSet actionSet;
 	private XrAction aimAction;
 	private XrAction triggerAction;
+	private XrAction squeezeAction;
 	private XrSpace leftAimSpace;
 	private XrSpace rightAimSpace;
 	private long pathHandLeft;
@@ -80,6 +81,11 @@ public class XrInput
 	@Getter private float leftTrigger;
 	/** Right trigger value 0..1. */
 	@Getter private float rightTrigger;
+
+	/** Left squeeze/grip value 0..1. */
+	@Getter private float leftSqueeze;
+	/** Right squeeze/grip value 0..1. */
+	@Getter private float rightSqueeze;
 
 	/** Left controller aim origin in stage space (metres). */
 	@Getter private float leftPosX, leftPosY, leftPosZ;
@@ -154,6 +160,18 @@ public class XrInput
 				pp));
 			triggerAction = new XrAction(pp.get(0), actionSet);
 
+			// Squeeze / grip action (both hands) — used for right-click
+			checkXr("xrCreateAction squeeze", xrCreateAction(actionSet,
+				XrActionCreateInfo.calloc(stack)
+					.type(XR_TYPE_ACTION_CREATE_INFO)
+					.actionName(stack.UTF8("squeeze_value"))
+					.actionType(XR_ACTION_TYPE_FLOAT_INPUT)
+					.localizedActionName(stack.UTF8("Squeeze"))
+					.countSubactionPaths(2)
+					.subactionPaths(subPaths),
+				pp));
+			squeezeAction = new XrAction(pp.get(0), actionSet);
+
 			suggestBindings(stack);
 
 			// Attach action sets — must happen before xrBeginSession
@@ -219,8 +237,10 @@ public class XrInput
 			rightActive = samplePose(stack, session, stageSpace, displayTime,
 				rightAimSpace, pathHandRight, false);
 
-			leftTrigger = sampleFloat(stack, session, pathHandLeft);
-			rightTrigger = sampleFloat(stack, session, pathHandRight);
+			leftTrigger  = sampleFloat(stack, session, triggerAction, pathHandLeft);
+			rightTrigger = sampleFloat(stack, session, triggerAction, pathHandRight);
+			leftSqueeze  = sampleFloat(stack, session, squeezeAction, pathHandLeft);
+			rightSqueeze = sampleFloat(stack, session, squeezeAction, pathHandRight);
 		}
 	}
 
@@ -231,6 +251,7 @@ public class XrInput
 		if (rightAimSpace != null) { xrDestroySpace(rightAimSpace); rightAimSpace = null; }
 		if (aimAction != null) { xrDestroyAction(aimAction); aimAction = null; }
 		if (triggerAction != null) { xrDestroyAction(triggerAction); triggerAction = null; }
+		if (squeezeAction != null) { xrDestroyAction(squeezeAction); squeezeAction = null; }
 		if (actionSet != null) { xrDestroyActionSet(actionSet); actionSet = null; }
 	}
 
@@ -242,29 +263,33 @@ public class XrInput
 	{
 		LongBuffer lb = stack.mallocLong(1);
 
-		long aimL = path(lb, "/user/hand/left/input/aim/pose");
-		long aimR = path(lb, "/user/hand/right/input/aim/pose");
+		long aimL  = path(lb, "/user/hand/left/input/aim/pose");
+		long aimR  = path(lb, "/user/hand/right/input/aim/pose");
 		long trigL = path(lb, "/user/hand/left/input/trigger/value");
 		long trigR = path(lb, "/user/hand/right/input/trigger/value");
-		long selL = path(lb, "/user/hand/left/input/select/click");
-		long selR = path(lb, "/user/hand/right/input/select/click");
+		long sqzL  = path(lb, "/user/hand/left/input/squeeze/value");
+		long sqzR  = path(lb, "/user/hand/right/input/squeeze/value");
+		long sqzLc = path(lb, "/user/hand/left/input/squeeze/click");
+		long sqzRc = path(lb, "/user/hand/right/input/squeeze/click");
+		long selL  = path(lb, "/user/hand/left/input/select/click");
+		long selR  = path(lb, "/user/hand/right/input/select/click");
 
 		// Oculus / Meta Touch
 		suggestProfile(stack, lb, "/interaction_profiles/oculus/touch_controller",
-			new long[]{aimL, aimR, trigL, trigR},
-			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction});
+			new long[]{aimL, aimR, trigL, trigR, sqzL, sqzR},
+			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction});
 
 		// Valve Index
 		suggestProfile(stack, lb, "/interaction_profiles/valve/index_controller",
-			new long[]{aimL, aimR, trigL, trigR},
-			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction});
+			new long[]{aimL, aimR, trigL, trigR, sqzL, sqzR},
+			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction});
 
-		// Windows Mixed Reality
+		// Windows Mixed Reality (squeeze is boolean click)
 		suggestProfile(stack, lb, "/interaction_profiles/microsoft/motion_controller",
-			new long[]{aimL, aimR, trigL, trigR},
-			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction});
+			new long[]{aimL, aimR, trigL, trigR, sqzLc, sqzRc},
+			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction});
 
-		// KHR Simple (fallback — uses select/click as a 0/1 float)
+		// KHR Simple (fallback — no squeeze; trigger=select/click, no right-click)
 		suggestProfile(stack, lb, "/interaction_profiles/khr/simple_controller",
 			new long[]{aimL, aimR, selL, selR},
 			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction});
@@ -361,14 +386,14 @@ public class XrInput
 		return true;
 	}
 
-	private float sampleFloat(MemoryStack stack, XrSession session, long subPath)
+	private float sampleFloat(MemoryStack stack, XrSession session, XrAction action, long subPath)
 	{
 		XrActionStateFloat state = XrActionStateFloat.calloc(stack)
 			.type(XR_TYPE_ACTION_STATE_FLOAT);
 		xrGetActionStateFloat(session,
 			XrActionStateGetInfo.calloc(stack)
 				.type(XR_TYPE_ACTION_STATE_GET_INFO)
-				.action(triggerAction)
+				.action(action)
 				.subactionPath(subPath),
 			state);
 		return state.isActive() ? state.currentState() : 0f;

@@ -29,8 +29,11 @@ import com.google.common.primitives.Ints;
 import com.google.inject.Provides;
 import java.awt.Canvas;
 import java.awt.Dimension;
+import java.awt.event.MouseEvent;
 import java.awt.GraphicsConfiguration;
 import java.awt.Image;
+import java.awt.Polygon;
+import java.awt.Rectangle;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
@@ -43,6 +46,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import net.runelite.api.AABB;
+import net.runelite.api.DecorativeObject;
+import net.runelite.api.GroundObject;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.NPCComposition;
+import net.runelite.api.ObjectComposition;
+import net.runelite.api.coords.LocalPoint;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
@@ -52,16 +62,29 @@ import net.runelite.api.Constants;
 import net.runelite.api.FloatProjection;
 import net.runelite.api.GameObject;
 import net.runelite.api.GameState;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
 import net.runelite.api.Model;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
 import net.runelite.api.Perspective;
 import net.runelite.api.Projection;
 import net.runelite.api.Renderable;
 import net.runelite.api.Scene;
+import net.runelite.api.SceneTileModel;
+import net.runelite.api.SceneTilePaint;
+import net.runelite.api.ScriptID;
 import net.runelite.api.TextureProvider;
+import net.runelite.api.Tile;
+import net.runelite.api.TileItem;
 import net.runelite.api.TileObject;
+import net.runelite.api.VarClientInt;
+import net.runelite.api.WallObject;
 import net.runelite.api.WorldEntity;
 import net.runelite.api.WorldView;
+import net.runelite.api.gameval.VarClientID;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.PostClientTick;
 import net.runelite.api.hooks.DrawCallbacks;
 import net.runelite.client.callback.ClientThread;
@@ -163,6 +186,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 * 1 tile = 128 units ≈ 0.1 m → 0.1 / 128 ≈ 0.000781.
 	 */
 	private static final float DEFAULT_WORLD_SCALE = 0.000781f;
+	private static final float VR_STAGE_CHARACTER_OFFSET_Y = -1.0f;
+	private static final float VR_STAGE_CHARACTER_OFFSET_Z = -0.5f;
+	private static final int VR_DESKTOP_AIM_PITCH = 228; // ~40 degrees from horizon in JAU
 
 	/**
 	 * Stage-space Y of the world anchor (where the OSRS camera maps to).
@@ -210,8 +236,47 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Scratch buffers for depth-buffer picking (single pixel read). */
 	private java.nio.FloatBuffer depthReadBuf;
 	private java.nio.IntBuffer fboReadBuf;
-	/** Right controller depth-buffer hit in OSRS world coords; null if no hit last frame. */
+	/** Controller depth-buffer hits in OSRS world coords; null if no hit last frame. */
+	private float[] vrLeftRayHit;
 	private float[] vrRightRayHit;
+	/** Persistent click-feedback marker: OSRS world position + button + timestamp. */
+	private float[] vrLastClickHit;
+	/** Persistent OSRS-space click ray [ox,oy,oz,dx,dy,dz] for diagnostics. */
+	private float[] vrLastClickRay;
+	/** Persistent ground-hit marker [x,y,z]. */
+	private float[] vrLastGroundHit;
+	/** Persistent reconstructed desktop screen-ray ground hit [x,y,z]. */
+	private float[] vrLastDesktopRayHit;
+	/** Persistent desktop-camera aim target [x,y,z] in GPU convention for diagnostics. */
+	private float[] vrDesktopCameraAimTarget;
+	/** Last requested desktop camera yaw/pitch targets for diagnostics. */
+	private int[] vrDesktopCameraAimAngles;
+	/** Persistent dispatch tile [sceneX, sceneY]. */
+	private int[] vrLastDispatchSceneTile;
+	/** Persistent raw walk params [p0, p1] sent to menuAction. */
+	private int[] vrLastWalkParams;
+	/** Persistent selected scene tile from the client after walk processing [sceneX, sceneY]. */
+	private int[] vrLastClientSelectedSceneTile;
+	/** Persistent client destination local point [x, y, z]. */
+	private float[] vrLastClientDestination;
+	private int vrLastClickButton; // MouseEvent.BUTTON1 or BUTTON3
+	private long vrLastClickTimeMs;
+	/** Previous-frame combined LMB/RMB values for rising-edge detection. */
+	private float prevLmb; // max(leftTrigger, rightTrigger)
+	private float prevRmb; // max(leftSqueeze,  rightSqueeze)
+	/** Pending click produced on render thread, consumed on client thread. */
+	private volatile float[] vrPendingClickHit;
+	private volatile int vrPendingClickButton; // MouseEvent.BUTTON1 or BUTTON3
+	/** OSRS-space ray [ox,oy,oz,dx,dy,dz] set on render thread when a click is detected; consumed on client thread. */
+	private volatile float[] vrPendingClickRay;
+	/** Pending staged walk dispatch [sceneX, sceneY, localX, localY(height), localZ]. */
+	private volatile float[] vrPendingWalkInspect;
+	/** Pending staged walk canvas point [x, y]. */
+	private volatile int[] vrPendingWalkCanvasPoint;
+	/** True once we have moved the live canvas mouse to the staged walk point. */
+	private volatile boolean vrPendingWalkMousePrimed;
+	/** Remaining ticks before staged walk dispatch. */
+	private volatile int vrPendingWalkInspectRetries;
 
 	/**
 	 * Number of VAOs in {@code vaoO} that were drawn (but not reset) during the
@@ -983,20 +1048,25 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		XrView view = vrViews.get(eye);
 
-		// World anchor: fixed in stage space so head tracking gives correct parallax.
+		// Character anchor: the local player is kept at a fixed room-space location.
 		// vrWorldAnchorY is sampled from the initial eye height on the first VR frame.
-		// X=0 (stage centre), Z=-1.5m (1.5 m in front of stage origin).
+		// X=0 (stage centre), Z=-0.5m (0.5 m in front of the head at recenter/start).
 		// OSRS Y increases downward, so the Y scale is negated to flip it upright.
+		// VR also needs an X flip to match the headset view handedness; without it the
+		// whole image appears mirrored left-right in the HMD.
 		float worldOffsetX = 0;
-		float worldOffsetY = vrWorldAnchorY;  // set once from initial eye height - 0.7 m
-		float worldOffsetZ = -1.5f;
+		float worldOffsetY = vrWorldAnchorY;
+		float worldOffsetZ = VR_STAGE_CHARACTER_OFFSET_Z;
+		float anchorWorldX = getVrAnchorWorldX();
+		float anchorWorldY = getVrAnchorWorldY();
+		float anchorWorldZ = getVrAnchorWorldZ();
 
-		// Chain: Proj × InvEyePose × Translate(worldOffset) × Scale(s,-s,s) × Translate(-cam)
+		// Chain: Proj × InvEyePose × Translate(worldOffset) × Scale(-s,-s,s) × Translate(-cam)
 		float[] proj = buildVrProjection(view.fov(), 0.05f);
 		Mat4.mul(proj, buildInvEyePose(view.pose()));
 		Mat4.mul(proj, Mat4.translate(worldOffsetX, worldOffsetY, worldOffsetZ));
-		Mat4.mul(proj, Mat4.scale(DEFAULT_WORLD_SCALE, -DEFAULT_WORLD_SCALE, DEFAULT_WORLD_SCALE));
-		Mat4.mul(proj, Mat4.translate(-root.cameraX, -root.cameraY, -root.cameraZ));
+		Mat4.mul(proj, Mat4.scale(-DEFAULT_WORLD_SCALE, -DEFAULT_WORLD_SCALE, DEFAULT_WORLD_SCALE));
+		Mat4.mul(proj, Mat4.translate(-anchorWorldX, -anchorWorldY, -anchorWorldZ));
 		return proj;
 	}
 
@@ -1090,14 +1160,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		debugVaoId = glGenVertexArrays();
 		debugVboId = glGenBuffers();
-		debugRayFb  = BufferUtils.createFloatBuffer(128); // max 16 verts × 7 floats + margin
+		debugRayFb  = BufferUtils.createFloatBuffer(768); // 2 rays + tile outlines + click marker + entity tile, 7 floats/vert
 		depthReadBuf = BufferUtils.createFloatBuffer(1);
 		fboReadBuf   = BufferUtils.createIntBuffer(1);
 
 		glBindVertexArray(debugVaoId);
 		glBindBuffer(GL_ARRAY_BUFFER, debugVboId);
 		// Pre-allocate GPU buffer for the max vertex count.
-		glBufferData(GL_ARRAY_BUFFER, (long) 128 * Float.BYTES, GL_STREAM_DRAW);
+		glBufferData(GL_ARRAY_BUFFER, (long) 768 * Float.BYTES, GL_STREAM_DRAW);
 
 		// Attribute 0: vec3 position (OSRS world coords)
 		glEnableVertexAttribArray(0);
@@ -1112,39 +1182,42 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	/**
 	 * Build controller ray vertices into {@link #debugRayFb}.
-	 * Each ray: 2 line verts (origin → endpoint) + 6 cross verts at endpoint.
-	 * {@code rightHit}: if non-null, overrides the right-hand endpoint with a depth-sampled
-	 * OSRS world position; otherwise a fixed 5 m endpoint is used.
+	 * Per controller: ray line + crosshair at endpoint + tile outline on the ground.
 	 * Returns number of floats written.
 	 */
-	private int buildDebugRayVerts(float[] rightHit)
+	private int buildDebugRayVerts(float[] leftHit, float[] rightHit)
 	{
 		final float s = DEFAULT_WORLD_SCALE;
 		final float oy = vrWorldAnchorY;
-		final float oz = -1.5f;
-		final float camX = root.cameraX;
-		final float camY = root.cameraY;
-		final float camZ = root.cameraZ;
+		final float oz = VR_STAGE_CHARACTER_OFFSET_Z;
+		final float camX = getVrAnchorWorldX();
+		final float camY = getVrAnchorWorldY();
+		final float camZ = getVrAnchorWorldZ();
 		final float RAY_M = 5f;          // ray length in metres
-		final float CROSS = 50f;         // crosshair arm half-length in OSRS units
+		final float CROSS = 17f;         // crosshair arm half-length in OSRS units (~3× smaller)
+		final float TILE  = 128f;        // one tile in OSRS local units
 
 		debugRayFb.clear();
 
+		// Colors: idle=hand color (left=green, right=blue), trigger=yellow (LMB), squeeze=red (RMB).
+		boolean lTrig = xrInput.getLeftTrigger()  > 0.7f, lSqz = xrInput.getLeftSqueeze()  > 0.7f;
+		boolean rTrig = xrInput.getRightTrigger() > 0.7f, rSqz = xrInput.getRightSqueeze() > 0.7f;
+
 		float[][] controllers = {
-			// px, py, pz, dx, dy, dz, r, g, b  (pressed: red)
+			// px, py, pz, dx, dy, dz, r, g, b
 			xrInput.isLeftActive()  ? new float[]{
 				xrInput.getLeftPosX(),  xrInput.getLeftPosY(),  xrInput.getLeftPosZ(),
 				xrInput.getLeftDirX(),  xrInput.getLeftDirY(),  xrInput.getLeftDirZ(),
-				xrInput.getLeftTrigger()  > 0.7f ? 1f : 0f,
-				xrInput.getLeftTrigger()  > 0.7f ? 0f : 1f,
-				0f
+				lTrig ? 1f : (lSqz ? 1f : 0f),
+				lTrig ? 1f : 1f,
+				lSqz || lTrig ? 0f : 0f
 			} : null,
 			xrInput.isRightActive() ? new float[]{
 				xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
 				xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ(),
-				xrInput.getRightTrigger() > 0.7f ? 1f : 0f,
-				0f,
-				xrInput.getRightTrigger() > 0.7f ? 0f : 1f
+				rTrig ? 1f : (rSqz ? 1f : 0f),
+				rTrig ? 1f : 0f,
+				rTrig || rSqz ? 0f : 1f
 			} : null,
 		};
 
@@ -1157,19 +1230,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			float r = c[6], g = c[7], b = c[8];
 
 			// Convert stage-space (metres) to OSRS world coordinates.
-			float ox2 = camX + px / s;
+			float ox2 = camX - px / s;
 			float oy2 = camY - (py - oy) / s;
 			float oz2 = camZ + (pz - oz) / s;
 
+			float[] hit = (ci == 0) ? leftHit : rightHit;
 			float ex, ey, ez;
-			if (ci == 1 && rightHit != null)
+			if (hit != null)
 			{
-				// Use depth-sampled intersection point for right controller crosshair.
-				ex = rightHit[0]; ey = rightHit[1]; ez = rightHit[2];
+				ex = hit[0]; ey = hit[1]; ez = hit[2];
 			}
 			else
 			{
-				ex = camX + (px + dx * RAY_M) / s;
+				ex = camX - (px + dx * RAY_M) / s;
 				ey = camY - ((py + dy * RAY_M) - oy) / s;
 				ez = camZ + ((pz + dz * RAY_M) - oz) / s;
 			}
@@ -1178,13 +1251,144 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			debugRayFb.put(ox2).put(oy2).put(oz2).put(r).put(g).put(b).put(1f);
 			debugRayFb.put(ex) .put(ey) .put(ez) .put(r).put(g).put(b).put(1f);
 
-			// Crosshair at endpoint (X, Y, Z arms)
+			// Crosshair at endpoint (3 axes)
 			debugRayFb.put(ex - CROSS).put(ey).put(ez).put(r).put(g).put(b).put(1f);
 			debugRayFb.put(ex + CROSS).put(ey).put(ez).put(r).put(g).put(b).put(1f);
 			debugRayFb.put(ex).put(ey - CROSS).put(ez).put(r).put(g).put(b).put(1f);
 			debugRayFb.put(ex).put(ey + CROSS).put(ez).put(r).put(g).put(b).put(1f);
 			debugRayFb.put(ex).put(ey).put(ez - CROSS).put(r).put(g).put(b).put(1f);
 			debugRayFb.put(ex).put(ey).put(ez + CROSS).put(r).put(g).put(b).put(1f);
+
+			// Tile outline on the ground at the hit tile.
+			// Snap ex/ez to tile-grid SW corner; use ey for ground height.
+			if (hit != null)
+			{
+				float tx = (float) (((int) ex >> 7) << 7);
+				float tz = (float) (((int) ez >> 7) << 7);
+				float ty = ey;
+				// 4 segments: SW→SE, SE→NE, NE→NW, NW→SW
+				debugRayFb.put(tx       ).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx + TILE).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx + TILE).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx + TILE).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx + TILE).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx       ).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx       ).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
+				debugRayFb.put(tx       ).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
+			}
+		}
+
+		// Persistent click diagnostics: visible for 3 seconds.
+		if (vrLastClickHit != null && System.currentTimeMillis() - vrLastClickTimeMs < 3000)
+		{
+			float cx = vrLastClickHit[0], cy = vrLastClickHit[1], cz = vrLastClickHit[2];
+			final float BIG = 150f;
+			final float SMALL = BIG / 3f;
+
+			if (vrLastClickRay != null)
+			{
+				float rox = vrLastClickRay[0], roy = vrLastClickRay[1], roz = vrLastClickRay[2];
+				float rdx = vrLastClickRay[3], rdy = vrLastClickRay[4], rdz = vrLastClickRay[5];
+				float far = 6000f;
+				float rex = rox + rdx * far;
+				float rey = roy + rdy * far;
+				float rez = roz + rdz * far;
+				// Orange = actual VR click ray in OSRS coords.
+				debugRayFb.put(rox).put(roy).put(roz).put(1f).put(0.55f).put(0f).put(1f);
+				debugRayFb.put(rex).put(rey).put(rez).put(1f).put(0.55f).put(0f).put(1f);
+			}
+
+			if (vrLastGroundHit != null)
+			{
+				float gx = vrLastGroundHit[0], gy = vrLastGroundHit[1], gz = vrLastGroundHit[2];
+				// Yellow = resolved VR ground intersection point.
+				debugRayFb.put(gx - SMALL).put(gy).put(gz        ).put(1f).put(1f).put(0f).put(1f);
+				debugRayFb.put(gx + SMALL).put(gy).put(gz        ).put(1f).put(1f).put(0f).put(1f);
+				debugRayFb.put(gx        ).put(gy).put(gz - SMALL).put(1f).put(1f).put(0f).put(1f);
+				debugRayFb.put(gx        ).put(gy).put(gz + SMALL).put(1f).put(1f).put(0f).put(1f);
+			}
+
+			if (vrDesktopCameraAimTarget != null)
+			{
+				double cameraApiX = client.getCameraFpX();
+				double cameraApiY = client.getCameraFpY();
+				double cameraApiZ = client.getCameraFpZ();
+				double cameraPitchFp = client.getCameraFpPitch();
+				double cameraYawFp = client.getCameraFpYaw();
+				float originX = (float) cameraApiX;
+				float originY = (float) cameraApiZ;
+				float originZ = (float) cameraApiY;
+				// Blue cross = actual hidden desktop camera position after steering.
+				debugRayFb.put(originX - BIG).put(originY).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
+				debugRayFb.put(originX + BIG).put(originY).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
+				debugRayFb.put(originX).put(originY - BIG).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
+				debugRayFb.put(originX).put(originY + BIG).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
+				debugRayFb.put(originX).put(originY).put(originZ - BIG).put(0.2f).put(0.5f).put(1f).put(1f);
+				debugRayFb.put(originX).put(originY).put(originZ + BIG).put(0.2f).put(0.5f).put(1f).put(1f);
+				float dirApiX = (float) (-Math.cos(cameraPitchFp) * Math.sin(cameraYawFp));
+				float dirApiY = (float) (Math.cos(cameraPitchFp) * Math.cos(cameraYawFp));
+				float dirApiZ = (float) Math.sin(cameraPitchFp);
+				float dirX = dirApiX;
+				float dirY = dirApiZ;
+				float dirZ = dirApiY;
+				float far = 6000f;
+				// Lime = actual desktop camera center ray read back from the client after steering.
+				debugRayFb.put(originX).put(originY).put(originZ).put(0.4f).put(1f).put(0.1f).put(1f);
+				debugRayFb.put(originX + dirX * far).put(originY + dirY * far).put(originZ + dirZ * far).put(0.4f).put(1f).put(0.1f).put(1f);
+
+				float tx = vrDesktopCameraAimTarget[0];
+				float ty = vrDesktopCameraAimTarget[1];
+				float tz = vrDesktopCameraAimTarget[2];
+				// Purple = line from actual desktop camera position to the intended VR ground target.
+				debugRayFb.put(originX).put(originY).put(originZ).put(0.8f).put(0.1f).put(1f).put(0.95f);
+				debugRayFb.put(tx).put(ty).put(tz).put(0.8f).put(0.1f).put(1f).put(0.95f);
+
+				float pax = getVrAnchorWorldX();
+				float pay = getVrAnchorWorldY();
+				float paz = getVrAnchorWorldZ();
+				// Aqua = player anchor to intended target, i.e. the desired forward-facing direction.
+				debugRayFb.put(pax).put(pay).put(paz).put(0.1f).put(0.9f).put(1f).put(0.9f);
+				debugRayFb.put(tx).put(ty).put(tz).put(0.1f).put(0.9f).put(1f).put(0.9f);
+			}
+
+			if (vrLastDesktopRayHit != null)
+			{
+				float hx = vrLastDesktopRayHit[0], hy = vrLastDesktopRayHit[1], hz = vrLastDesktopRayHit[2];
+				// White cross = where the reconstructed desktop screen ray hits the ground.
+				debugRayFb.put(hx - BIG).put(hy).put(hz      ).put(1f).put(1f).put(1f).put(1f);
+				debugRayFb.put(hx + BIG).put(hy).put(hz      ).put(1f).put(1f).put(1f).put(1f);
+				debugRayFb.put(hx      ).put(hy).put(hz - BIG).put(1f).put(1f).put(1f).put(1f);
+				debugRayFb.put(hx      ).put(hy).put(hz + BIG).put(1f).put(1f).put(1f).put(1f);
+			}
+
+			if (vrLastDispatchSceneTile != null)
+			{
+				float dtx = vrLastDispatchSceneTile[0] * TILE;
+				float dtz = vrLastDispatchSceneTile[1] * TILE;
+				float dty = vrLastGroundHit != null ? vrLastGroundHit[1] : cy;
+				// Red = tile params actually sent to menuAction.
+				debugRayFb.put(dtx       ).put(dty).put(dtz       ).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx + TILE).put(dty).put(dtz       ).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx + TILE).put(dty).put(dtz       ).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx + TILE).put(dty).put(dtz + TILE).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx + TILE).put(dty).put(dtz + TILE).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx       ).put(dty).put(dtz + TILE).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx       ).put(dty).put(dtz + TILE).put(1f).put(0f).put(0f).put(1f);
+				debugRayFb.put(dtx       ).put(dty).put(dtz       ).put(1f).put(0f).put(0f).put(1f);
+			}
+
+			if (vrLastClientDestination != null)
+			{
+				float dx2 = vrLastClientDestination[0];
+				float dy2 = vrLastClientDestination[1];
+				float dz2 = vrLastClientDestination[2];
+				// Cyan = client local destination after the walk click.
+				debugRayFb.put(dx2 - BIG).put(dy2).put(dz2      ).put(0f).put(1f).put(1f).put(1f);
+				debugRayFb.put(dx2 + BIG).put(dy2).put(dz2      ).put(0f).put(1f).put(1f).put(1f);
+				debugRayFb.put(dx2      ).put(dy2).put(dz2 - BIG).put(0f).put(1f).put(1f).put(1f);
+				debugRayFb.put(dx2      ).put(dy2).put(dz2 + BIG).put(0f).put(1f).put(1f).put(1f);
+			}
+
 		}
 
 		debugRayFb.flip();
@@ -1205,16 +1409,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final float FAR = 10f;
 		final float s = DEFAULT_WORLD_SCALE;
 		final float anchorY = vrWorldAnchorY;
-		final float anchorZ = -1.5f;
+		final float anchorZ = VR_STAGE_CHARACTER_OFFSET_Z;
+		final float anchorWorldX = getVrAnchorWorldX();
+		final float anchorWorldY = getVrAnchorWorldY();
+		final float anchorWorldZ = getVrAnchorWorldZ();
 
 		float testX = rox + rdx * FAR;
 		float testY = roy + rdy * FAR;
 		float testZ = roz + rdz * FAR;
 
 		// Stage space → OSRS world
-		float wx = root.cameraX + testX / s;
-		float wy = root.cameraY - (testY - anchorY) / s;
-		float wz = root.cameraZ + (testZ - anchorZ) / s;
+		float wx = anchorWorldX - testX / s;
+		float wy = anchorWorldY - (testY - anchorY) / s;
+		float wz = anchorWorldZ + (testZ - anchorZ) / s;
 
 		// OSRS world → clip space
 		float[] proj = computeVrWorldProj(eye);
@@ -1282,9 +1489,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float stZ = r20*xEye + r21*yEye + r22*zEye + epz;
 
 		// Stage space → OSRS world
-		float osrsX = root.cameraX + stX / s;
-		float osrsY = root.cameraY - (stY - anchorY) / s;
-		float osrsZ = root.cameraZ + (stZ - anchorZ) / s;
+		float osrsX = anchorWorldX - stX / s;
+		float osrsY = anchorWorldY - (stY - anchorY) / s;
+		float osrsZ = anchorWorldZ + (stZ - anchorZ) / s;
 
 		return new float[]{osrsX, osrsY, osrsZ};
 	}
@@ -1298,16 +1505,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (xrInput == null || Float.isNaN(vrWorldAnchorY)) return;
 		if (!xrInput.isLeftActive() && !xrInput.isRightActive()) return;
 
-		// Sample right-eye depth buffer to find where the right controller ray hits geometry.
-		// Done on eye=1 so the right-eye FBO is bound and contains fresh scene depth.
-		if (eye == 1 && xrInput.isRightActive())
+		// Sample depth buffer on eye=1 (right eye FBO bound, fresh scene depth).
+		if (eye == 1)
 		{
-			vrRightRayHit = sampleDepthAtRay(1,
+			vrLeftRayHit  = xrInput.isLeftActive()  ? sampleDepthAtRay(1,
+				xrInput.getLeftPosX(),  xrInput.getLeftPosY(),  xrInput.getLeftPosZ(),
+				xrInput.getLeftDirX(),  xrInput.getLeftDirY(),  xrInput.getLeftDirZ()) : null;
+			vrRightRayHit = xrInput.isRightActive() ? sampleDepthAtRay(1,
 				xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
-				xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ());
+				xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ()) : null;
 		}
 
-		int n = buildDebugRayVerts(vrRightRayHit);
+		int n = buildDebugRayVerts(vrLeftRayHit, vrRightRayHit);
 		if (n == 0) return;
 
 		glBindVertexArray(debugVaoId);
@@ -1321,6 +1530,109 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glBindVertexArray(0);
 		glUseProgram(glProgram);
+
+		// Rising-edge click detection — runs once per frame on eye=1.
+		// Either trigger (LMB) or either squeeze (RMB) at the right-controller ray position.
+		if (eye == 1)
+		{
+			float lmb = Math.max(xrInput.getLeftTrigger(),  xrInput.getRightTrigger());
+			float rmb = Math.max(xrInput.getLeftSqueeze(),  xrInput.getRightSqueeze());
+
+			// Diagnostic: log when any button crosses 30%
+			if ((lmb > 0.3f && prevLmb <= 0.3f) || (rmb > 0.3f && prevRmb <= 0.3f))
+			{
+				log.info("VR input: lt={} rt={} ls={} rs={} leftHit={} rightHit={}",
+					xrInput.getLeftTrigger(), xrInput.getRightTrigger(),
+					xrInput.getLeftSqueeze(), xrInput.getRightSqueeze(),
+					vrLeftRayHit != null, vrRightRayHit != null);
+			}
+
+			// Prefer the hand that just pressed; fall back to any valid hit.
+			float[] activeHit = null;
+			if (xrInput.getRightTrigger() >= 0.7f || xrInput.getRightSqueeze() >= 0.7f)
+				activeHit = vrRightRayHit;
+			if (activeHit == null && (xrInput.getLeftTrigger() >= 0.7f || xrInput.getLeftSqueeze() >= 0.7f))
+				activeHit = vrLeftRayHit;
+			if (activeHit == null)
+				activeHit = vrRightRayHit != null ? vrRightRayHit : vrLeftRayHit;
+
+			if (activeHit != null)
+			{
+				boolean isLmb = lmb >= 0.7f && prevLmb < 0.7f;
+				boolean isRmb = rmb >= 0.7f && prevRmb < 0.7f;
+				if (isLmb || isRmb)
+				{
+					int btn = isLmb ? MouseEvent.BUTTON1 : MouseEvent.BUTTON3;
+					vrPendingClickHit = activeHit.clone();
+					vrPendingClickButton = btn;
+					vrLastClickHit = activeHit.clone();
+					vrLastClickButton = btn;
+					vrLastClickTimeMs = System.currentTimeMillis();
+
+					// Compute OSRS-space ray from the active controller for client-thread raycast.
+					// Right controller takes priority; fall back to left if right is not active.
+					boolean useRight = xrInput.getRightTrigger() >= 0.7f || xrInput.getRightSqueeze() >= 0.7f;
+					float spx, spy, spz, sdx, sdy, sdz;
+					if (useRight || !xrInput.isLeftActive())
+					{
+						spx = xrInput.getRightPosX(); spy = xrInput.getRightPosY(); spz = xrInput.getRightPosZ();
+						sdx = xrInput.getRightDirX(); sdy = xrInput.getRightDirY(); sdz = xrInput.getRightDirZ();
+					}
+					else
+					{
+						spx = xrInput.getLeftPosX(); spy = xrInput.getLeftPosY(); spz = xrInput.getLeftPosZ();
+						sdx = xrInput.getLeftDirX(); sdy = xrInput.getLeftDirY(); sdz = xrInput.getLeftDirZ();
+					}
+					final float s = DEFAULT_WORLD_SCALE;
+					float anchorWorldX = getVrAnchorWorldX();
+					float anchorWorldY = getVrAnchorWorldY();
+					float anchorWorldZ = getVrAnchorWorldZ();
+					float rox = anchorWorldX - spx / s;
+					float roy = anchorWorldY - (spy - vrWorldAnchorY) / s;
+					float roz = anchorWorldZ + (spz - VR_STAGE_CHARACTER_OFFSET_Z) / s;
+					float rdx;
+					float rdy;
+					float rdz;
+					if (activeHit != null)
+					{
+						// First diagnostic fix: derive the click ray from the visual depth hit.
+						// This keeps the client-thread ray aligned with the ray the user actually sees.
+						rdx = activeHit[0] - rox;
+						rdy = activeHit[1] - roy;
+						rdz = activeHit[2] - roz;
+						float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+						if (len > 1e-6f)
+						{
+							rdx /= len;
+							rdy /= len;
+							rdz /= len;
+						}
+						else
+						{
+							rdx = -sdx;
+							rdy = -sdy;
+							rdz = sdz;
+						}
+					}
+					else
+					{
+						// Y is flipped: OSRS Y increases downward, stage Y increases upward.
+						rdx = -sdx;
+						rdy = -sdy;
+						rdz = sdz;
+					}
+					vrPendingClickRay = new float[]{rox, roy, roz, rdx, rdy, rdz};
+					vrLastClickRay = vrPendingClickRay.clone();
+					log.info("VR {} triggered: depth=({},{},{}) stageDir=({},{},{}) clickDir=({},{},{})",
+						isLmb ? "LMB" : "RMB",
+						activeHit[0], activeHit[1], activeHit[2],
+						-sdx, -sdy, sdz,
+						rdx, rdy, rdz);
+				}
+			}
+			prevLmb = lmb;
+			prevRmb = rmb;
+		}
 	}
 
 	/**
@@ -1334,11 +1646,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 *       winding test that decides which faces are front-facing.</li>
 	 *   <li>Sort faces by depth ({@code p[2] - zero}).</li>
 	 * </ol>
-	 * Returns {@code [clipX, -clipY, clipW / DEFAULT_WORLD_SCALE]}:
+	 * Returns {@code [clipX, clipY, clipW / DEFAULT_WORLD_SCALE]}:
 	 * <ul>
 	 *   <li>clipX/clipY come from the VR eye perspective transform.</li>
-	 *   <li>Y is negated to restore CCW-front convention after the Y-scale flip
-	 *       (same reason we use {@code glCullFace(GL_FRONT)} in VR mode).</li>
+	 *   <li>X and Y are both flipped in the OSRS→VR world transform, preserving winding
+	 *       so normal back-face culling still applies in VR.</li>
 	 *   <li>clipW (view-space depth in VR metres) is divided by the world scale
 	 *       to convert back to OSRS units so that the {@code > 50} clip threshold holds.</li>
 	 * </ul>
@@ -1402,7 +1714,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			public float[] project(float wx, float wy, float wz, float[] out)
 			{
 				// Translate by -camera, scale (OSRS→VR metres, Y-flip), add world offset
-				float vx = (wx - camX) * s;
+				float vx = -(wx - camX) * s;
 				float vy = -(wy - camY) * s + oy;
 				float vz = (wz - camZ) * s + oz;
 
@@ -1517,8 +1829,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			if (Float.isNaN(vrWorldAnchorY))
 			{
 				float initialEyeY = vrViews.get(0).pose().position$().y();
-				vrWorldAnchorY = initialEyeY - 0.7f;
-				log.info("VR world anchor Y set to {} (eyeY={} - 0.7)", vrWorldAnchorY, initialEyeY);
+				vrWorldAnchorY = initialEyeY + VR_STAGE_CHARACTER_OFFSET_Y;
+				log.info("VR world anchor Y set to {} (eyeY={} {}m)", vrWorldAnchorY, initialEyeY, String.format("%+.1f", VR_STAGE_CHARACTER_OFFSET_Y));
 			}
 
 			// Build sorter projection after vrWorldAnchorY is guaranteed non-NaN.
@@ -1665,7 +1977,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// In VR mode the Y scale is negated, which reverses winding order for every
 		// triangle.  Switch to GL_FRONT so the rasterizer still discards the correct side.
 		glEnable(GL_CULL_FACE);
-		if (xrFrameStarted) { glCullFace(GL_FRONT); }
+		if (xrFrameStarted) { glCullFace(GL_BACK); }
 
 		// Enable blending
 		glEnable(GL_BLEND);
@@ -1702,6 +2014,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// Draw controller rays over left eye (state: blend/cull/depth already disabled).
 			drawDebugRays(0);
 
+			// Render a true desktop spectator pass from the vanilla/staged desktop camera
+			// instead of mirroring the left eye. This lets us validate staged WALK clicks
+			// against the same screen-space view the client consumes.
+			renderDesktopSpectatorPass();
+
 			// ---- Right eye pass (T3.3) ----
 			int rightFbo = eyeSwapchains[1].acquireImage();
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rightFbo);
@@ -1719,7 +2036,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glUniform4i(uniEntityTint, 0, 0, 0, 0);
 
 			glEnable(GL_CULL_FACE);
-			glCullFace(GL_FRONT); // Y-flip reverses winding; cull front to discard actual back faces
+			glCullFace(GL_BACK); // X/Y flips preserve winding parity; normal back-face culling applies
 			glEnable(GL_BLEND);
 			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
 			glDepthFunc(GL_GREATER);
@@ -1795,30 +2112,237 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glCullFace(GL_BACK); // restore default before leaving VR render path
 			glDisable(GL_CULL_FACE);
 			glDisable(GL_DEPTH_TEST);
+
 			// Draw controller rays over right eye before releasing swapchain image.
 			drawDebugRays(1);
 			eyeSwapchains[1].releaseImage();
 
-			// ---- Desktop mirror: blit left eye to AWT canvas (T3.5) ----
-			int defaultFbo = awtContext.getFramebuffer(false);
-			glBindFramebuffer(GL_READ_FRAMEBUFFER, vrLeftEyeFbo);
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, defaultFbo);
-			int mirrorW = getScaledValue(clientUI.getGraphicsConfiguration().getDefaultTransform().getScaleX(), client.getCanvasWidth());
-			int mirrorH = getScaledValue(clientUI.getGraphicsConfiguration().getDefaultTransform().getScaleY(), client.getCanvasHeight());
-			glBlitFramebuffer(0, 0, eyeSwapchains[0].getWidth(), eyeSwapchains[0].getHeight(),
-				0, 0, mirrorW, mirrorH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-			glBindFramebuffer(GL_READ_FRAMEBUFFER, defaultFbo);
-
 			eyeSwapchains[0].releaseImage();
 			currentEye = -1;
 
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, defaultFbo);
+			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, awtContext.getFramebuffer(false));
 			sceneFboValid = true;
 			return;
 		}
 
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, awtContext.getFramebuffer(false));
 		sceneFboValid = true;
+	}
+
+	private static final class DesktopViewport
+	{
+		final int x;
+		final int y;
+		final int width;
+		final int height;
+
+		private DesktopViewport(int x, int y, int width, int height)
+		{
+			this.x = x;
+			this.y = y;
+			this.width = width;
+			this.height = height;
+		}
+	}
+
+	private DesktopViewport getDesktopViewport()
+	{
+		int renderWidthOff = client.getViewportXOffset();
+		int renderHeightOff = client.getViewportYOffset();
+		int canvasWidth = client.getCanvasWidth();
+		int canvasHeight = client.getCanvasHeight();
+		int renderCanvasHeight = canvasHeight;
+		int renderViewportHeight = client.getViewportHeight();
+		int renderViewportWidth = client.getViewportWidth();
+
+		if (client.isStretchedEnabled())
+		{
+			Dimension dim = client.getStretchedDimensions();
+			renderCanvasHeight = dim.height;
+
+			double scaleFactorY = dim.getHeight() / canvasHeight;
+			double scaleFactorX = dim.getWidth() / canvasWidth;
+			final int padding = 1;
+
+			renderViewportHeight = (int) Math.ceil(scaleFactorY * renderViewportHeight) + padding * 2;
+			renderViewportWidth = (int) Math.ceil(scaleFactorX * renderViewportWidth) + padding * 2;
+			renderHeightOff = (int) Math.floor(scaleFactorY * renderHeightOff) - padding;
+			renderWidthOff = (int) Math.floor(scaleFactorX * renderWidthOff) - padding;
+		}
+
+		int y = renderCanvasHeight - renderViewportHeight - renderHeightOff;
+		return new DesktopViewport(renderWidthOff, y, renderViewportWidth, renderViewportHeight);
+	}
+
+	private void ensureDesktopSceneFbo()
+	{
+		final AntiAliasingMode antiAliasingMode = config.antiAliasingMode();
+		final Dimension stretchedDimensions = client.getStretchedDimensions();
+		final int canvasWidth = client.getCanvasWidth();
+		final int canvasHeight = client.getCanvasHeight();
+
+		final int stretchedCanvasWidth = client.isStretchedEnabled() ? stretchedDimensions.width : canvasWidth;
+		final int stretchedCanvasHeight = client.isStretchedEnabled() ? stretchedDimensions.height : canvasHeight;
+
+		if (lastStretchedCanvasWidth != stretchedCanvasWidth
+			|| lastStretchedCanvasHeight != stretchedCanvasHeight
+			|| lastAntiAliasingMode != antiAliasingMode
+			|| fboScene == -1)
+		{
+			shutdownFbo();
+
+			glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+			final int forcedAASamples = glGetInteger(GL_SAMPLES);
+			final int maxSamples = glGetInteger(GL_MAX_SAMPLES);
+			final int samples = forcedAASamples != 0 ? forcedAASamples :
+				Math.min(antiAliasingMode.getSamples(), maxSamples);
+
+			log.debug("Desktop spectator AA samples: {}, max samples: {}, forced samples: {}",
+				samples, maxSamples, forcedAASamples);
+
+			initFbo(stretchedCanvasWidth, stretchedCanvasHeight, samples);
+			lastStretchedCanvasWidth = stretchedCanvasWidth;
+			lastStretchedCanvasHeight = stretchedCanvasHeight;
+			lastAntiAliasingMode = antiAliasingMode;
+		}
+	}
+
+	private float[] computeDesktopWorldProj()
+	{
+		float desktopCameraPitch = (float) client.getCameraFpPitch();
+		float desktopCameraYaw = (float) client.getCameraFpYaw();
+		float desktopCameraX = (float) client.getCameraFpX();
+		float desktopCameraY = (float) client.getCameraFpZ();
+		float desktopCameraZ = (float) client.getCameraFpY();
+
+		float[] projectionMatrix = Mat4.scale(client.getScale(), client.getScale(), 1);
+		Mat4.mul(projectionMatrix, Mat4.projection(client.getViewportWidth(), client.getViewportHeight(), 50));
+		Mat4.mul(projectionMatrix, Mat4.rotateX(desktopCameraPitch));
+		Mat4.mul(projectionMatrix, Mat4.rotateY(desktopCameraYaw));
+		// cameraFp uses API convention: X=east, Y=north, Z=height.
+		// Scene/world rendering matrices use GPU convention: X=east, Y=height, Z=north.
+		Mat4.mul(projectionMatrix, Mat4.translate(-desktopCameraX, -desktopCameraY, -desktopCameraZ));
+		return projectionMatrix;
+	}
+
+	private void uploadMainCameraUniforms(float cameraYaw, float cameraPitch, float cameraX, float cameraY, float cameraZ)
+	{
+		uniformBuffer.clear();
+		uniformBuffer
+			.put(cameraYaw)
+			.put(cameraPitch)
+			.put(cameraX)
+			.put(cameraY)
+			.put(cameraZ);
+		uniformBuffer.flip();
+
+		glBindBuffer(GL_UNIFORM_BUFFER, glUniformBuffer.glBufferId);
+		glBufferData(GL_UNIFORM_BUFFER, uniformBuffer.getBuffer(), GL_DYNAMIC_DRAW);
+		glBindBuffer(GL_UNIFORM_BUFFER, 0);
+		uniformBuffer.clear();
+		glBindBufferBase(GL_UNIFORM_BUFFER, 0, glUniformBuffer.glBufferId);
+	}
+
+	private void renderDesktopSpectatorPass()
+	{
+		ensureDesktopSceneFbo();
+		int sky = client.getSkyboxColor();
+		DesktopViewport vp = getDesktopViewport();
+		int desktopCameraYaw = (int) client.getCameraFpYaw();
+		int desktopCameraPitch = (int) client.getCameraFpPitch();
+		int desktopCameraX = (int) client.getCameraFpX();
+		int desktopCameraY = (int) client.getCameraFpZ();
+		int desktopCameraZ = (int) client.getCameraFpY();
+
+		uploadMainCameraUniforms(
+			(float) client.getCameraFpYaw(),
+			(float) client.getCameraFpPitch(),
+			(float) client.getCameraFpX(),
+			(float) client.getCameraFpZ(),
+			(float) client.getCameraFpY());
+
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fboScene);
+		glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
+		glClearDepth(0d);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		glDpiAwareViewport(vp.x, vp.y, vp.width, vp.height);
+
+		glUseProgram(glProgram);
+		glUniformMatrix4fv(uniWorldProj, false, computeDesktopWorldProj());
+		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
+		glUniform4i(uniEntityTint, 0, 0, 0, 0);
+
+		glEnable(GL_CULL_FACE);
+		glCullFace(GL_BACK);
+		glEnable(GL_BLEND);
+		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
+		glDepthFunc(GL_GREATER);
+		glEnable(GL_DEPTH_TEST);
+
+		final int offset = SCENE_OFFSET >> 3;
+		for (int i = 0; i < vrOpaqueZones.size(); i++)
+		{
+			int[] zz = vrOpaqueZones.get(i);
+			updateEntityProjection(vrOpaqueProjs.get(i));
+			Zone z = root.zones[zz[0]][zz[1]];
+			if (z.initialized)
+			{
+				z.renderOpaque(zz[0] - offset, zz[1] - offset,
+					root.minLevel, root.level, root.maxLevel, root.hideRoofIds);
+			}
+		}
+
+		glUniform3i(uniBase, 0, 0, 0);
+		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
+		for (int i = 0; i < vrPassOpaqueCount; i++)
+		{
+			vaoO.vaos.get(i).draw();
+		}
+
+		if (vrPassPlayerCount > 0)
+		{
+			glDepthMask(false);
+			for (int i = 0; i < vrPassPlayerCount; i++)
+			{
+				vaoPO.vaos.get(i).draw();
+			}
+			glDepthMask(true);
+			glColorMask(false, false, false, false);
+			for (int i = 0; i < vrPassPlayerCount; i++)
+			{
+				vaoPO.vaos.get(i).draw();
+			}
+			glColorMask(true, true, true, true);
+		}
+
+		vaoA.unmap();
+		for (int i = 0; i < vrAlphaZones.size(); i++)
+		{
+			int[] za = vrAlphaZones.get(i);
+			int level = za[0], zx = za[1], zzc = za[2];
+			Zone z = root.zones[zx][zzc];
+			if (!z.initialized)
+			{
+				continue;
+			}
+
+			updateEntityProjection(vrAlphaProjs.get(i));
+			glUniform4i(uniEntityTint, 0, 0, 0, 0);
+			int dx = desktopCameraX - ((zx - offset) << 10);
+			int dz = desktopCameraZ - ((zzc - offset) << 10);
+			boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
+			z.renderAlpha(zx - offset, zzc - offset, desktopCameraYaw, desktopCameraPitch,
+				root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
+				!close || (vrScene.getOverrideAmount() > 0));
+		}
+
+		glDisable(GL_BLEND);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
+
+		// Restore the main-scene camera uniforms before continuing with the stereo VR path.
+		uploadMainCameraUniforms(cameraYaw, cameraPitch, root.cameraX, root.cameraY, root.cameraZ);
 	}
 
 	private void blitSceneFbo()
@@ -2115,6 +2639,97 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	@Subscribe
 	public void onPostClientTick(PostClientTick event)
 	{
+		processPendingStagedWalk();
+
+		// Process any pending VR controller click (ray produced on render thread).
+		float[] clickRay = vrPendingClickRay;
+		if (clickRay != null)
+		{
+			vrPendingClickRay = null;
+			int button = vrPendingClickButton;
+			float[] clickHit = vrPendingClickHit; // depth-buffer position for WALK fallback
+			vrPendingClickHit = null;
+
+			WorldView wvClick = client.getTopLevelWorldView();
+			if (wvClick != null)
+			{
+				float ox = clickRay[0], oy = clickRay[1], oz = clickRay[2];
+				float dx = clickRay[3], dy = clickRay[4], dz = clickRay[5];
+
+				VrGroundHit groundHit = vrIntersectGround(ox, oy, oz, dx, dy, dz, wvClick, clickHit);
+				List<VrMenuHit> hits = vrRaycastScene(ox, oy, oz, dx, dy, dz, wvClick, groundHit);
+
+				StringBuilder menuLog = new StringBuilder();
+				menuLog.append("VR ").append(button == MouseEvent.BUTTON1 ? "LMB" : "RMB")
+					.append(" menu (").append(hits.size()).append(" hits)");
+
+				if (groundHit != null)
+				{
+					menuLog.append(" ground=(").append(groundHit.sceneX).append(",").append(groundHit.sceneY)
+						.append(") t=").append(String.format("%.1f", groundHit.t))
+						.append(" local=(").append(String.format("%.1f", groundHit.x)).append(',')
+						.append(String.format("%.1f", groundHit.y)).append(',')
+						.append(String.format("%.1f", groundHit.z)).append(')');
+				}
+				menuLog.append('\n');
+
+				int entryCount = 0;
+				for (VrMenuHit hit : hits)
+				{
+					for (VrMenuEntry entry : hit.entries)
+					{
+						menuLog.append(String.format("  %2d. %s %s  [t=%.1f, %s]\n",
+							++entryCount, entry.option, entry.target, hit.t, hit.entityType));
+					}
+				}
+
+				if (groundHit != null)
+				{
+					menuLog.append(String.format("  %2d. Walk here  [scene=%d,%d, t=%.1f]\n",
+						++entryCount, groundHit.sceneX, groundHit.sceneY, groundHit.t));
+				}
+				menuLog.append(String.format("  %2d. Cancel\n", ++entryCount));
+				log.info("{}", menuLog);
+				log.info("VR click diag: rayOrigin=({},{},{}) rayDir=({},{},{}) depthHit={} groundHit={}",
+					String.format("%.1f", ox), String.format("%.1f", oy), String.format("%.1f", oz),
+					String.format("%.4f", dx), String.format("%.4f", dy), String.format("%.4f", dz),
+					clickHit == null ? "null" : String.format("(%.1f,%.1f,%.1f)", clickHit[0], clickHit[1], clickHit[2]),
+					groundHit == null ? "null" : String.format("(scene=%d,%d local=%.1f,%.1f,%.1f t=%.1f)",
+						groundHit.sceneX, groundHit.sceneY, groundHit.x, groundHit.y, groundHit.z, groundHit.t));
+
+				vrLastGroundHit = groundHit == null ? null : new float[]{groundHit.x, groundHit.y, groundHit.z};
+				updateClientWalkDiagnostics(wvClick);
+
+				VrMenuEntry defaultEntry = !hits.isEmpty() && !hits.get(0).entries.isEmpty()
+					? hits.get(0).entries.get(0)
+					: null;
+
+				if (button == MouseEvent.BUTTON1)
+				{
+					if (defaultEntry != null)
+					{
+						vrLastWalkParams = null;
+						vrLastDispatchSceneTile = defaultEntry.action == MenuAction.WALK ? null : new int[]{defaultEntry.p0, defaultEntry.p1};
+						log.info("VR LMB dispatch: {} {} action={} p0={} p1={} id={} itemId={}",
+							defaultEntry.option, defaultEntry.target, defaultEntry.action,
+							defaultEntry.p0, defaultEntry.p1, defaultEntry.id, defaultEntry.itemId);
+						client.menuAction(defaultEntry.p0, defaultEntry.p1, defaultEntry.action,
+							defaultEntry.id, defaultEntry.itemId, defaultEntry.option, defaultEntry.target);
+					}
+					else if (groundHit != null)
+					{
+						cancelPendingWalkInspection();
+						vrLastWalkParams = null;
+						vrLastClientSelectedSceneTile = null;
+						vrLastClientDestination = null;
+						vrLastDispatchSceneTile = new int[]{groundHit.sceneX, groundHit.sceneY};
+						aimDesktopCameraAtGroundHit(groundHit);
+						beginStagedWalkDispatch(groundHit);
+					}
+				}
+			}
+		}
+
 		WorldView wv = client.getTopLevelWorldView();
 		if (wv == null)
 		{
@@ -2280,8 +2895,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glClearColor(0, 0, 0, 1);
 		glClear(GL_COLOR_BUFFER_BIT);
 
-		// In VR mode the left eye was already blitted to the AWT canvas in postDrawToplevel.
-		if (sceneFboValid && !xrFrameStarted)
+		if (sceneFboValid)
 		{
 			blitSceneFbo();
 		}
@@ -3008,5 +3622,1087 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 			log.debug("glGetError:", new Exception(errStr));
 		}
+	}
+
+	// -------------------------------------------------------------------------
+	// VR ray-scene intersection (client thread)
+	// -------------------------------------------------------------------------
+
+	/** Holds one intersected entity and its available menu options. */
+	private static final class VrMenuHit
+	{
+		float t;
+		String entityType;
+		String entityName;
+		int sceneX;
+		int sceneY;
+		List<VrMenuEntry> entries = new ArrayList<>();
+	}
+
+	private static final class VrMenuEntry
+	{
+		String option;
+		String target;
+		MenuAction action;
+		int p0;
+		int p1;
+		int id;
+		int itemId = -1;
+	}
+
+	private static final class VrGroundHit
+	{
+		float t;
+		float x;
+		float y;
+		float z;
+		int sceneX;
+		int sceneY;
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		MenuAction action = event.getMenuAction();
+		if (action == MenuAction.WALK
+			|| action == MenuAction.NPC_FIRST_OPTION
+			|| action == MenuAction.GAME_OBJECT_FIRST_OPTION
+			|| action == MenuAction.GROUND_ITEM_FIRST_OPTION
+			|| action == MenuAction.PLAYER_FIRST_OPTION
+			|| action == MenuAction.EXAMINE_NPC
+			|| action == MenuAction.EXAMINE_OBJECT
+			|| action == MenuAction.EXAMINE_ITEM_GROUND)
+		{
+			log.info("MenuOptionClicked diag: action={} option='{}' target='{}' p0={} p1={} id={} itemId={}",
+				action, event.getMenuOption(), event.getMenuTarget(),
+				event.getParam0(), event.getParam1(), event.getId(), event.getItemId());
+			if (action == MenuAction.WALK)
+			{
+				WorldView wv = client.getTopLevelWorldView();
+				updateClientWalkDiagnostics(wv);
+				logClientWalkState("from MenuOptionClicked", wv);
+			}
+		}
+	}
+
+	private static final class VrRenderablePlacement
+	{
+		final Renderable renderable;
+		final int orientation;
+		final int x;
+		final int y;
+		final int z;
+
+		private VrRenderablePlacement(Renderable renderable, int orientation, int x, int y, int z)
+		{
+			this.renderable = renderable;
+			this.orientation = orientation;
+			this.x = x;
+			this.y = y;
+			this.z = z;
+		}
+	}
+
+	/**
+	 * Cast a ray through the scene, collecting all intersected entities sorted by distance.
+	 * Tests actors and tile entities against actual model geometry, plus ground tiles for Walk here.
+	 * Must be called on the client thread.
+	 */
+	private List<VrMenuHit> vrRaycastScene(float ox, float oy, float oz,
+		float dx, float dy, float dz, WorldView wv, VrGroundHit groundHit)
+	{
+		List<VrMenuHit> hits = new ArrayList<>();
+		int plane = wv.getPlane();
+
+		for (NPC npc : wv.npcs())
+		{
+			if (npc == null) continue;
+			VrMenuHit hit = buildNpcHit(ox, oy, oz, dx, dy, dz, plane, npc);
+			if (hit != null)
+			{
+				hits.add(hit);
+			}
+		}
+
+		for (Player player : wv.players())
+		{
+			if (player == null || player == client.getLocalPlayer())
+			{
+				continue;
+			}
+
+			VrMenuHit hit = buildPlayerHit(ox, oy, oz, dx, dy, dz, plane, player);
+			if (hit != null)
+			{
+				hits.add(hit);
+			}
+		}
+
+		Tile[][][] sceneTiles = wv.getScene().getTiles();
+		if (plane >= 0 && plane < sceneTiles.length && sceneTiles[plane] != null)
+		{
+			for (int scX = 0; scX < wv.getSizeX(); scX++)
+			{
+				for (int scY = 0; scY < wv.getSizeY(); scY++)
+				{
+					Tile tile = sceneTiles[plane][scX][scY];
+					if (tile == null) continue;
+
+					for (GameObject obj : tile.getGameObjects())
+					{
+						if (obj == null || obj.getId() == -1) continue;
+						if (!obj.getSceneMinLocation().equals(tile.getSceneLocation()))
+						{
+							continue;
+						}
+						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+							"GameObject",
+							clampScene(obj.getX() >> 7, wv.getSizeX()),
+							clampScene(obj.getY() >> 7, wv.getSizeY()),
+							obj.getId(),
+							new VrRenderablePlacement(obj.getRenderable(), obj.getModelOrientation() & 2047, obj.getX(), obj.getZ(), obj.getY()));
+						if (hit != null)
+						{
+							hits.add(hit);
+						}
+					}
+
+					WallObject wall = tile.getWallObject();
+					if (wall != null && wall.getId() != -1)
+					{
+						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+							"WallObject",
+							scX,
+							scY,
+							wall.getId(),
+							new VrRenderablePlacement(wall.getRenderable1(), 0, wall.getX(), wall.getZ(), wall.getY()),
+							new VrRenderablePlacement(wall.getRenderable2(), 0, wall.getX(), wall.getZ(), wall.getY()));
+						if (hit != null)
+						{
+							hits.add(hit);
+						}
+					}
+
+					DecorativeObject deco = tile.getDecorativeObject();
+					if (deco != null && deco.getId() != -1)
+					{
+						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+							"DecorativeObject",
+							scX,
+							scY,
+							deco.getId(),
+							new VrRenderablePlacement(deco.getRenderable(), 0,
+								deco.getX() + deco.getXOffset(), deco.getZ(), deco.getY() + deco.getYOffset()),
+							new VrRenderablePlacement(deco.getRenderable2(), 0,
+								deco.getX() + deco.getXOffset2(), deco.getZ(), deco.getY() + deco.getYOffset2()));
+						if (hit != null)
+						{
+							hits.add(hit);
+						}
+					}
+
+					GroundObject ground = tile.getGroundObject();
+					if (ground != null && ground.getId() != -1)
+					{
+						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+							"GroundObject",
+							scX,
+							scY,
+							ground.getId(),
+							new VrRenderablePlacement(ground.getRenderable(), 0, ground.getX(), ground.getZ(), ground.getY()));
+						if (hit != null)
+						{
+							hits.add(hit);
+						}
+					}
+
+					List<TileItem> items = tile.getGroundItems();
+					if (items != null && !items.isEmpty())
+					{
+						float itemT = groundHit != null && groundHit.sceneX == scX && groundHit.sceneY == scY
+							? groundHit.t
+							: rayBoxTest(ox, oy, oz, dx, dy, dz,
+								scX * 128f, tileHeightAtScene(wv, scX, scY, plane) - 60f, scY * 128f,
+								scX * 128f + 128f, tileHeightAtScene(wv, scX, scY, plane) + 16f, scY * 128f + 128f);
+						if (itemT <= 0f)
+						{
+							continue;
+						}
+
+						for (TileItem item : items)
+						{
+							if (item == null) continue;
+							VrMenuHit hit = buildGroundItemHit(itemT, scX, scY, item);
+							if (hit != null)
+							{
+								hits.add(hit);
+							}
+						}
+					}
+				}
+			}
+		}
+
+		hits.sort((a, b) -> Float.compare(a.t, b.t));
+		return hits;
+	}
+
+	private VrMenuHit buildNpcHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, NPC npc)
+	{
+		Model model = npc.getModel();
+		LocalPoint lp = npc.getLocalLocation();
+		if (model == null || lp == null)
+		{
+			return null;
+		}
+
+		float t = rayTestModel(ox, oy, oz, dx, dy, dz, model, npc.getCurrentOrientation() & 2047,
+			lp.getX(), Perspective.getTileHeight(client, lp, plane), lp.getY());
+		if (t <= 0f)
+		{
+			return null;
+		}
+
+		NPCComposition comp = npc.getTransformedComposition();
+		if (comp == null)
+		{
+			comp = npc.getComposition();
+		}
+
+		VrMenuHit hit = new VrMenuHit();
+		hit.t = t;
+		hit.entityType = "npc";
+		hit.entityName = safeName(npc.getName(), "NPC");
+		hit.sceneX = lp.getX() >> 7;
+		hit.sceneY = lp.getY() >> 7;
+
+		MenuAction[] actions = {
+			MenuAction.NPC_FIRST_OPTION,
+			MenuAction.NPC_SECOND_OPTION,
+			MenuAction.NPC_THIRD_OPTION,
+			MenuAction.NPC_FOURTH_OPTION,
+			MenuAction.NPC_FIFTH_OPTION
+		};
+		addEntries(hit, comp != null ? comp.getActions() : null, actions, npc.getIndex(), 0, 0, hit.entityName);
+		addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_NPC, 0, 0, npc.getIndex(), -1);
+		return hit;
+	}
+
+	private VrMenuHit buildPlayerHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, Player player)
+	{
+		Model model = player.getModel();
+		LocalPoint lp = player.getLocalLocation();
+		if (model == null || lp == null)
+		{
+			return null;
+		}
+
+		float t = rayTestModel(ox, oy, oz, dx, dy, dz, model, player.getCurrentOrientation() & 2047,
+			lp.getX(), Perspective.getTileHeight(client, lp, plane), lp.getY());
+		if (t <= 0f)
+		{
+			return null;
+		}
+
+		VrMenuHit hit = new VrMenuHit();
+		hit.t = t;
+		hit.entityType = "player";
+		hit.entityName = safeName(player.getName(), "Player");
+		hit.sceneX = lp.getX() >> 7;
+		hit.sceneY = lp.getY() >> 7;
+
+		MenuAction[] actions = {
+			MenuAction.PLAYER_FIRST_OPTION,
+			MenuAction.PLAYER_SECOND_OPTION,
+			MenuAction.PLAYER_THIRD_OPTION,
+			MenuAction.PLAYER_FOURTH_OPTION,
+			MenuAction.PLAYER_FIFTH_OPTION,
+			MenuAction.PLAYER_SIXTH_OPTION,
+			MenuAction.PLAYER_SEVENTH_OPTION,
+			MenuAction.PLAYER_EIGHTH_OPTION
+		};
+		addEntries(hit, client.getPlayerOptions(), actions, player.getId(), 0, 0, hit.entityName);
+		return hit.entries.isEmpty() ? null : hit;
+	}
+
+	private VrMenuHit buildObjectHit(float ox, float oy, float oz, float dx, float dy, float dz,
+		String entityType, int sceneX, int sceneY, int objId, VrRenderablePlacement... placements)
+	{
+		ObjectComposition def = client.getObjectDefinition(objId);
+		if (def == null)
+		{
+			return null;
+		}
+		if (def.getImpostorIds() != null)
+		{
+			ObjectComposition impostor = def.getImpostor();
+			if (impostor != null)
+			{
+				def = impostor;
+			}
+		}
+
+		float bestT = Float.MAX_VALUE;
+		for (VrRenderablePlacement placement : placements)
+		{
+			if (placement == null || placement.renderable == null)
+			{
+				continue;
+			}
+
+			Model model = placement.renderable.getModel();
+			if (model == null)
+			{
+				continue;
+			}
+
+			float t = rayTestModel(ox, oy, oz, dx, dy, dz, model, placement.orientation, placement.x, placement.y, placement.z);
+			if (t > 0f && t < bestT)
+			{
+				bestT = t;
+			}
+		}
+
+		if (bestT == Float.MAX_VALUE)
+		{
+			return null;
+		}
+
+		VrMenuHit hit = new VrMenuHit();
+		hit.t = bestT;
+		hit.entityType = entityType;
+		hit.entityName = safeName(def.getName(), "Object");
+		hit.sceneX = sceneX;
+		hit.sceneY = sceneY;
+
+		MenuAction[] actions = {
+			MenuAction.GAME_OBJECT_FIRST_OPTION,
+			MenuAction.GAME_OBJECT_SECOND_OPTION,
+			MenuAction.GAME_OBJECT_THIRD_OPTION,
+			MenuAction.GAME_OBJECT_FOURTH_OPTION,
+			MenuAction.GAME_OBJECT_FIFTH_OPTION
+		};
+		addEntries(hit, def.getActions(), actions, objId, sceneX, sceneY, hit.entityName);
+		addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_OBJECT, sceneX, sceneY, objId, -1);
+		return hit;
+	}
+
+	private VrMenuHit buildGroundItemHit(float t, int sceneX, int sceneY, TileItem item)
+	{
+		ItemComposition def = client.getItemDefinition(item.getId());
+		if (def == null)
+		{
+			return null;
+		}
+
+		VrMenuHit hit = new VrMenuHit();
+		hit.t = t;
+		hit.entityType = "ground-item";
+		hit.entityName = safeName(def.getName(), "Item");
+		hit.sceneX = sceneX;
+		hit.sceneY = sceneY;
+
+		addEntry(hit, "Take", hit.entityName, MenuAction.GROUND_ITEM_FIRST_OPTION, sceneX, sceneY, item.getId(), item.getId());
+		addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_ITEM_GROUND, sceneX, sceneY, item.getId(), item.getId());
+		return hit;
+	}
+
+	private static void addEntries(VrMenuHit hit, String[] options, MenuAction[] actions, int id, int p0, int p1, String target)
+	{
+		if (options == null)
+		{
+			return;
+		}
+
+		for (int i = 0; i < options.length && i < actions.length; i++)
+		{
+			String option = options[i];
+			if (option == null || option.isEmpty() || "null".equals(option))
+			{
+				continue;
+			}
+			addEntry(hit, option, target, actions[i], p0, p1, id, -1);
+		}
+	}
+
+	private static void addEntry(VrMenuHit hit, String option, String target, MenuAction action, int p0, int p1, int id, int itemId)
+	{
+		VrMenuEntry entry = new VrMenuEntry();
+		entry.option = option;
+		entry.target = target;
+		entry.action = action;
+		entry.p0 = p0;
+		entry.p1 = p1;
+		entry.id = id;
+		entry.itemId = itemId;
+		hit.entries.add(entry);
+	}
+
+	private VrGroundHit vrIntersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv, float[] fallbackHit)
+	{
+		VrGroundHit best = null;
+		Tile[][][] tiles = wv.getScene().getTiles();
+		int plane = wv.getPlane();
+		if (plane >= 0 && plane < tiles.length && tiles[plane] != null)
+		{
+			for (int sceneX = 0; sceneX < wv.getSizeX(); sceneX++)
+			{
+				for (int sceneY = 0; sceneY < wv.getSizeY(); sceneY++)
+				{
+					Tile tile = tiles[plane][sceneX][sceneY];
+					if (tile == null)
+					{
+						continue;
+					}
+
+					VrGroundHit hit = intersectGroundTile(ox, oy, oz, dx, dy, dz, wv, plane, sceneX, sceneY, tile);
+					if (hit != null && (best == null || hit.t < best.t))
+					{
+						best = hit;
+					}
+				}
+			}
+		}
+
+		if (best == null && fallbackHit != null)
+		{
+			VrGroundHit fallback = new VrGroundHit();
+			fallback.x = fallbackHit[0];
+			fallback.y = fallbackHit[1];
+			fallback.z = fallbackHit[2];
+			fallback.sceneX = clampScene((int) fallbackHit[0] >> 7, wv.getSizeX());
+			fallback.sceneY = clampScene((int) fallbackHit[2] >> 7, wv.getSizeY());
+			fallback.t = distanceAlongRay(ox, oy, oz, dx, dy, dz, fallback.x, fallback.y, fallback.z);
+			best = fallback;
+		}
+		return best;
+	}
+
+	private VrGroundHit intersectGroundTile(float ox, float oy, float oz, float dx, float dy, float dz,
+		WorldView wv, int plane, int sceneX, int sceneY, Tile tile)
+	{
+		SceneTileModel model = tile.getSceneTileModel();
+		if (model != null)
+		{
+			int[] faceX = model.getFaceX();
+			int[] faceY = model.getFaceY();
+			int[] faceZ = model.getFaceZ();
+			int[] vertexX = model.getVertexX();
+			int[] vertexY = model.getVertexY();
+			int[] vertexZ = model.getVertexZ();
+			if (faceX != null && faceY != null && faceZ != null && vertexX != null && vertexY != null && vertexZ != null)
+			{
+				VrGroundHit best = null;
+				for (int i = 0; i < faceX.length; i++)
+				{
+					int a = faceX[i];
+					int b = faceY[i];
+					int c = faceZ[i];
+					float t = rayTriangleMT(ox, oy, oz, dx, dy, dz,
+						vertexX[a], vertexY[a], vertexZ[a],
+						vertexX[b], vertexY[b], vertexZ[b],
+						vertexX[c], vertexY[c], vertexZ[c]);
+					if (t > 0f && (best == null || t < best.t))
+					{
+						best = buildGroundHit(ox, oy, oz, dx, dy, dz, t, sceneX, sceneY);
+					}
+				}
+				if (best != null)
+				{
+					return best;
+				}
+			}
+		}
+
+		SceneTilePaint paint = tile.getSceneTilePaint();
+		if (paint == null)
+		{
+			return null;
+		}
+
+		float baseX = sceneX * 128f;
+		float baseZ = sceneY * 128f;
+		float swY = tileHeightAtScene(wv, sceneX, sceneY, plane);
+		float seY = tileHeightAtScene(wv, sceneX + 1, sceneY, plane);
+		float neY = tileHeightAtScene(wv, sceneX + 1, sceneY + 1, plane);
+		float nwY = tileHeightAtScene(wv, sceneX, sceneY + 1, plane);
+
+		float t1 = rayTriangleMT(ox, oy, oz, dx, dy, dz,
+			baseX, swY, baseZ,
+			baseX + 128f, seY, baseZ,
+			baseX + 128f, neY, baseZ + 128f);
+		float t2 = rayTriangleMT(ox, oy, oz, dx, dy, dz,
+			baseX, swY, baseZ,
+			baseX + 128f, neY, baseZ + 128f,
+			baseX, nwY, baseZ + 128f);
+
+		float t = -1f;
+		if (t1 > 0f)
+		{
+			t = t1;
+		}
+		if (t2 > 0f && (t < 0f || t2 < t))
+		{
+			t = t2;
+		}
+		return t > 0f ? buildGroundHit(ox, oy, oz, dx, dy, dz, t, sceneX, sceneY) : null;
+	}
+
+	private static VrGroundHit buildGroundHit(float ox, float oy, float oz, float dx, float dy, float dz, float t, int sceneX, int sceneY)
+	{
+		VrGroundHit hit = new VrGroundHit();
+		hit.t = t;
+		hit.x = ox + dx * t;
+		hit.y = oy + dy * t;
+		hit.z = oz + dz * t;
+		hit.sceneX = sceneX;
+		hit.sceneY = sceneY;
+		return hit;
+	}
+
+	private static float tileHeightAtScene(WorldView wv, int sceneX, int sceneY, int plane)
+	{
+		int clampedX = clampScene(sceneX, wv.getSizeX() + 1);
+		int clampedY = clampScene(sceneY, wv.getSizeY() + 1);
+		return wv.getTileHeights()[plane][clampedX][clampedY];
+	}
+
+	private static String safeName(String value, String fallback)
+	{
+		return value == null || value.isEmpty() || "null".equals(value) ? fallback : value;
+	}
+
+	private static int clampScene(int coord, int size)
+	{
+		return Math.max(0, Math.min(coord, size - 1));
+	}
+
+	private static int getWalkSceneParamOffset(WorldView wv)
+	{
+		return wv != null && wv.isTopLevel() ? SCENE_OFFSET : 0;
+	}
+
+	private float getVrAnchorWorldX()
+	{
+		Player player = client.getLocalPlayer();
+		LocalPoint lp = player != null ? player.getLocalLocation() : null;
+		if (lp != null)
+		{
+			return lp.getX();
+		}
+		return root.cameraX;
+	}
+
+	private float getVrAnchorWorldY()
+	{
+		Player player = client.getLocalPlayer();
+		LocalPoint lp = player != null ? player.getLocalLocation() : null;
+		WorldView wv = client.getTopLevelWorldView();
+		if (lp != null && wv != null)
+		{
+			return wv.getTileHeight(lp.getX(), lp.getY(), wv.getPlane());
+		}
+		return root.cameraY;
+	}
+
+	private float getVrAnchorWorldZ()
+	{
+		Player player = client.getLocalPlayer();
+		LocalPoint lp = player != null ? player.getLocalLocation() : null;
+		if (lp != null)
+		{
+			return lp.getY();
+		}
+		return root.cameraZ;
+	}
+
+	private void cancelPendingWalkInspection()
+	{
+		vrPendingWalkInspect = null;
+		vrPendingWalkCanvasPoint = null;
+		vrPendingWalkMousePrimed = false;
+		vrPendingWalkInspectRetries = 0;
+	}
+
+	private void beginStagedWalkDispatch(VrGroundHit groundHit)
+	{
+		vrPendingWalkInspect = new float[]{
+			groundHit.sceneX, groundHit.sceneY,
+			groundHit.x, groundHit.y, groundHit.z
+		};
+		vrPendingWalkCanvasPoint = null;
+		vrPendingWalkMousePrimed = false;
+		vrPendingWalkInspectRetries = 1;
+		log.info("VR staged walk begin: scene=({}, {}) local=({},{},{}) delayTicks={}",
+			groundHit.sceneX, groundHit.sceneY,
+			String.format("%.1f", groundHit.x), String.format("%.1f", groundHit.y), String.format("%.1f", groundHit.z),
+			vrPendingWalkInspectRetries);
+	}
+
+	private void aimDesktopCameraAtGroundHit(VrGroundHit groundHit)
+	{
+		applyDesktopCameraMaxZoomOut();
+
+		double cameraApiX = client.getCameraFpX();
+		double cameraApiY = client.getCameraFpY();
+		double cameraApiZ = client.getCameraFpZ();
+		Player player = client.getLocalPlayer();
+		LocalPoint playerLocal = player != null ? player.getLocalLocation() : null;
+		double playerX = playerLocal != null ? playerLocal.getX() : getVrAnchorWorldX();
+		double playerZ = playerLocal != null ? playerLocal.getY() : getVrAnchorWorldZ();
+		double targetX = groundHit.x;
+		double targetZ = groundHit.z;
+		double dx = targetX - playerX;
+		double dz = targetZ - playerZ;
+		double horizontal = Math.hypot(dx, dz);
+		if (horizontal < 1e-3)
+		{
+			horizontal = 1e-3;
+		}
+
+		int desiredYaw = radiansToJau(Math.atan2(-dx, dz));
+		int desiredPitch = VR_DESKTOP_AIM_PITCH;
+
+		client.setCameraPitchRelaxerEnabled(true);
+		client.setCameraSpeed(999f);
+		client.setCameraYawTarget(desiredYaw);
+		client.setCameraPitchTarget(desiredPitch);
+
+		vrDesktopCameraAimTarget = new float[]{groundHit.x, groundHit.y, groundHit.z};
+		vrDesktopCameraAimAngles = new int[]{desiredYaw, desiredPitch};
+		log.info("VR desktop camera aim: targetScene=({}, {}) targetLocalGpu=({},{},{}) desiredYaw={} desiredPitch={} currentYaw={} currentPitch={}",
+			groundHit.sceneX, groundHit.sceneY,
+			String.format("%.1f", groundHit.x), String.format("%.1f", groundHit.y), String.format("%.1f", groundHit.z),
+			desiredYaw, desiredPitch,
+			client.getCameraYaw(), client.getCameraPitch());
+	}
+
+	private void applyDesktopCameraMaxZoomOut()
+	{
+		int fixedMin = client.getVarcIntValue(VarClientID.CAMERA_ZOOM_SMALL_MIN);
+		int fixedMax = client.getVarcIntValue(VarClientID.CAMERA_ZOOM_SMALL_MAX);
+		int resizableMin = client.getVarcIntValue(VarClientID.CAMERA_ZOOM_BIG_MIN);
+		int resizableMax = client.getVarcIntValue(VarClientID.CAMERA_ZOOM_BIG_MAX);
+		int fixedBefore = client.getVarcIntValue(VarClientInt.CAMERA_ZOOM_FIXED_VIEWPORT);
+		int resizableBefore = client.getVarcIntValue(VarClientInt.CAMERA_ZOOM_RESIZABLE_VIEWPORT);
+
+		client.setVarcIntValue(VarClientInt.CAMERA_ZOOM_FIXED_VIEWPORT, fixedMin);
+		client.setVarcIntValue(VarClientInt.CAMERA_ZOOM_RESIZABLE_VIEWPORT, resizableMin);
+		client.runScript(ScriptID.CAMERA_DO_ZOOM, fixedMin, resizableMin);
+
+	}
+
+	private static int radiansToJau(double radians)
+	{
+		int angle = (int) Math.round(radians / Perspective.UNIT);
+		angle %= 2048;
+		if (angle < 0)
+		{
+			angle += 2048;
+		}
+		return angle;
+	}
+
+	private net.runelite.api.Point projectStagedWalkCanvasPoint(float[] pending, WorldView wv)
+	{
+		int centerX = client.getViewportXOffset() + client.getViewportWidth() / 2;
+		LocalPoint tileCenter = LocalPoint.fromScene((int) pending[0], (int) pending[1], wv);
+		if (tileCenter != null)
+		{
+			Polygon poly = Perspective.getCanvasTilePoly(client, tileCenter);
+			if (poly != null && poly.npoints > 0)
+			{
+				int sx = 0;
+				int sy = 0;
+				for (int i = 0; i < poly.npoints; i++)
+				{
+					sx += poly.xpoints[i];
+					sy += poly.ypoints[i];
+				}
+				return new net.runelite.api.Point(centerX, sy / poly.npoints);
+			}
+		}
+
+		net.runelite.api.Point projected = Perspective.localToCanvas(
+			client,
+			wv.getId(),
+			Math.round(pending[2]),
+			Math.round(pending[4]),
+			Math.round(pending[3]));
+		if (projected == null)
+		{
+			return null;
+		}
+		return new net.runelite.api.Point(centerX, projected.getY());
+	}
+
+	private void primeCanvasMouseForWalk(int canvasX, int canvasY)
+	{
+		Canvas targetCanvas = canvas != null ? canvas : client.getCanvas();
+		if (targetCanvas == null)
+		{
+			return;
+		}
+
+		long now = System.currentTimeMillis();
+		targetCanvas.dispatchEvent(new MouseEvent(
+			targetCanvas,
+			MouseEvent.MOUSE_ENTERED,
+			now,
+			0,
+			canvasX,
+			canvasY,
+			0,
+			false,
+			MouseEvent.NOBUTTON));
+		targetCanvas.dispatchEvent(new MouseEvent(
+			targetCanvas,
+			MouseEvent.MOUSE_MOVED,
+			now,
+			0,
+			canvasX,
+			canvasY,
+			0,
+			false,
+			MouseEvent.NOBUTTON));
+	}
+
+	private float[] reconstructDesktopScreenRayGroundHit(int canvasX, int canvasY, WorldView wv)
+	{
+		final float viewportXMiddle = client.getViewportWidth() / 2f;
+		final float viewportYMiddle = client.getViewportHeight() / 2f;
+		final float viewportXOffset = client.getViewportXOffset();
+		final float viewportYOffset = client.getViewportYOffset();
+		final float zoom3d = client.getScale();
+
+		float sx = canvasX - viewportXOffset - viewportXMiddle;
+		float sy = canvasY - viewportYOffset - viewportYMiddle;
+
+		double cameraPitch = client.getCameraFpPitch();
+		double cameraYaw = client.getCameraFpYaw();
+		float pitchSin = (float) Math.sin(cameraPitch);
+		float pitchCos = (float) Math.cos(cameraPitch);
+		float yawSin = (float) Math.sin(cameraYaw);
+		float yawCos = (float) Math.cos(cameraYaw);
+
+		float x1 = sx;
+		float y2 = sy;
+		float z1 = zoom3d;
+
+		// Invert the projection and camera rotation used by Perspective.localToCanvasGpu.
+		float y1 = y2 * pitchSin + z1 * pitchCos;
+		float fz = y2 * pitchCos - z1 * pitchSin;
+		float fx = x1 * yawCos - y1 * yawSin;
+		float fy = y1 * yawCos + x1 * yawSin;
+
+		float originX = (float) client.getCameraFpX();
+		float originY = (float) client.getCameraFpZ();
+		float originZ = (float) client.getCameraFpY();
+		float dirX = fx;
+		float dirY = fz;
+		float dirZ = fy;
+		float len = (float) Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+		if (len < 1e-6f)
+		{
+			return null;
+		}
+		dirX /= len;
+		dirY /= len;
+		dirZ /= len;
+
+		VrGroundHit desktopGroundHit = vrIntersectGround(originX, originY, originZ, dirX, dirY, dirZ, wv, null);
+		if (desktopGroundHit == null)
+		{
+			return null;
+		}
+
+		return new float[]{desktopGroundHit.x, desktopGroundHit.y, desktopGroundHit.z};
+	}
+
+	private void processPendingStagedWalk()
+	{
+		float[] pending = vrPendingWalkInspect;
+		if (pending == null)
+		{
+			return;
+		}
+
+		WorldView wv = client.getTopLevelWorldView();
+		if (wv == null)
+		{
+			cancelPendingWalkInspection();
+			return;
+		}
+
+		if (vrPendingWalkInspectRetries > 0)
+		{
+			int ticksRemainingAfterThis = vrPendingWalkInspectRetries - 1;
+			vrPendingWalkInspectRetries--;
+			if (ticksRemainingAfterThis > 0)
+			{
+				return;
+			}
+		}
+
+		net.runelite.api.Point canvasPoint = projectStagedWalkCanvasPoint(pending, wv);
+		if (canvasPoint == null)
+		{
+			log.info("VR staged walk: projection failed scene=({}, {}) local=({},{},{})",
+				(int) pending[0], (int) pending[1],
+				String.format("%.1f", pending[2]), String.format("%.1f", pending[3]), String.format("%.1f", pending[4]));
+			cancelPendingWalkInspection();
+			return;
+		}
+
+		net.runelite.api.Point rawProjected = Perspective.localToCanvas(
+			client,
+			wv.getId(),
+			Math.round(pending[2]),
+			Math.round(pending[4]),
+			Math.round(pending[3]));
+		float[] desktopRayHit = reconstructDesktopScreenRayGroundHit(canvasPoint.getX(), canvasPoint.getY(), wv);
+		vrLastDesktopRayHit = desktopRayHit;
+		vrPendingWalkCanvasPoint = new int[]{canvasPoint.getX(), canvasPoint.getY()};
+		vrLastWalkParams = new int[]{canvasPoint.getX(), canvasPoint.getY()};
+		net.runelite.api.Point mouseBefore = client.getMouseCanvasPosition();
+		if (!vrPendingWalkMousePrimed)
+		{
+			primeCanvasMouseForWalk(canvasPoint.getX(), canvasPoint.getY());
+			vrPendingWalkMousePrimed = true;
+			vrPendingWalkInspectRetries = 1;
+			log.info("VR staged walk mouse prime: scene=({}, {}) dispatchCanvas=({}, {}) mouseBefore={} mouseAfter={} delayTicks={}",
+				(int) pending[0], (int) pending[1],
+				canvasPoint.getX(), canvasPoint.getY(),
+				mouseBefore,
+				client.getMouseCanvasPosition(),
+				vrPendingWalkInspectRetries);
+			return;
+		}
+		log.info("VR staged walk dispatch: scene=({}, {}) rawCanvas={} dispatchCanvas=({}, {}) desktopRayHit={} local=({},{},{})",
+			(int) pending[0], (int) pending[1],
+			rawProjected,
+			canvasPoint.getX(), canvasPoint.getY(),
+			desktopRayHit == null ? "null" : String.format("(%.1f,%.1f,%.1f)", desktopRayHit[0], desktopRayHit[1], desktopRayHit[2]),
+			String.format("%.1f", pending[2]), String.format("%.1f", pending[3]), String.format("%.1f", pending[4]));
+		client.menuAction(canvasPoint.getX(), canvasPoint.getY(), MenuAction.WALK, 0, 0, "Walk here", "");
+		updateClientWalkDiagnostics(wv);
+		logClientWalkState("after staged walk dispatch", wv);
+		cancelPendingWalkInspection();
+	}
+
+	private void updateClientWalkDiagnostics(WorldView wv)
+	{
+		if (wv != null)
+		{
+			Tile selected = wv.getSelectedSceneTile();
+			if (selected != null && selected.getSceneLocation() != null)
+			{
+				vrLastClientSelectedSceneTile = new int[]{
+					selected.getSceneLocation().getX(),
+					selected.getSceneLocation().getY()
+				};
+			}
+			else
+			{
+				vrLastClientSelectedSceneTile = null;
+			}
+		}
+		else
+		{
+			vrLastClientSelectedSceneTile = null;
+		}
+
+		LocalPoint destination = client.getLocalDestinationLocation();
+		if (destination != null)
+		{
+			int plane = wv != null ? wv.getPlane() : client.getPlane();
+			vrLastClientDestination = new float[]{
+				destination.getX(),
+				Perspective.getTileHeight(client, destination, plane),
+				destination.getY()
+			};
+		}
+		else
+		{
+			vrLastClientDestination = null;
+		}
+	}
+
+	private void logClientWalkState(String context, WorldView wv)
+	{
+		Tile selected = wv != null ? wv.getSelectedSceneTile() : null;
+		LocalPoint destination = client.getLocalDestinationLocation();
+		log.info("VR walk state {}: selectedSceneTile={} destinationLocal={}",
+			context,
+			selected != null && selected.getSceneLocation() != null
+				? "(" + selected.getSceneLocation().getX() + "," + selected.getSceneLocation().getY() + ")"
+				: "null",
+			destination != null
+				? "(" + destination.getX() + "," + destination.getY() + ")"
+				: "null");
+	}
+
+	private static float distanceAlongRay(float ox, float oy, float oz, float dx, float dy, float dz, float x, float y, float z)
+	{
+		float vx = x - ox;
+		float vy = y - oy;
+		float vz = z - oz;
+		return vx * dx + vy * dy + vz * dz;
+	}
+
+	private static float rayTestModel(float ox, float oy, float oz,
+		float dx, float dy, float dz,
+		Model m, int orient, int entityX, int entityY, int entityZ)
+	{
+		AABB aabb = m.getAABB(orient);
+		float cx = entityX + aabb.getCenterX();
+		float cy = entityY + aabb.getCenterY();
+		float cz = entityZ + aabb.getCenterZ();
+		float ex = aabb.getExtremeX() + 16f;
+		float ey = aabb.getExtremeY() + 16f;
+		float ez = aabb.getExtremeZ() + 16f;
+		if (rayBoxTest(ox, oy, oz, dx, dy, dz, cx - ex, cy - ey, cz - ez, cx + ex, cy + ey, cz + ez) < 0f)
+		{
+			return -1f;
+		}
+
+		float[] vx = m.getVerticesX();
+		float[] vy = m.getVerticesY();
+		float[] vz = m.getVerticesZ();
+		int[] fi1 = m.getFaceIndices1();
+		int[] fi2 = m.getFaceIndices2();
+		int[] fi3 = m.getFaceIndices3();
+		if (vx == null || vy == null || vz == null || fi1 == null || fi2 == null || fi3 == null)
+		{
+			return -1f;
+		}
+
+		int sin = Perspective.SINE[orient];
+		int cos = Perspective.COSINE[orient];
+		float minT = Float.MAX_VALUE;
+		for (int f = 0; f < m.getFaceCount(); f++)
+		{
+			int i0 = fi1[f];
+			int i1 = fi2[f];
+			int i2 = fi3[f];
+
+			float ax = vx[i0];
+			float ay = vy[i0];
+			float az = vz[i0];
+			float wax = entityX + (az * sin + ax * cos) / 65536f;
+			float way = entityY + ay;
+			float waz = entityZ + (az * cos - ax * sin) / 65536f;
+
+			float bx = vx[i1];
+			float by = vy[i1];
+			float bz = vz[i1];
+			float wbx = entityX + (bz * sin + bx * cos) / 65536f;
+			float wby = entityY + by;
+			float wbz = entityZ + (bz * cos - bx * sin) / 65536f;
+
+			float cx2 = vx[i2];
+			float cy2 = vy[i2];
+			float cz2 = vz[i2];
+			float wcx = entityX + (cz2 * sin + cx2 * cos) / 65536f;
+			float wcy = entityY + cy2;
+			float wcz = entityZ + (cz2 * cos - cx2 * sin) / 65536f;
+
+			float t = rayTriangleMT(ox, oy, oz, dx, dy, dz,
+				wax, way, waz,
+				wbx, wby, wbz,
+				wcx, wcy, wcz);
+			if (t > 0f && t < minT)
+			{
+				minT = t;
+			}
+		}
+		return minT < Float.MAX_VALUE ? minT : -1f;
+	}
+
+	/**
+	 * Möller-Trumbore ray-triangle intersection.
+	 * Tests both faces (no backface culling).
+	 *
+	 * @return ray parameter t &gt; 0 if hit, else -1
+	 */
+	private static float rayTriangleMT(
+		float ox, float oy, float oz, float dx, float dy, float dz,
+		float v0x, float v0y, float v0z,
+		float v1x, float v1y, float v1z,
+		float v2x, float v2y, float v2z)
+	{
+		float e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+		float e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+		float hx = dy * e2z - dz * e2y;
+		float hy = dz * e2x - dx * e2z;
+		float hz = dx * e2y - dy * e2x;
+		float a = e1x * hx + e1y * hy + e1z * hz;
+		if (a > -1e-5f && a < 1e-5f) return -1f; // parallel to triangle plane
+		float f = 1f / a;
+		float sx = ox - v0x, sy = oy - v0y, sz = oz - v0z;
+		float u = f * (sx * hx + sy * hy + sz * hz);
+		if (u < 0f || u > 1f) return -1f;
+		float qx = sy * e1z - sz * e1y;
+		float qy = sz * e1x - sx * e1z;
+		float qz = sx * e1y - sy * e1x;
+		float v = f * (dx * qx + dy * qy + dz * qz);
+		if (v < 0f || u + v > 1f) return -1f;
+		float t = f * (e2x * qx + e2y * qy + e2z * qz);
+		return t > 1e-3f ? t : -1f;
+	}
+
+	/**
+	 * Ray vs axis-aligned bounding box (slab method).
+	 *
+	 * @return ray parameter t at entry, or -1 if no intersection with t &gt; 0
+	 */
+	private static float rayBoxTest(
+		float ox, float oy, float oz, float dx, float dy, float dz,
+		float minX, float minY, float minZ, float maxX, float maxY, float maxZ)
+	{
+		float tmin = Float.NEGATIVE_INFINITY;
+		float tmax = Float.POSITIVE_INFINITY;
+
+		if (Math.abs(dx) < 1e-6f)
+		{
+			if (ox < minX || ox > maxX) return -1f;
+		}
+		else
+		{
+			float t1 = (minX - ox) / dx;
+			float t2 = (maxX - ox) / dx;
+			if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+			tmin = Math.max(tmin, t1);
+			tmax = Math.min(tmax, t2);
+		}
+
+		if (Math.abs(dy) < 1e-6f)
+		{
+			if (oy < minY || oy > maxY) return -1f;
+		}
+		else
+		{
+			float t1 = (minY - oy) / dy;
+			float t2 = (maxY - oy) / dy;
+			if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+			tmin = Math.max(tmin, t1);
+			tmax = Math.min(tmax, t2);
+		}
+
+		if (Math.abs(dz) < 1e-6f)
+		{
+			if (oz < minZ || oz > maxZ) return -1f;
+		}
+		else
+		{
+			float t1 = (minZ - oz) / dz;
+			float t2 = (maxZ - oz) / dz;
+			if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+			tmin = Math.max(tmin, t1);
+			tmax = Math.min(tmax, t2);
+		}
+
+		if (tmax < tmin || tmax < 0f) return -1f;
+		return tmin > 0f ? tmin : tmax;
 	}
 }
