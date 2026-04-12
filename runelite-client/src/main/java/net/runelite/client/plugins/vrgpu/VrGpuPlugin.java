@@ -2401,7 +2401,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			final int samples = forcedAASamples != 0 ? forcedAASamples :
 				Math.min(antiAliasingMode.getSamples(), maxSamples);
 
-			log.debug("Desktop spectator AA samples: {}, max samples: {}, forced samples: {}",
+			log.debug("Desktop scene AA samples: {}, max samples: {}, forced samples: {}",
 				samples, maxSamples, forcedAASamples);
 
 			initFbo(stretchedCanvasWidth, stretchedCanvasHeight, samples);
