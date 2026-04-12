@@ -236,6 +236,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Scratch buffers for depth-buffer picking (single pixel read). */
 	private java.nio.FloatBuffer depthReadBuf;
 	private java.nio.IntBuffer fboReadBuf;
+	/** Scratch buffer used when desktop-only re-sorting needs alpha faces but should discard opaque output. */
+	private java.nio.IntBuffer desktopSorterScratchOpaque;
 	/** Controller depth-buffer hits in OSRS world coords; null if no hit last frame. */
 	private float[] vrLeftRayHit;
 	private float[] vrRightRayHit;
@@ -284,10 +286,22 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private int vrPassOpaqueCount;
 	/**
+	 * Number of VAOs in {@code vaoDesktopO} filled during the left-eye pass for the
+	 * desktop spectator camera. These remain separate so opaque temp/dynamic faces
+	 * do not inherit the VR eye's sorted/culling decisions.
+	 */
+	private int vrPassDesktopOpaqueCount;
+	/**
 	 * Number of VAOs in {@code vaoPO} that were drawn (but not reset) during the
 	 * left-eye drawPass. Replayed and reset in the right-eye pass.
 	 */
 	private int vrPassPlayerCount;
+	/**
+	 * Number of VAOs in {@code vaoDesktopPO} that were filled during the left-eye pass
+	 * for the desktop spectator camera. These stay separate from {@code vaoPO}
+	 * because player/temp faces must be sorted from the desktop camera, not the VR eye.
+	 */
+	private int vrPassDesktopPlayerCount;
 
 	private boolean lwjglInitted = false;
 	private GLCapabilities glCapabilities;
@@ -336,6 +350,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private VAOList vaoO;
 	private VAOList vaoA;
 	private VAOList vaoPO;
+	private VAOList vaoDesktopO;
+	private VAOList vaoDesktopA;
+	private VAOList vaoDesktopPO;
 
 	private SceneUploader clientUploader, mapUploader;
 	private FacePrioritySorter facePrioritySorter;
@@ -882,6 +899,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vaoO = new VAOList();
 		vaoA = new VAOList();
 		vaoPO = new VAOList();
+		vaoDesktopO = new VAOList();
+		vaoDesktopA = new VAOList();
+		vaoDesktopPO = new VAOList();
 	}
 
 	private void initGlBuffer(GLBuffer glBuffer)
@@ -899,15 +919,27 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			vaoO.free();
 		}
+		if (vaoDesktopO != null)
+		{
+			vaoDesktopO.free();
+		}
 		if (vaoA != null)
 		{
 			vaoA.free();
+		}
+		if (vaoDesktopA != null)
+		{
+			vaoDesktopA.free();
 		}
 		if (vaoPO != null)
 		{
 			vaoPO.free();
 		}
-		vaoO = vaoA = vaoPO = null;
+		if (vaoDesktopPO != null)
+		{
+			vaoDesktopPO.free();
+		}
+		vaoO = vaoA = vaoPO = vaoDesktopO = vaoDesktopA = vaoDesktopPO = null;
 	}
 
 	private void destroyGlBuffer(GLBuffer glBuffer)
@@ -1164,6 +1196,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		debugRayFb  = BufferUtils.createFloatBuffer(768); // 2 rays + tile outlines + click marker + entity tile, 7 floats/vert
 		depthReadBuf = BufferUtils.createFloatBuffer(1);
 		fboReadBuf   = BufferUtils.createIntBuffer(1);
+		desktopSorterScratchOpaque = BufferUtils.createIntBuffer(FacePrioritySorter.MAX_FACE_COUNT * (VAO.VERT_SIZE >> 2) * 3);
 
 		glBindVertexArray(debugVaoId);
 		glBindBuffer(GL_ARRAY_BUFFER, debugVboId);
@@ -1190,10 +1223,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		final float s = DEFAULT_WORLD_SCALE;
 		final float oy = vrWorldAnchorY;
-		final float oz = VR_STAGE_CHARACTER_OFFSET_Z;
-		final float camX = getVrAnchorWorldX();
-		final float camY = getVrAnchorWorldY();
-		final float camZ = getVrAnchorWorldZ();
+		final float oz = -1.5f;
+		final float camX = root.cameraX;
+		final float camY = root.cameraY;
+		final float camZ = root.cameraZ;
 		final float RAY_M = 5f;          // ray length in metres
 		final float CROSS = 17f;         // crosshair arm half-length in OSRS units (~3× smaller)
 		final float TILE  = 128f;        // one tile in OSRS local units
@@ -1698,10 +1731,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		final float s = DEFAULT_WORLD_SCALE;
 		final float oy = vrWorldAnchorY;
-		final float oz = -1.5f;
-		final float camX = root.cameraX;
-		final float camY = root.cameraY;
-		final float camZ = root.cameraZ;
+		final float oz = VR_STAGE_CHARACTER_OFFSET_Z;
+		final float camX = getVrAnchorWorldX();
+		final float camY = getVrAnchorWorldY();
+		final float camZ = getVrAnchorWorldZ();
 
 		return new Projection()
 		{
@@ -1714,7 +1747,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			@Override
 			public float[] project(float wx, float wy, float wz, float[] out)
 			{
-				// Translate by -camera, scale (OSRS→VR metres, Y-flip), add world offset
+				// Translate by -camera, scale (OSRS→VR metres, X/Y flips), add world offset
 				float vx = -(wx - camX) * s;
 				float vy = -(wy - camY) * s + oy;
 				float vz = (wz - camZ) * s + oz;
@@ -1726,9 +1759,56 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 				// Perspective: clip_w = -ez (positive for front objects, camera looks -Z)
 				float clipW = -ez;
-				out[0] = a * ex + b * ez;  // clip_x
+				// The VR world projection flips X to correct the headset image handedness.
+				// FacePrioritySorter does its own 2D winding test on projected X/Y to decide
+				// which one-sided temp/model faces are front-facing before they are uploaded.
+				// Without mirroring clip_x here too, that winding test sees the opposite
+				// orientation and uploads the wrong faces, which makes players/NPCs appear
+				// partially or almost completely culled in VR.
+				out[0] = -(a * ex + b * ez); // clip_x
 				out[1] = c * ey + d * ez;  // clip_y: Y-up, consistent with worldProjection
 				out[2] = clipW / s;        // depth in OSRS units (so >50 clip test holds)
+				return out;
+			}
+		};
+	}
+
+	private Projection buildDesktopSorterProjection()
+	{
+		final float cameraYaw = getSafeDesktopCameraYawRad();
+		final float cameraPitch = getSafeDesktopCameraPitchRad();
+		final float pitchSin = (float) Math.sin(cameraPitch);
+		final float pitchCos = (float) Math.cos(cameraPitch);
+		final float yawSin = (float) Math.sin(cameraYaw);
+		final float yawCos = (float) Math.cos(cameraYaw);
+		final float cameraX = (float) client.getCameraFpX();
+		final float cameraY = (float) client.getCameraFpZ();
+		final float cameraZ = (float) client.getCameraFpY();
+
+		return new Projection()
+		{
+			@Override
+			public float[] project(float wx, float wy, float wz)
+			{
+				return project(wx, wy, wz, new float[3]);
+			}
+
+			@Override
+			public float[] project(float wx, float wy, float wz, float[] out)
+			{
+				// Match Perspective.localToCanvasGpu(), but with the plugin's x,height,z axis order.
+				final float fx = wx - cameraX;
+				final float fy = wz - cameraZ;
+				final float fz = wy - cameraY;
+
+				final float x1 = fx * yawCos + fy * yawSin;
+				final float y1 = fy * yawCos - fx * yawSin;
+				final float y2 = fz * pitchCos - y1 * pitchSin;
+				final float z1 = y1 * pitchCos + fz * pitchSin;
+
+				out[0] = x1;
+				out[1] = y2;
+				out[2] = z1;
 				return out;
 			}
 		};
@@ -1774,6 +1854,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			Scene toplevel = client.getScene();
 			vaoO.addRange(null, toplevel);
 			vaoPO.addRange(null, toplevel);
+			vaoDesktopO.addRange(null, toplevel);
+			vaoDesktopPO.addRange(null, toplevel);
 			glUniform4i(uniEntityTint, scene.getOverrideHue(), scene.getOverrideSaturation(), scene.getOverrideLuminance(), scene.getOverrideAmount());
 		}
 	}
@@ -1824,7 +1906,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrAlphaProjs.clear();
 			vrScene = scene;
 			vrPassOpaqueCount = 0;
+			vrPassDesktopOpaqueCount = 0;
 			vrPassPlayerCount = 0;
+			vrPassDesktopPlayerCount = 0;
 
 			// Sample world anchor Y from initial eye height (once per session).
 			if (Float.isNaN(vrWorldAnchorY))
@@ -2095,9 +2179,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				int dx = root.cameraX - ((zx - offset) << 10);
 				int dz = root.cameraZ - ((zzc - offset) << 10);
 				boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
-				z.renderAlpha(zx - offset, zzc - offset, cameraYaw, cameraPitch,
-					root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
-					!close || (vrScene.getOverrideAmount() > 0));
+			z.renderAlpha(zx - offset, zzc - offset, cameraYaw, cameraPitch,
+				root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
+				!close || (vrScene.getOverrideAmount() > 0), false);
 			}
 
 			// Cleanup temp alpha models deferred from left-eye PASS_ALPHA
@@ -2210,8 +2294,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private float[] computeDesktopWorldProj()
 	{
-		float desktopCameraPitch = getSafeDesktopCameraPitch();
-		float desktopCameraYaw = getSafeDesktopCameraYaw();
+		float desktopCameraPitch = getSafeDesktopCameraPitchRad();
+		float desktopCameraYaw = getSafeDesktopCameraYawRad();
 		float desktopCameraX = (float) client.getCameraFpX();
 		float desktopCameraY = (float) client.getCameraFpZ();
 		float desktopCameraZ = (float) client.getCameraFpY();
@@ -2249,15 +2333,17 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		ensureDesktopSceneFbo();
 		int sky = client.getSkyboxColor();
 		DesktopViewport vp = getDesktopViewport();
-		int desktopCameraYaw = getSafeDesktopCameraYaw();
-		int desktopCameraPitch = getSafeDesktopCameraPitch();
+		float desktopCameraYawRad = getSafeDesktopCameraYawRad();
+		float desktopCameraPitchRad = getSafeDesktopCameraPitchRad();
+		int desktopCameraYawJau = radiansToJau(desktopCameraYawRad);
+		int desktopCameraPitchJau = radiansToJau(desktopCameraPitchRad);
 		int desktopCameraX = (int) client.getCameraFpX();
 		int desktopCameraY = (int) client.getCameraFpZ();
 		int desktopCameraZ = (int) client.getCameraFpY();
 
 		uploadMainCameraUniforms(
-			(float) desktopCameraYaw,
-			(float) desktopCameraPitch,
+			desktopCameraYawRad,
+			desktopCameraPitchRad,
 			(float) client.getCameraFpX(),
 			(float) client.getCameraFpZ(),
 			(float) client.getCameraFpY());
@@ -2296,25 +2382,29 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glUniform3i(uniBase, 0, 0, 0);
 		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-		for (int i = 0; i < vrPassOpaqueCount; i++)
+		for (int i = 0; i < vrPassDesktopOpaqueCount; i++)
 		{
-			vaoO.vaos.get(i).draw();
+			vaoDesktopO.vaos.get(i).draw();
+			vaoDesktopO.vaos.get(i).reset();
 		}
+		vrPassDesktopOpaqueCount = 0;
 
-		if (vrPassPlayerCount > 0)
+		if (vrPassDesktopPlayerCount > 0)
 		{
 			glDepthMask(false);
-			for (int i = 0; i < vrPassPlayerCount; i++)
+			for (int i = 0; i < vrPassDesktopPlayerCount; i++)
 			{
-				vaoPO.vaos.get(i).draw();
+				vaoDesktopPO.vaos.get(i).draw();
 			}
 			glDepthMask(true);
 			glColorMask(false, false, false, false);
-			for (int i = 0; i < vrPassPlayerCount; i++)
+			for (int i = 0; i < vrPassDesktopPlayerCount; i++)
 			{
-				vaoPO.vaos.get(i).draw();
+				vaoDesktopPO.vaos.get(i).draw();
+				vaoDesktopPO.vaos.get(i).reset();
 			}
 			glColorMask(true, true, true, true);
+			vrPassDesktopPlayerCount = 0;
 		}
 
 		vaoA.unmap();
@@ -2333,9 +2423,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			int dx = desktopCameraX - ((zx - offset) << 10);
 			int dz = desktopCameraZ - ((zzc - offset) << 10);
 			boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
-			z.renderAlpha(zx - offset, zzc - offset, desktopCameraYaw, desktopCameraPitch,
+			z.renderAlpha(zx - offset, zzc - offset, desktopCameraYawJau, desktopCameraPitchJau,
 				root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
-				!close || (vrScene.getOverrideAmount() > 0));
+				!close || (vrScene.getOverrideAmount() > 0), true);
 		}
 
 		glDisable(GL_BLEND);
@@ -2346,34 +2436,24 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		uploadMainCameraUniforms(cameraYaw, cameraPitch, root.cameraX, root.cameraY, root.cameraZ);
 	}
 
-	private int getSafeDesktopCameraYaw()
+	private float getSafeDesktopCameraYawRad()
 	{
 		double yaw = client.getCameraFpYaw();
 		if (yaw < 0)
 		{
-			yaw = client.getCameraYaw();
+			yaw = client.getCameraYaw() * Perspective.UNIT;
 		}
-		return normalizeJau((int) Math.round(yaw));
+		return (float) yaw;
 	}
 
-	private int getSafeDesktopCameraPitch()
+	private float getSafeDesktopCameraPitchRad()
 	{
 		double pitch = client.getCameraFpPitch();
 		if (pitch < 0)
 		{
-			pitch = client.getCameraPitch();
+			pitch = client.getCameraPitch() * Perspective.UNIT;
 		}
-		return normalizeJau((int) Math.round(pitch));
-	}
-
-	private static int normalizeJau(int angle)
-	{
-		angle %= 2048;
-		if (angle < 0)
-		{
-			angle += 2048;
-		}
-		return angle;
+		return (float) pitch;
 	}
 
 	private void blitSceneFbo()
@@ -2470,7 +2550,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			z.multizoneLocs(scene, zx - offset, zz - offset, ctx.cameraX, ctx.cameraZ, ctx.zones);
 		}
 
-		z.renderAlpha(zx - offset, zz - offset, cameraYaw, cameraPitch, ctx.minLevel, ctx.level, ctx.maxLevel, level, ctx.hideRoofIds, !close || (scene.getOverrideAmount() > 0));
+			z.renderAlpha(zx - offset, zz - offset, cameraYaw, cameraPitch, ctx.minLevel, ctx.level, ctx.maxLevel, level, ctx.hideRoofIds, !close || (scene.getOverrideAmount() > 0), false);
 
 		checkGLErrors();
 	}
@@ -2490,6 +2570,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			vaoO.addRange(projection, scene);
 			vaoPO.addRange(projection, scene);
+			vaoDesktopO.addRange(projection, scene);
+			vaoDesktopPO.addRange(projection, scene);
 
 			if (scene.getWorldViewId() == WorldView.TOPLEVEL)
 			{
@@ -2502,6 +2584,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					if (!xrFrameStarted) { vaoO.vaos.get(i).reset(); }
 				}
 				if (xrFrameStarted) { vrPassOpaqueCount = sz; }
+
+				if (xrFrameStarted)
+				{
+					vrPassDesktopOpaqueCount = vaoDesktopO.unmap();
+				}
 
 				sz = vaoPO.unmap();
 				if (sz > 0)
@@ -2518,6 +2605,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					}
 					glColorMask(true, true, true, true);
 					if (xrFrameStarted) { vrPassPlayerCount = sz; }
+				}
+
+				if (xrFrameStarted)
+				{
+					vrPassDesktopPlayerCount = vaoDesktopPO.unmap();
 				}
 			}
 		}
@@ -2561,11 +2653,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			VAO o = vaoO.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
+			if (xrFrameStarted)
+			{
+				VAO desktopO = vaoDesktopO.get(size);
+				clientUploader.uploadTempModel(m, orient, x, y, z, desktopO.vbo.vb);
+			}
 		}
 		else
 		{
 			m.calculateBoundsCylinder();
 			VAO o = vaoO.get(size), a = vaoA.get(size);
+			VAO desktopO = xrFrameStarted ? vaoDesktopO.get(size) : null;
+			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
 			int start = a.vbo.vb.position();
 			try
 			{
@@ -2575,7 +2674,25 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			{
 				log.debug("error drawing entity", ex);
 			}
+			int desktopStart = desktopA != null ? desktopA.vbo.vb.position() : -1;
+			if (desktopA != null)
+			{
+				java.nio.IntBuffer desktopOpaqueBuffer = desktopO != null ? desktopO.vbo.vb : desktopSorterScratchOpaque;
+				if (desktopOpaqueBuffer == desktopSorterScratchOpaque)
+				{
+					desktopSorterScratchOpaque.clear();
+				}
+				try
+				{
+					facePrioritySorter.uploadSortedModel(buildDesktopSorterProjection(), m, orient, x, y, z, desktopOpaqueBuffer, desktopA.vbo.vb);
+				}
+				catch (Exception ex)
+				{
+					log.debug("error drawing desktop spectator dynamic entity", ex);
+				}
+			}
 			int end = a.vbo.vb.position();
+			int desktopEnd = desktopA != null ? desktopA.vbo.vb.position() : -1;
 
 			if (end > start)
 			{
@@ -2588,7 +2705,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				// tileObject.getPlane()>maxLevel if visbelow is set - lower the object to the max level
 				int plane = Math.min(ctx.maxLevel, tileObject.getPlane());
 				// renderable modelheight is typically not set here because DynamicObject doesn't compute it on the returned model
-				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y, z & 1023);
+				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
+				if (desktopA != null && desktopEnd > desktopStart)
+				{
+					zone.addTempAlphaModel(desktopA.vao, desktopStart, desktopEnd, plane, x & 1023, y, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
+				}
 			}
 		}
 	}
@@ -2616,7 +2737,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// because they are not depth tested. transparent player faces don't need their own vao because normal
 			// transparent faces are already not depth tested
 			VAO o = renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH ? vaoPO.get(size) : vaoO.get(size);
+			VAO desktopPlayerVao = xrFrameStarted && renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH
+				? vaoDesktopPO.get(size)
+				: null;
 			VAO a = vaoA.get(size);
+			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
+			VAO desktopO = xrFrameStarted && renderMode != Renderable.RENDERMODE_SORTED_NO_DEPTH
+				? vaoDesktopO.get(size)
+				: null;
 
 			int start = a.vbo.vb.position();
 			m.calculateBoundsCylinder();
@@ -2631,7 +2759,28 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			{
 				log.debug("error drawing entity", ex);
 			}
+			int desktopStart = desktopA != null ? desktopA.vbo.vb.position() : -1;
+
+			if (desktopPlayerVao != null || desktopA != null)
+			{
+				java.nio.IntBuffer desktopOpaqueBuffer = desktopPlayerVao != null
+					? desktopPlayerVao.vbo.vb
+					: desktopO != null ? desktopO.vbo.vb : desktopSorterScratchOpaque;
+				if (desktopOpaqueBuffer == desktopSorterScratchOpaque)
+				{
+					desktopSorterScratchOpaque.clear();
+				}
+				try
+				{
+					facePrioritySorter.uploadSortedModel(buildDesktopSorterProjection(), m, orient, x, y, z, desktopOpaqueBuffer, desktopA.vbo.vb);
+				}
+				catch (Exception ex)
+				{
+					log.debug("error drawing desktop spectator entity", ex);
+				}
+			}
 			int end = a.vbo.vb.position();
+			int desktopEnd = desktopA != null ? desktopA.vbo.vb.position() : -1;
 
 			if (end > start)
 			{
@@ -2640,13 +2789,22 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				int zz = (gameObject.getY() >> 10) + offset;
 				Zone zone = ctx.zones[zx][zz];
 				int plane = Math.min(ctx.maxLevel, gameObject.getPlane());
-				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023);
+				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
+				if (desktopA != null && desktopEnd > desktopStart)
+				{
+					zone.addTempAlphaModel(desktopA.vao, desktopStart, desktopEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
+				}
 			}
 		}
 		else
 		{
 			VAO o = vaoO.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
+			if (xrFrameStarted)
+			{
+				VAO desktopO = vaoDesktopO.get(size);
+				clientUploader.uploadTempModel(m, orient, x, y, z, desktopO.vbo.vb);
+			}
 		}
 	}
 

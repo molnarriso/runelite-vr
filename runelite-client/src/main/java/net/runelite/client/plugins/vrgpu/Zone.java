@@ -317,6 +317,8 @@ class Zone
 
 		static final int SKIP = 1; // temporary model is in a closer zone
 		static final int TEMP = 2; // temporary model added to a closer zone
+		static final int DESKTOP_ONLY = 4; // only visible in the desktop spectator replay
+		static final int VR_ONLY = 8; // only visible in the VR eye replay
 
 		boolean isTemp()
 		{
@@ -432,6 +434,11 @@ class Zone
 
 	void addTempAlphaModel(int vao, int startpos, int endpos, int level, int x, int y, int z)
 	{
+		addTempAlphaModel(vao, startpos, endpos, level, x, y, z, 0);
+	}
+
+	void addTempAlphaModel(int vao, int startpos, int endpos, int level, int x, int y, int z, int flags)
+	{
 		AlphaModel m = modelCache.poll();
 		if (m == null)
 		{
@@ -447,7 +454,7 @@ class Zone
 		m.rid = -1;
 		m.level = (byte) level;
 		m.lx = m.lz = m.ux = m.uz = -1;
-		m.flags = 0;
+		m.flags = (byte) flags;
 		m.zofx = m.zofz = 0;
 		alphaModels.add(m);
 	}
@@ -528,7 +535,7 @@ class Zone
 		alphaModels.sort(alphaModelComparator);
 	}
 
-	void renderAlpha(int zx, int zz, int cyaw, int cpitch, int minLevel, int currentLevel, int maxLevel, int level, Set<Integer> hiddenRoofIds, boolean useStaticUnsorted)
+	void renderAlpha(int zx, int zz, int cyaw, int cpitch, int minLevel, int currentLevel, int maxLevel, int level, Set<Integer> hiddenRoofIds, boolean useStaticUnsorted, boolean desktopPass)
 	{
 		drawOff.clear();
 		drawEnd.clear();
@@ -546,6 +553,17 @@ class Zone
 			AlphaModel m = alphaModels.get(j);
 
 			if ((m.flags & AlphaModel.SKIP) != 0 || m.level != level)
+			{
+				continue;
+			}
+			if (desktopPass)
+			{
+				if ((m.flags & AlphaModel.VR_ONLY) != 0)
+				{
+					continue;
+				}
+			}
+			else if ((m.flags & AlphaModel.DESKTOP_ONLY) != 0)
 			{
 				continue;
 			}
