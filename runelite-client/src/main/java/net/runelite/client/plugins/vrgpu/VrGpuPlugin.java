@@ -986,6 +986,65 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		replay.sortedOpaqueCount = 0;
 	}
 
+	private void replayScene(Scene scene, ReplayBuffers replay, int alphaCameraYaw, int alphaCameraPitch,
+		int alphaCameraX, int alphaCameraZ, boolean desktopAlphaPass, boolean resetReplayBuffers,
+		boolean cleanupTempAlphaModels)
+	{
+		final int offset = SCENE_OFFSET >> 3;
+		for (int i = 0; i < vrOpaqueZones.size(); i++)
+		{
+			int[] zoneCoords = vrOpaqueZones.get(i);
+			updateEntityProjection(vrOpaqueProjs.get(i));
+			Zone zone = root.zones[zoneCoords[0]][zoneCoords[1]];
+			if (zone.initialized)
+			{
+				zone.renderOpaque(zoneCoords[0] - offset, zoneCoords[1] - offset,
+					root.minLevel, root.level, root.maxLevel, root.hideRoofIds);
+			}
+		}
+
+		glUniform3i(uniBase, 0, 0, 0);
+		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
+		replayCapturedOpaque(replay, resetReplayBuffers);
+		replayCapturedSortedOpaque(replay, resetReplayBuffers);
+
+		vaoA.unmap();
+		for (int i = 0; i < vrAlphaZones.size(); i++)
+		{
+			int[] alphaZone = vrAlphaZones.get(i);
+			int level = alphaZone[0];
+			int zx = alphaZone[1];
+			int zz = alphaZone[2];
+			Zone zone = root.zones[zx][zz];
+			if (!zone.initialized)
+			{
+				continue;
+			}
+
+			updateEntityProjection(vrAlphaProjs.get(i));
+			glUniform4i(uniEntityTint, 0, 0, 0, 0);
+			int dx = alphaCameraX - ((zx - offset) << 10);
+			int dz = alphaCameraZ - ((zz - offset) << 10);
+			boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
+			zone.renderAlpha(zx - offset, zz - offset, alphaCameraYaw, alphaCameraPitch,
+				root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
+				!close || (scene.getOverrideAmount() > 0), desktopAlphaPass);
+		}
+
+		if (!cleanupTempAlphaModels)
+		{
+			return;
+		}
+
+		for (int x = 0; x < root.sizeX; ++x)
+		{
+			for (int z = 0; z < root.sizeZ; ++z)
+			{
+				root.zones[x][z].removeTemp();
+			}
+		}
+	}
+
 	private void drawImmediateOpaque(ReplayBuffers replay, boolean retainForReplay)
 	{
 		int sz = replay.opaque.unmap();
@@ -2211,56 +2270,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glDepthFunc(GL_GREATER);
 			glEnable(GL_DEPTH_TEST);
 
-			// Replay opaque zones from left-eye pass
-			final int offset = SCENE_OFFSET >> 3;
-			for (int i = 0; i < vrOpaqueZones.size(); i++)
-			{
-				int[] zz = vrOpaqueZones.get(i);
-				updateEntityProjection(vrOpaqueProjs.get(i));
-				Zone z = root.zones[zz[0]][zz[1]];
-				if (z.initialized)
-				{
-					z.renderOpaque(zz[0] - offset, zz[1] - offset,
-						root.minLevel, root.level, root.maxLevel, root.hideRoofIds);
-				}
-			}
-
-			// Replay drawPass geometry: scene underlay tiles + opaque actors (NPCs, players).
-			// These were drawn but not reset during the left-eye drawPass; reset them here.
-			glUniform3i(uniBase, 0, 0, 0);
-			glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-			replayCapturedOpaque(primaryReplay, true);
-			replayCapturedSortedOpaque(primaryReplay, true);
-
-			// Replay alpha zones from left-eye pass (already sorted during left-eye pass)
-			vaoA.unmap();
-			for (int i = 0; i < vrAlphaZones.size(); i++)
-			{
-				int[] za = vrAlphaZones.get(i);
-				int level = za[0], zx = za[1], zzc = za[2];
-				Zone z = root.zones[zx][zzc];
-				if (!z.initialized)
-				{
-					continue;
-				}
-				updateEntityProjection(vrAlphaProjs.get(i));
-				glUniform4i(uniEntityTint, 0, 0, 0, 0);
-				int dx = root.cameraX - ((zx - offset) << 10);
-				int dz = root.cameraZ - ((zzc - offset) << 10);
-				boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
-			z.renderAlpha(zx - offset, zzc - offset, cameraYaw, cameraPitch,
-				root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
-				!close || (vrScene.getOverrideAmount() > 0), false);
-			}
-
-			// Cleanup temp alpha models deferred from left-eye PASS_ALPHA
-			for (int x = 0; x < root.sizeX; ++x)
-			{
-				for (int z = 0; z < root.sizeZ; ++z)
-				{
-					root.zones[x][z].removeTemp();
-				}
-			}
+			// Replay left-eye-captured scene content into the right-eye target.
+			replayScene(vrScene, primaryReplay, cameraYaw, cameraPitch, root.cameraX, root.cameraZ,
+				false, true, true);
 
 			glDisable(GL_BLEND);
 			glCullFace(GL_BACK); // restore default before leaving VR render path
@@ -2436,44 +2448,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glDepthFunc(GL_GREATER);
 		glEnable(GL_DEPTH_TEST);
 
-		final int offset = SCENE_OFFSET >> 3;
-		for (int i = 0; i < vrOpaqueZones.size(); i++)
-		{
-			int[] zz = vrOpaqueZones.get(i);
-			updateEntityProjection(vrOpaqueProjs.get(i));
-			Zone z = root.zones[zz[0]][zz[1]];
-			if (z.initialized)
-			{
-				z.renderOpaque(zz[0] - offset, zz[1] - offset,
-					root.minLevel, root.level, root.maxLevel, root.hideRoofIds);
-			}
-		}
-
-		glUniform3i(uniBase, 0, 0, 0);
-		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-		replayCapturedOpaque(desktopReplay, true);
-		replayCapturedSortedOpaque(desktopReplay, true);
-
-		vaoA.unmap();
-		for (int i = 0; i < vrAlphaZones.size(); i++)
-		{
-			int[] za = vrAlphaZones.get(i);
-			int level = za[0], zx = za[1], zzc = za[2];
-			Zone z = root.zones[zx][zzc];
-			if (!z.initialized)
-			{
-				continue;
-			}
-
-			updateEntityProjection(vrAlphaProjs.get(i));
-			glUniform4i(uniEntityTint, 0, 0, 0, 0);
-			int dx = desktopCameraX - ((zx - offset) << 10);
-			int dz = desktopCameraZ - ((zzc - offset) << 10);
-			boolean close = dx * dx + dz * dz < ALPHA_ZSORT_CLOSE * ALPHA_ZSORT_CLOSE;
-			z.renderAlpha(zx - offset, zzc - offset, desktopCameraYawJau, desktopCameraPitchJau,
-				root.minLevel, root.level, root.maxLevel, level, root.hideRoofIds,
-				!close || (vrScene.getOverrideAmount() > 0), true);
-		}
+		replayScene(vrScene, desktopReplay, desktopCameraYawJau, desktopCameraPitchJau,
+			desktopCameraX, desktopCameraZ, true, true, false);
 
 		glDisable(GL_BLEND);
 		glDisable(GL_CULL_FACE);
