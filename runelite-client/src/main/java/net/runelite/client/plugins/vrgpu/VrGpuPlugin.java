@@ -1045,6 +1045,65 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
+	private static final class SortedUploadTarget
+	{
+		private final Projection projection;
+		private final java.nio.IntBuffer opaqueBuffer;
+		private final VAO alphaVao;
+		private final String errorMessage;
+		private int alphaStart;
+		private int alphaEnd;
+
+		private SortedUploadTarget(Projection projection, java.nio.IntBuffer opaqueBuffer, VAO alphaVao, String errorMessage)
+		{
+			this.projection = projection;
+			this.opaqueBuffer = opaqueBuffer;
+			this.alphaVao = alphaVao;
+			this.errorMessage = errorMessage;
+		}
+
+		private boolean hasAlphaFaces()
+		{
+			return alphaEnd > alphaStart;
+		}
+	}
+
+	private SortedUploadTarget createSortedUploadTarget(Projection projection, VAO opaqueVao, VAO alphaVao, String errorMessage)
+	{
+		if (alphaVao == null)
+		{
+			return null;
+		}
+
+		java.nio.IntBuffer opaqueBuffer = opaqueVao != null ? opaqueVao.vbo.vb : desktopSorterScratchOpaque;
+		if (opaqueBuffer == desktopSorterScratchOpaque)
+		{
+			desktopSorterScratchOpaque.clear();
+		}
+
+		return new SortedUploadTarget(projection, opaqueBuffer, alphaVao, errorMessage);
+	}
+
+	private void uploadSortedModel(SortedUploadTarget target, Model model, int orient, int x, int y, int z)
+	{
+		if (target == null)
+		{
+			return;
+		}
+
+		target.alphaStart = target.alphaVao.vbo.vb.position();
+		try
+		{
+			facePrioritySorter.uploadSortedModel(target.projection, model, orient, x, y, z,
+				target.opaqueBuffer, target.alphaVao.vbo.vb);
+		}
+		catch (Exception ex)
+		{
+			log.debug(target.errorMessage, ex);
+		}
+		target.alphaEnd = target.alphaVao.vbo.vb.position();
+	}
+
 	private void drawImmediateOpaque(ReplayBuffers replay, boolean retainForReplay)
 	{
 		int sz = replay.opaque.unmap();
@@ -2659,36 +2718,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			VAO o = primaryReplay.opaque.get(size), a = vaoA.get(size);
 			VAO desktopO = xrFrameStarted ? desktopReplay.opaque.get(size) : null;
 			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
-			int start = a.vbo.vb.position();
-			try
-			{
-				facePrioritySorter.uploadSortedModel(worldProjection, m, orient, x, y, z, o.vbo.vb, a.vbo.vb);
-			}
-			catch (Exception ex)
-			{
-				log.debug("error drawing entity", ex);
-			}
-			int desktopStart = desktopA != null ? desktopA.vbo.vb.position() : -1;
-			if (desktopA != null)
-			{
-				java.nio.IntBuffer desktopOpaqueBuffer = desktopO != null ? desktopO.vbo.vb : desktopSorterScratchOpaque;
-				if (desktopOpaqueBuffer == desktopSorterScratchOpaque)
-				{
-					desktopSorterScratchOpaque.clear();
-				}
-				try
-				{
-					facePrioritySorter.uploadSortedModel(buildDesktopSorterProjection(), m, orient, x, y, z, desktopOpaqueBuffer, desktopA.vbo.vb);
-				}
-				catch (Exception ex)
-				{
-					log.debug("error drawing desktop spectator dynamic entity", ex);
-				}
-			}
-			int end = a.vbo.vb.position();
-			int desktopEnd = desktopA != null ? desktopA.vbo.vb.position() : -1;
+			SortedUploadTarget primaryTarget = createSortedUploadTarget(worldProjection, o, a, "error drawing entity");
+			SortedUploadTarget desktopTarget = createSortedUploadTarget(
+				xrFrameStarted ? buildDesktopSorterProjection() : null,
+				desktopO,
+				desktopA,
+				"error drawing desktop spectator dynamic entity");
+			uploadSortedModel(primaryTarget, m, orient, x, y, z);
+			uploadSortedModel(desktopTarget, m, orient, x, y, z);
 
-			if (end > start)
+			if (primaryTarget.hasAlphaFaces())
 			{
 				int offset = scene.getWorldViewId() == WorldView.TOPLEVEL ? SCENE_OFFSET : 0;
 				int zx = (x >> 10) + (offset >> 3);
@@ -2699,10 +2738,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				// tileObject.getPlane()>maxLevel if visbelow is set - lower the object to the max level
 				int plane = Math.min(ctx.maxLevel, tileObject.getPlane());
 				// renderable modelheight is typically not set here because DynamicObject doesn't compute it on the returned model
-				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
-				if (desktopA != null && desktopEnd > desktopStart)
+				zone.addTempAlphaModel(a.vao, primaryTarget.alphaStart, primaryTarget.alphaEnd, plane, x & 1023, y, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
+				if (desktopTarget != null && desktopTarget.hasAlphaFaces())
 				{
-					zone.addTempAlphaModel(desktopA.vao, desktopStart, desktopEnd, plane, x & 1023, y, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
+					zone.addTempAlphaModel(desktopA.vao, desktopTarget.alphaStart, desktopTarget.alphaEnd, plane, x & 1023, y, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
 				}
 			}
 		}
@@ -2740,53 +2779,31 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				? desktopReplay.opaque.get(size)
 				: null;
 
-			int start = a.vbo.vb.position();
 			m.calculateBoundsCylinder();
 			// In VR mode use the VR eye's projection for face sorting/culling instead of the
 			// OSRS 2D camera projection, which only shows faces visible from one fixed direction.
 			Projection sortProj = xrFrameStarted ? vrSorterProjection : worldProjection;
-			try
-			{
-				facePrioritySorter.uploadSortedModel(sortProj, m, orient, x, y, z, o.vbo.vb, a.vbo.vb);
-			}
-			catch (Exception ex)
-			{
-				log.debug("error drawing entity", ex);
-			}
-			int desktopStart = desktopA != null ? desktopA.vbo.vb.position() : -1;
+			VAO desktopOpaqueVao = desktopPlayerVao != null ? desktopPlayerVao : desktopO;
+			SortedUploadTarget primaryTarget = createSortedUploadTarget(sortProj, o, a, "error drawing entity");
+			SortedUploadTarget desktopTarget = createSortedUploadTarget(
+				xrFrameStarted ? buildDesktopSorterProjection() : null,
+				desktopOpaqueVao,
+				desktopA,
+				"error drawing desktop spectator entity");
+			uploadSortedModel(primaryTarget, m, orient, x, y, z);
+			uploadSortedModel(desktopTarget, m, orient, x, y, z);
 
-			if (desktopPlayerVao != null || desktopA != null)
-			{
-				java.nio.IntBuffer desktopOpaqueBuffer = desktopPlayerVao != null
-					? desktopPlayerVao.vbo.vb
-					: desktopO != null ? desktopO.vbo.vb : desktopSorterScratchOpaque;
-				if (desktopOpaqueBuffer == desktopSorterScratchOpaque)
-				{
-					desktopSorterScratchOpaque.clear();
-				}
-				try
-				{
-					facePrioritySorter.uploadSortedModel(buildDesktopSorterProjection(), m, orient, x, y, z, desktopOpaqueBuffer, desktopA.vbo.vb);
-				}
-				catch (Exception ex)
-				{
-					log.debug("error drawing desktop spectator entity", ex);
-				}
-			}
-			int end = a.vbo.vb.position();
-			int desktopEnd = desktopA != null ? desktopA.vbo.vb.position() : -1;
-
-			if (end > start)
+			if (primaryTarget.hasAlphaFaces())
 			{
 				int offset = scene.getWorldViewId() == WorldView.TOPLEVEL ? (SCENE_OFFSET >> 3) : 0;
 				int zx = (gameObject.getX() >> 10) + offset;
 				int zz = (gameObject.getY() >> 10) + offset;
 				Zone zone = ctx.zones[zx][zz];
 				int plane = Math.min(ctx.maxLevel, gameObject.getPlane());
-				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
-				if (desktopA != null && desktopEnd > desktopStart)
+				zone.addTempAlphaModel(a.vao, primaryTarget.alphaStart, primaryTarget.alphaEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
+				if (desktopTarget != null && desktopTarget.hasAlphaFaces())
 				{
-					zone.addTempAlphaModel(desktopA.vao, desktopStart, desktopEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
+					zone.addTempAlphaModel(desktopA.vao, desktopTarget.alphaStart, desktopTarget.alphaEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
 				}
 			}
 		}
