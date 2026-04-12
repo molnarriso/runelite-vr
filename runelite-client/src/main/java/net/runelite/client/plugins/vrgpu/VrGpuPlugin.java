@@ -2156,36 +2156,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		else
 		{
-			// Desktop path — setup FBO and anti-aliasing
-			final AntiAliasingMode antiAliasingMode = config.antiAliasingMode();
-			final Dimension stretchedDimensions = client.getStretchedDimensions();
-
-			final int stretchedCanvasWidth = client.isStretchedEnabled() ? stretchedDimensions.width : canvasWidth;
-			final int stretchedCanvasHeight = client.isStretchedEnabled() ? stretchedDimensions.height : canvasHeight;
-
-			// Re-create fbo
-			if (lastStretchedCanvasWidth != stretchedCanvasWidth
-				|| lastStretchedCanvasHeight != stretchedCanvasHeight
-				|| lastAntiAliasingMode != antiAliasingMode)
-			{
-				shutdownFbo();
-
-				// Bind default FBO to check whether anti-aliasing is forced
-				glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
-				final int forcedAASamples = glGetInteger(GL_SAMPLES);
-				final int maxSamples = glGetInteger(GL_MAX_SAMPLES);
-				final int samples = forcedAASamples != 0 ? forcedAASamples :
-					Math.min(antiAliasingMode.getSamples(), maxSamples);
-
-				log.debug("AA samples: {}, max samples: {}, forced samples: {}", samples, maxSamples, forcedAASamples);
-
-				initFbo(stretchedCanvasWidth, stretchedCanvasHeight, samples);
-
-				lastStretchedCanvasWidth = stretchedCanvasWidth;
-				lastStretchedCanvasHeight = stretchedCanvasHeight;
-				lastAntiAliasingMode = antiAliasingMode;
-			}
-
+			ensureDesktopSceneFbo();
 		}
 		int sky = client.getSkyboxColor();
 
