@@ -280,28 +280,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Remaining ticks before staged walk dispatch. */
 	private volatile int vrPendingWalkInspectRetries;
 
-	/**
-	 * Number of VAOs in {@code vaoO} that were drawn (but not reset) during the
-	 * left-eye drawPass. Replayed and reset in the right-eye pass.
-	 */
-	private int vrPassOpaqueCount;
-	/**
-	 * Number of VAOs in {@code vaoDesktopO} filled during the left-eye pass for the
-	 * desktop spectator camera. These remain separate so opaque temp/dynamic faces
-	 * do not inherit the VR eye's sorted/culling decisions.
-	 */
-	private int vrPassDesktopOpaqueCount;
-	/**
-	 * Number of VAOs in {@code vaoPO} that were drawn (but not reset) during the
-	 * left-eye drawPass. Replayed and reset in the right-eye pass.
-	 */
-	private int vrPassPlayerCount;
-	/**
-	 * Number of VAOs in {@code vaoDesktopPO} that were filled during the left-eye pass
-	 * for the desktop spectator camera. These stay separate from {@code vaoPO}
-	 * because player/temp faces must be sorted from the desktop camera, not the VR eye.
-	 */
-	private int vrPassDesktopPlayerCount;
+	private static final class ReplayBuffers
+	{
+		VAOList opaque;
+		VAOList sortedOpaque;
+		int opaqueCount;
+		int sortedOpaqueCount;
+
+		void resetCounts()
+		{
+			opaqueCount = 0;
+			sortedOpaqueCount = 0;
+		}
+	}
 
 	private boolean lwjglInitted = false;
 	private GLCapabilities glCapabilities;
@@ -347,12 +338,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private int cameraYaw, cameraPitch;
 
-	private VAOList vaoO;
+	private ReplayBuffers primaryReplay;
 	private VAOList vaoA;
-	private VAOList vaoPO;
-	private VAOList vaoDesktopO;
+	private ReplayBuffers desktopReplay;
 	private VAOList vaoDesktopA;
-	private VAOList vaoDesktopPO;
 
 	private SceneUploader clientUploader, mapUploader;
 	private FacePrioritySorter facePrioritySorter;
@@ -896,12 +885,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		initGlBuffer(glUniformBuffer);
 		Zone.initBuffer();
 
-		vaoO = new VAOList();
+		primaryReplay = new ReplayBuffers();
+		primaryReplay.opaque = new VAOList();
+		primaryReplay.sortedOpaque = new VAOList();
+		desktopReplay = new ReplayBuffers();
+		desktopReplay.opaque = new VAOList();
+		desktopReplay.sortedOpaque = new VAOList();
 		vaoA = new VAOList();
-		vaoPO = new VAOList();
-		vaoDesktopO = new VAOList();
 		vaoDesktopA = new VAOList();
-		vaoDesktopPO = new VAOList();
 	}
 
 	private void initGlBuffer(GLBuffer glBuffer)
@@ -915,31 +906,127 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		uniformBuffer = null;
 		Zone.freeBuffer();
 
-		if (vaoO != null)
-		{
-			vaoO.free();
-		}
-		if (vaoDesktopO != null)
-		{
-			vaoDesktopO.free();
-		}
+		freeReplayBuffers(primaryReplay);
 		if (vaoA != null)
 		{
 			vaoA.free();
 		}
+		freeReplayBuffers(desktopReplay);
 		if (vaoDesktopA != null)
 		{
 			vaoDesktopA.free();
 		}
-		if (vaoPO != null)
+		primaryReplay = null;
+		desktopReplay = null;
+		vaoA = vaoDesktopA = null;
+	}
+
+	private static void freeReplayBuffers(ReplayBuffers replay)
+	{
+		if (replay == null)
 		{
-			vaoPO.free();
+			return;
 		}
-		if (vaoDesktopPO != null)
+		if (replay.opaque != null)
 		{
-			vaoDesktopPO.free();
+			replay.opaque.free();
+			replay.opaque = null;
 		}
-		vaoO = vaoA = vaoPO = vaoDesktopO = vaoDesktopA = vaoDesktopPO = null;
+		if (replay.sortedOpaque != null)
+		{
+			replay.sortedOpaque.free();
+			replay.sortedOpaque = null;
+		}
+		replay.resetCounts();
+	}
+
+	private static void addReplayRange(ReplayBuffers replay, Projection projection, Scene scene)
+	{
+		replay.opaque.addRange(projection, scene);
+		replay.sortedOpaque.addRange(projection, scene);
+	}
+
+	private void replayCapturedOpaque(ReplayBuffers replay, boolean resetAfterDraw)
+	{
+		for (int i = 0; i < replay.opaqueCount; i++)
+		{
+			replay.opaque.vaos.get(i).draw();
+			if (resetAfterDraw)
+			{
+				replay.opaque.vaos.get(i).reset();
+			}
+		}
+		replay.opaqueCount = 0;
+	}
+
+	private void replayCapturedSortedOpaque(ReplayBuffers replay, boolean resetAfterDraw)
+	{
+		if (replay.sortedOpaqueCount <= 0)
+		{
+			return;
+		}
+
+		glDepthMask(false);
+		for (int i = 0; i < replay.sortedOpaqueCount; i++)
+		{
+			replay.sortedOpaque.vaos.get(i).draw();
+		}
+		glDepthMask(true);
+
+		glColorMask(false, false, false, false);
+		for (int i = 0; i < replay.sortedOpaqueCount; i++)
+		{
+			replay.sortedOpaque.vaos.get(i).draw();
+			if (resetAfterDraw)
+			{
+				replay.sortedOpaque.vaos.get(i).reset();
+			}
+		}
+		glColorMask(true, true, true, true);
+		replay.sortedOpaqueCount = 0;
+	}
+
+	private void drawImmediateOpaque(ReplayBuffers replay, boolean retainForReplay)
+	{
+		int sz = replay.opaque.unmap();
+		for (int i = 0; i < sz; ++i)
+		{
+			replay.opaque.vaos.get(i).draw();
+			if (!retainForReplay)
+			{
+				replay.opaque.vaos.get(i).reset();
+			}
+		}
+		replay.opaqueCount = retainForReplay ? sz : 0;
+	}
+
+	private void drawImmediateSortedOpaque(ReplayBuffers replay, boolean retainForReplay)
+	{
+		int sz = replay.sortedOpaque.unmap();
+		if (sz <= 0)
+		{
+			replay.sortedOpaqueCount = 0;
+			return;
+		}
+
+		glDepthMask(false);
+		for (int i = 0; i < sz; ++i)
+		{
+			replay.sortedOpaque.vaos.get(i).draw();
+		}
+		glDepthMask(true);
+
+		glColorMask(false, false, false, false);
+		for (int i = 0; i < sz; ++i)
+		{
+			replay.sortedOpaque.vaos.get(i).draw();
+			if (!retainForReplay)
+			{
+				replay.sortedOpaque.vaos.get(i).reset();
+			}
+		}
+		glColorMask(true, true, true, true);
+		replay.sortedOpaqueCount = retainForReplay ? sz : 0;
 	}
 
 	private void destroyGlBuffer(GLBuffer glBuffer)
@@ -1223,10 +1310,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		final float s = DEFAULT_WORLD_SCALE;
 		final float oy = vrWorldAnchorY;
-		final float oz = -1.5f;
-		final float camX = root.cameraX;
-		final float camY = root.cameraY;
-		final float camZ = root.cameraZ;
+		final float oz = VR_STAGE_CHARACTER_OFFSET_Z;
+		final float camX = getVrAnchorWorldX();
+		final float camY = getVrAnchorWorldY();
+		final float camZ = getVrAnchorWorldZ();
 		final float RAY_M = 5f;          // ray length in metres
 		final float CROSS = 17f;         // crosshair arm half-length in OSRS units (~3× smaller)
 		final float TILE  = 128f;        // one tile in OSRS local units
@@ -1263,7 +1350,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			float dx = c[3], dy = c[4], dz = c[5];
 			float r = c[6], g = c[7], b = c[8];
 
-			// Convert stage-space (metres) to OSRS world coordinates.
+			// Convert stage-space (metres) to the same anchored OSRS world coordinates
+			// used by computeVrWorldProj() and the staged click ray path.
 			float ox2 = camX - px / s;
 			float oy2 = camY - (py - oy) / s;
 			float oz2 = camZ + (pz - oz) / s;
@@ -1852,10 +1940,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		else
 		{
 			Scene toplevel = client.getScene();
-			vaoO.addRange(null, toplevel);
-			vaoPO.addRange(null, toplevel);
-			vaoDesktopO.addRange(null, toplevel);
-			vaoDesktopPO.addRange(null, toplevel);
+			addReplayRange(primaryReplay, null, toplevel);
+			addReplayRange(desktopReplay, null, toplevel);
 			glUniform4i(uniEntityTint, scene.getOverrideHue(), scene.getOverrideSaturation(), scene.getOverrideLuminance(), scene.getOverrideAmount());
 		}
 	}
@@ -1905,10 +1991,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrAlphaZones.clear();
 			vrAlphaProjs.clear();
 			vrScene = scene;
-			vrPassOpaqueCount = 0;
-			vrPassDesktopOpaqueCount = 0;
-			vrPassPlayerCount = 0;
-			vrPassDesktopPlayerCount = 0;
+			primaryReplay.resetCounts();
+			desktopReplay.resetCounts();
 
 			// Sample world anchor Y from initial eye height (once per session).
 			if (Float.isNaN(vrWorldAnchorY))
@@ -2145,23 +2229,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// These were drawn but not reset during the left-eye drawPass; reset them here.
 			glUniform3i(uniBase, 0, 0, 0);
 			glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-			for (int i = 0; i < vrPassOpaqueCount; i++)
-			{
-				vaoO.vaos.get(i).draw();
-				vaoO.vaos.get(i).reset();
-			}
-			vrPassOpaqueCount = 0;
-
-			if (vrPassPlayerCount > 0)
-			{
-				glDepthMask(false);
-				for (int i = 0; i < vrPassPlayerCount; i++) { vaoPO.vaos.get(i).draw(); }
-				glDepthMask(true);
-				glColorMask(false, false, false, false);
-				for (int i = 0; i < vrPassPlayerCount; i++) { vaoPO.vaos.get(i).draw(); vaoPO.vaos.get(i).reset(); }
-				glColorMask(true, true, true, true);
-				vrPassPlayerCount = 0;
-			}
+			replayCapturedOpaque(primaryReplay, true);
+			replayCapturedSortedOpaque(primaryReplay, true);
 
 			// Replay alpha zones from left-eye pass (already sorted during left-eye pass)
 			vaoA.unmap();
@@ -2382,30 +2451,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glUniform3i(uniBase, 0, 0, 0);
 		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-		for (int i = 0; i < vrPassDesktopOpaqueCount; i++)
-		{
-			vaoDesktopO.vaos.get(i).draw();
-			vaoDesktopO.vaos.get(i).reset();
-		}
-		vrPassDesktopOpaqueCount = 0;
-
-		if (vrPassDesktopPlayerCount > 0)
-		{
-			glDepthMask(false);
-			for (int i = 0; i < vrPassDesktopPlayerCount; i++)
-			{
-				vaoDesktopPO.vaos.get(i).draw();
-			}
-			glDepthMask(true);
-			glColorMask(false, false, false, false);
-			for (int i = 0; i < vrPassDesktopPlayerCount; i++)
-			{
-				vaoDesktopPO.vaos.get(i).draw();
-				vaoDesktopPO.vaos.get(i).reset();
-			}
-			glColorMask(true, true, true, true);
-			vrPassDesktopPlayerCount = 0;
-		}
+		replayCapturedOpaque(desktopReplay, true);
+		replayCapturedSortedOpaque(desktopReplay, true);
 
 		vaoA.unmap();
 		for (int i = 0; i < vrAlphaZones.size(); i++)
@@ -2568,48 +2615,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		if (pass == DrawCallbacks.PASS_OPAQUE)
 		{
-			vaoO.addRange(projection, scene);
-			vaoPO.addRange(projection, scene);
-			vaoDesktopO.addRange(projection, scene);
-			vaoDesktopPO.addRange(projection, scene);
+			addReplayRange(primaryReplay, projection, scene);
+			addReplayRange(desktopReplay, projection, scene);
 
 			if (scene.getWorldViewId() == WorldView.TOPLEVEL)
 			{
 				glUniform3i(uniBase, 0, 0, 0);
-
-				int sz = vaoO.unmap();
-				for (int i = 0; i < sz; ++i)
-				{
-					vaoO.vaos.get(i).draw();
-					if (!xrFrameStarted) { vaoO.vaos.get(i).reset(); }
-				}
-				if (xrFrameStarted) { vrPassOpaqueCount = sz; }
+				drawImmediateOpaque(primaryReplay, xrFrameStarted);
+				drawImmediateSortedOpaque(primaryReplay, xrFrameStarted);
 
 				if (xrFrameStarted)
 				{
-					vrPassDesktopOpaqueCount = vaoDesktopO.unmap();
-				}
-
-				sz = vaoPO.unmap();
-				if (sz > 0)
-				{
-					glDepthMask(false);
-					for (int i = 0; i < sz; ++i) { vaoPO.vaos.get(i).draw(); }
-					glDepthMask(true);
-
-					glColorMask(false, false, false, false);
-					for (int i = 0; i < sz; ++i)
-					{
-						vaoPO.vaos.get(i).draw();
-						if (!xrFrameStarted) { vaoPO.vaos.get(i).reset(); }
-					}
-					glColorMask(true, true, true, true);
-					if (xrFrameStarted) { vrPassPlayerCount = sz; }
-				}
-
-				if (xrFrameStarted)
-				{
-					vrPassDesktopPlayerCount = vaoDesktopPO.unmap();
+					desktopReplay.opaqueCount = desktopReplay.opaque.unmap();
+					desktopReplay.sortedOpaqueCount = desktopReplay.sortedOpaque.unmap();
 				}
 			}
 		}
@@ -2651,19 +2669,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		int size = m.getFaceCount() * 3 * VAO.VERT_SIZE;
 		if (m.getFaceTransparencies() == null)
 		{
-			VAO o = vaoO.get(size);
+			VAO o = primaryReplay.opaque.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
 			if (xrFrameStarted)
 			{
-				VAO desktopO = vaoDesktopO.get(size);
+				VAO desktopO = desktopReplay.opaque.get(size);
 				clientUploader.uploadTempModel(m, orient, x, y, z, desktopO.vbo.vb);
 			}
 		}
 		else
 		{
 			m.calculateBoundsCylinder();
-			VAO o = vaoO.get(size), a = vaoA.get(size);
-			VAO desktopO = xrFrameStarted ? vaoDesktopO.get(size) : null;
+			VAO o = primaryReplay.opaque.get(size), a = vaoA.get(size);
+			VAO desktopO = xrFrameStarted ? desktopReplay.opaque.get(size) : null;
 			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
 			int start = a.vbo.vb.position();
 			try
@@ -2736,14 +2754,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// opaque player faces have their own vao and are drawn in a separate pass from normal opaque faces
 			// because they are not depth tested. transparent player faces don't need their own vao because normal
 			// transparent faces are already not depth tested
-			VAO o = renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH ? vaoPO.get(size) : vaoO.get(size);
+			VAO o = renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH ? primaryReplay.sortedOpaque.get(size) : primaryReplay.opaque.get(size);
 			VAO desktopPlayerVao = xrFrameStarted && renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH
-				? vaoDesktopPO.get(size)
+				? desktopReplay.sortedOpaque.get(size)
 				: null;
 			VAO a = vaoA.get(size);
 			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
 			VAO desktopO = xrFrameStarted && renderMode != Renderable.RENDERMODE_SORTED_NO_DEPTH
-				? vaoDesktopO.get(size)
+				? desktopReplay.opaque.get(size)
 				: null;
 
 			int start = a.vbo.vb.position();
@@ -2798,11 +2816,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		else
 		{
-			VAO o = vaoO.get(size);
+			VAO o = primaryReplay.opaque.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
 			if (xrFrameStarted)
 			{
-				VAO desktopO = vaoDesktopO.get(size);
+				VAO desktopO = desktopReplay.opaque.get(size);
 				clientUploader.uploadTempModel(m, orient, x, y, z, desktopO.vbo.vb);
 			}
 		}
