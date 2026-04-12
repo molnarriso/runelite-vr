@@ -1045,6 +1045,35 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
+	private void setupScenePass(int framebuffer, int viewportX, int viewportY, int viewportWidth, int viewportHeight,
+		boolean dpiAwareViewport, float[] worldProjectionMatrix, int skyColor, int cullFaceMode)
+	{
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
+		glClearColor((skyColor >> 16 & 0xFF) / 255f, (skyColor >> 8 & 0xFF) / 255f, (skyColor & 0xFF) / 255f, 1f);
+		glClearDepth(0d);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		if (dpiAwareViewport)
+		{
+			glDpiAwareViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+		}
+		else
+		{
+			glViewport(viewportX, viewportY, viewportWidth, viewportHeight);
+		}
+
+		glUniformMatrix4fv(uniWorldProj, false, worldProjectionMatrix);
+		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
+		glUniform4i(uniEntityTint, 0, 0, 0, 0);
+
+		glEnable(GL_CULL_FACE);
+		glCullFace(cullFaceMode);
+		glEnable(GL_BLEND);
+		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
+		glDepthFunc(GL_GREATER);
+		glEnable(GL_DEPTH_TEST);
+	}
+
 	private static final class SortedUploadTarget
 	{
 		private final Projection projection;
@@ -2124,7 +2153,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrSorterProjection = buildVrSorterProjection(0);
 
 			vrLeftEyeFbo = eyeSwapchains[0].acquireImage();
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, vrLeftEyeFbo);
 		}
 		else
 		{
@@ -2158,14 +2186,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				lastAntiAliasingMode = antiAliasingMode;
 			}
 
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fboScene);
 		}
-
-		// Clear scene
 		int sky = client.getSkyboxColor();
-		glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
-		glClearDepth(0d);
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
 		// Setup anisotropic filtering
 		final int anisotropicFilteringLevel = config.anisotropicFilteringLevel();
@@ -2174,42 +2196,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			textureManager.setAnisotropicFilteringLevel(textureArrayId, anisotropicFilteringLevel);
 			lastAnisotropicFilteringLevel = anisotropicFilteringLevel;
-		}
-
-		// Setup viewport
-		if (xrFrameStarted)
-		{
-			// VR: render to full left-eye swapchain resolution
-			glViewport(0, 0, eyeSwapchains[0].getWidth(), eyeSwapchains[0].getHeight());
-		}
-		else
-		{
-			int renderWidthOff = client.getViewportXOffset();
-			int renderHeightOff = client.getViewportYOffset();
-			int renderCanvasHeight = canvasHeight;
-			int renderViewportHeight = viewportHeight;
-			int renderViewportWidth = viewportWidth;
-			if (client.isStretchedEnabled())
-			{
-				Dimension dim = client.getStretchedDimensions();
-				renderCanvasHeight = dim.height;
-
-				double scaleFactorY = dim.getHeight() / canvasHeight;
-				double scaleFactorX = dim.getWidth() / canvasWidth;
-
-				// Pad the viewport a little because having ints for our viewport dimensions can introduce off-by-one errors.
-				final int padding = 1;
-
-				// Ceil the sizes because even if the size is 599.1 we want to treat it as size 600 (i.e. render to the x=599 pixel).
-				renderViewportHeight = (int) Math.ceil(scaleFactorY * (renderViewportHeight)) + padding * 2;
-				renderViewportWidth = (int) Math.ceil(scaleFactorX * (renderViewportWidth)) + padding * 2;
-
-				// Floor the offsets because even if the offset is 4.9, we want to render to the x=4 pixel anyway.
-				renderHeightOff = (int) Math.floor(scaleFactorY * (renderHeightOff)) - padding;
-				renderWidthOff = (int) Math.floor(scaleFactorX * (renderWidthOff)) - padding;
-			}
-
-			glDpiAwareViewport(renderWidthOff, renderCanvasHeight - renderViewportHeight - renderHeightOff, renderViewportWidth, renderViewportHeight);
 		}
 
 		glUseProgram(glProgram);
@@ -2250,29 +2236,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			Mat4.mul(projectionMatrix, Mat4.rotateY(cameraYaw));
 			Mat4.mul(projectionMatrix, Mat4.translate(-cameraX, -cameraY, -cameraZ));
 		}
-		glUniformMatrix4fv(uniWorldProj, false, projectionMatrix);
-
-		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-
-		glUniform4i(uniEntityTint, 0, 0, 0, 0);
+		ScenePassViewport scenePassViewport = getMainSceneViewport(canvasWidth, canvasHeight, viewportWidth, viewportHeight);
+		int drawFramebuffer = xrFrameStarted ? vrLeftEyeFbo : fboScene;
+		setupScenePass(drawFramebuffer, scenePassViewport.x, scenePassViewport.y, scenePassViewport.width, scenePassViewport.height,
+			scenePassViewport.dpiAware, projectionMatrix, sky, GL_BACK);
 
 		// Bind uniforms
 		glUniformBlockBinding(glProgram, uniBlockMain, 0);
 		glUniform1i(uniTextures, 1); // texture sampler array is bound to texture1
-
-		// Enable face culling.
-		// In VR mode the Y scale is negated, which reverses winding order for every
-		// triangle.  Switch to GL_FRONT so the rasterizer still discards the correct side.
-		glEnable(GL_CULL_FACE);
-		if (xrFrameStarted) { glCullFace(GL_BACK); }
-
-		// Enable blending
-		glEnable(GL_BLEND);
-		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
-
-		// Enable depth testing
-		glDepthFunc(GL_GREATER);
-		glEnable(GL_DEPTH_TEST);
 
 		checkGLErrors();
 	}
@@ -2308,26 +2279,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 			// ---- Right eye pass (T3.3) ----
 			int rightFbo = eyeSwapchains[1].acquireImage();
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, rightFbo);
-
 			int sky = client.getSkyboxColor();
-			glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
-			glClearDepth(0d);
-			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-			glViewport(0, 0, eyeSwapchains[1].getWidth(), eyeSwapchains[1].getHeight());
-
 			glUseProgram(glProgram);
-			glUniformMatrix4fv(uniWorldProj, false, computeVrWorldProj(1));
-			glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-			glUniform4i(uniEntityTint, 0, 0, 0, 0);
-
-			glEnable(GL_CULL_FACE);
-			glCullFace(GL_BACK); // X/Y flips preserve winding parity; normal back-face culling applies
-			glEnable(GL_BLEND);
-			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
-			glDepthFunc(GL_GREATER);
-			glEnable(GL_DEPTH_TEST);
+			setupScenePass(rightFbo, 0, 0, eyeSwapchains[1].getWidth(), eyeSwapchains[1].getHeight(),
+				false, computeVrWorldProj(1), sky, GL_BACK);
 
 			// Replay left-eye-captured scene content into the right-eye target.
 			replayScene(vrScene, primaryReplay, cameraYaw, cameraPitch, root.cameraX, root.cameraZ,
@@ -2370,6 +2325,24 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
+	private static final class ScenePassViewport
+	{
+		final int x;
+		final int y;
+		final int width;
+		final int height;
+		final boolean dpiAware;
+
+		private ScenePassViewport(int x, int y, int width, int height, boolean dpiAware)
+		{
+			this.x = x;
+			this.y = y;
+			this.width = width;
+			this.height = height;
+			this.dpiAware = dpiAware;
+		}
+	}
+
 	private DesktopViewport getDesktopViewport()
 	{
 		int renderWidthOff = client.getViewportXOffset();
@@ -2397,6 +2370,41 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		int y = renderCanvasHeight - renderViewportHeight - renderHeightOff;
 		return new DesktopViewport(renderWidthOff, y, renderViewportWidth, renderViewportHeight);
+	}
+
+	private ScenePassViewport getMainSceneViewport(int canvasWidth, int canvasHeight, int viewportWidth, int viewportHeight)
+	{
+		if (xrFrameStarted)
+		{
+			return new ScenePassViewport(0, 0, eyeSwapchains[0].getWidth(), eyeSwapchains[0].getHeight(), false);
+		}
+
+		int renderWidthOff = client.getViewportXOffset();
+		int renderHeightOff = client.getViewportYOffset();
+		int renderCanvasHeight = canvasHeight;
+		int renderViewportHeight = viewportHeight;
+		int renderViewportWidth = viewportWidth;
+		if (client.isStretchedEnabled())
+		{
+			Dimension dim = client.getStretchedDimensions();
+			renderCanvasHeight = dim.height;
+
+			double scaleFactorY = dim.getHeight() / canvasHeight;
+			double scaleFactorX = dim.getWidth() / canvasWidth;
+			final int padding = 1;
+
+			renderViewportHeight = (int) Math.ceil(scaleFactorY * renderViewportHeight) + padding * 2;
+			renderViewportWidth = (int) Math.ceil(scaleFactorX * renderViewportWidth) + padding * 2;
+			renderHeightOff = (int) Math.floor(scaleFactorY * renderHeightOff) - padding;
+			renderWidthOff = (int) Math.floor(scaleFactorX * renderWidthOff) - padding;
+		}
+
+		return new ScenePassViewport(
+			renderWidthOff,
+			renderCanvasHeight - renderViewportHeight - renderHeightOff,
+			renderViewportWidth,
+			renderViewportHeight,
+			true);
 	}
 
 	private void ensureDesktopSceneFbo()
@@ -2488,24 +2496,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			(float) client.getCameraFpZ(),
 			(float) client.getCameraFpY());
 
-		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fboScene);
-		glClearColor((sky >> 16 & 0xFF) / 255f, (sky >> 8 & 0xFF) / 255f, (sky & 0xFF) / 255f, 1f);
-		glClearDepth(0d);
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-		glDpiAwareViewport(vp.x, vp.y, vp.width, vp.height);
-
 		glUseProgram(glProgram);
-		glUniformMatrix4fv(uniWorldProj, false, computeDesktopWorldProj());
-		glUniformMatrix4fv(uniEntityProj, false, Mat4.identity());
-		glUniform4i(uniEntityTint, 0, 0, 0, 0);
-
-		glEnable(GL_CULL_FACE);
-		glCullFace(GL_BACK);
-		glEnable(GL_BLEND);
-		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
-		glDepthFunc(GL_GREATER);
-		glEnable(GL_DEPTH_TEST);
+		setupScenePass(fboScene, vp.x, vp.y, vp.width, vp.height, true, computeDesktopWorldProj(), sky, GL_BACK);
 
 		replayScene(vrScene, desktopReplay, desktopCameraYawJau, desktopCameraPitchJau,
 			desktopCameraX, desktopCameraZ, true, true, false);
