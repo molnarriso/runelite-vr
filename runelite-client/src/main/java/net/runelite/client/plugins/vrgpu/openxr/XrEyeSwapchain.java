@@ -27,6 +27,7 @@ package net.runelite.client.plugins.vrgpu.openxr;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.lwjgl.openxr.KHROpenGLEnable;
+import org.lwjgl.openxr.XrInstance;
 import org.lwjgl.openxr.XrSession;
 import org.lwjgl.openxr.XrSwapchain;
 import org.lwjgl.openxr.XrSwapchainCreateInfo;
@@ -61,6 +62,7 @@ import static org.lwjgl.system.MemoryStack.stackPush;
 @Slf4j
 public class XrEyeSwapchain
 {
+	private XrInstance instance;
 	/** The OpenXR swapchain handle. */
 	@Getter
 	private XrSwapchain swapchain;
@@ -100,8 +102,9 @@ public class XrEyeSwapchain
 	 * @param height  recommended image height (from XrViewConfigurationView)
 	 * @param format  GL internal format to request (e.g. {@code GL_RGBA8} or {@code GL_SRGB8_ALPHA8})
 	 */
-	public void init(XrSession session, int width, int height, int format)
+	public void init(XrInstance instance, XrSession session, int width, int height, int format)
 	{
+		this.instance = instance;
 		this.width = width;
 		this.height = height;
 
@@ -257,11 +260,11 @@ public class XrEyeSwapchain
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	}
 
-	private static void checkXr(String call, int result)
+	private void checkXr(String call, int result)
 	{
 		if (result != XR_SUCCESS)
 		{
-			throw new RuntimeException(call + " failed with XrResult=" + result);
+			throw new RuntimeException(call + " failed with XrResult=" + result + " (" + XrContext.xrResultName(instance, result) + ")");
 		}
 	}
 }

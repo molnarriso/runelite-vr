@@ -55,7 +55,7 @@ import org.lwjgl.openxr.XrViewConfigurationView;
 import org.lwjgl.openxr.XrViewLocateInfo;
 import org.lwjgl.openxr.XrViewState;
 import org.lwjgl.system.MemoryStack;
-
+import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 
@@ -513,11 +513,27 @@ public class XrContext
 		log.info("XR session ended");
 	}
 
-	private static void checkXr(String call, int result)
+	private void checkXr(String call, int result)
 	{
 		if (result != XR_SUCCESS)
 		{
-			throw new RuntimeException(call + " failed with XrResult=" + result);
+			throw new RuntimeException(call + " failed with XrResult=" + result + " (" + xrResultName(instance, result) + ")");
 		}
+	}
+
+	static String xrResultName(XrInstance instance, int result)
+	{
+		if (instance != null)
+		{
+			try (MemoryStack stack = stackPush())
+			{
+				ByteBuffer resultString = stack.malloc(XR_MAX_RESULT_STRING_SIZE);
+				if (xrResultToString(instance, result, resultString) == XR_SUCCESS)
+				{
+					return org.lwjgl.system.MemoryUtil.memASCII(resultString, org.lwjgl.system.MemoryUtil.memLengthNT1(resultString));
+				}
+			}
+		}
+		return "UNKNOWN_XR_RESULT";
 	}
 }

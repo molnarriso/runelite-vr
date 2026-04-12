@@ -399,11 +399,11 @@ public class XrInput
 		return state.isActive() ? state.currentState() : 0f;
 	}
 
-	private static void checkXr(String call, int result)
+	private void checkXr(String call, int result)
 	{
 		if (result != XR_SUCCESS)
 		{
-			throw new RuntimeException(call + " failed: XrResult=" + result);
+			throw new RuntimeException(call + " failed: XrResult=" + result + " (" + XrContext.xrResultName(instance, result) + ")");
 		}
 	}
 }

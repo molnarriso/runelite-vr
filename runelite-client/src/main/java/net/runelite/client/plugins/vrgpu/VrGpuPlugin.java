@@ -539,6 +539,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					{
 						eyeSwapchains[eye] = new XrEyeSwapchain();
 						eyeSwapchains[eye].init(
+							xrContext.getInstance(),
 							xrContext.getSession(),
 							xrContext.getEyeWidth()[eye],
 							xrContext.getEyeHeight()[eye],
