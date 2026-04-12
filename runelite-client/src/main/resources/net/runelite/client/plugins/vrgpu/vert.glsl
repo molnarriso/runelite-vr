@@ -54,6 +54,7 @@ layout(std140) uniform uniforms {
 
 uniform mat4 worldProj;
 uniform mat4 entityProj;
+uniform float biasScale;
 uniform ivec4 entityTint;
 uniform float brightness;
 uniform int useFog;
@@ -93,7 +94,7 @@ void main() {
 #ifdef ZBUF_DEBUG
   fDepth = screenPos.z / screenPos.w;
 #endif
-  screenPos.z += float(bias) / 128.0;
+  screenPos.z += float(bias) / 128.0 * biasScale;
   gl_Position = screenPos;
 #ifdef BIAS_DEBUG
   fColor = vec4(clamp(bias, 0, 12) / 12.0, 0.0, 0.0, 1.0);

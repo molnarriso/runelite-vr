@@ -429,6 +429,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private int uniColorblindIntensity;
 	private int uniUiColorblindIntensity;
 	static int uniBase;
+	private int uniBiasScale;
 
 	private static Projection lastProjection;
 
@@ -816,6 +817,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		uniTextureAnimations = glGetUniformLocation(glProgram, "textureAnimations");
 		uniBase = glGetUniformLocation(glProgram, "base");
 		uniColorblindIntensity = glGetUniformLocation(glProgram, "colorblindIntensity");
+		uniBiasScale = glGetUniformLocation(glProgram, "biasScale");
 
 		uniTex = glGetUniformLocation(glUiProgram, "tex");
 		uniTexTargetDimensions = glGetUniformLocation(glUiProgram, "targetDimensions");
@@ -2180,6 +2182,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glUniform1i(uniDrawDistance, drawDistance * Perspective.LOCAL_TILE_SIZE);
 		glUniform1i(uniExpandedMapLoadingChunks, client.getExpandedMapLoading());
 		glUniform1f(uniColorblindIntensity, config.colorBlindIntensity());
+		// VR clip_w is in metres; desktop clip_w is in OSRS units (~1/DEFAULT_WORLD_SCALE larger).
+		// Scaling the bias by DEFAULT_WORLD_SCALE in VR keeps the NDC depth offset identical
+		// to desktop mode, preventing decal faces from clipping through walls and NPCs.
+		glUniform1f(uniBiasScale, xrFrameStarted ? DEFAULT_WORLD_SCALE : 1.0f);
 
 		// Brightness happens to also be stored in the texture provider, so we use that
 		TextureProvider textureProvider = client.getTextureProvider();
