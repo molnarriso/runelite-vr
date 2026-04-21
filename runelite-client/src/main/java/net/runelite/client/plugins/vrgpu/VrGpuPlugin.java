@@ -201,7 +201,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private int currentEye = -1;
 
 	/** FBO handle acquired for the left eye this frame (valid until releaseImage). */
-	private int vrLeftEyeFbo;
+	private int vrLeftEyeFbo = -1;
+	/** FBO handle acquired for the right eye this frame (valid until releaseImage). */
+	private int vrRightEyeFbo = -1;
 
 	/** Opaque zone coords [zx, zz] recorded during the left-eye pass. */
 	private final List<int[]> vrOpaqueZones = new ArrayList<>(256);
@@ -229,6 +231,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	// --- Debug ray visualisation ---
 	private int glDebugProgram;
 	private int uniDebugWorldProj;
+	private final VrUi vrUi = new VrUi();
 	private int debugVboId;
 	private int debugVaoId;
 	/** Scratch buffer for per-frame debug vertices (max 16 verts × 7 floats). */
@@ -791,6 +794,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glUiProgram = UI_PROGRAM.compile(template);
 		glDebugProgram = DEBUG_PROGRAM.compile(template);
 		uniDebugWorldProj = glGetUniformLocation(glDebugProgram, "worldProj");
+		vrUi.init(template);
 
 		glBindVertexArray(0);
 
@@ -837,6 +841,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (glDebugProgram != 0) { glDeleteProgram(glDebugProgram); glDebugProgram = 0; }
 		if (debugVaoId != 0) { glDeleteVertexArrays(debugVaoId); debugVaoId = 0; }
 		if (debugVboId != 0) { glDeleteBuffers(debugVboId); debugVboId = 0; }
+		vrUi.destroy();
 	}
 
 	private void initVao()
@@ -2270,11 +2275,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glDisable(GL_CULL_FACE);
 			glDisable(GL_DEPTH_TEST);
 
-			// Draw controller rays over right eye before releasing swapchain image.
+			// Draw controller rays over right eye. The swapchain images stay acquired
+			// until draw(), where the late VR UI pass has access to the canvas texture.
 			drawDebugRays(1);
-			eyeSwapchains[1].releaseImage();
-
-			eyeSwapchains[0].releaseImage();
+			vrRightEyeFbo = rightFbo;
 			currentEye = -1;
 
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, awtContext.getFramebuffer(false));
@@ -3022,6 +3026,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				// End any in-flight frame before stopping.
 				if (xrFrameStarted)
 				{
+					releaseXrEyeImagesIfAcquired();
 					xrContext.endXrFrame();
 					xrFrameStarted = false;
 				}
@@ -3060,6 +3065,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int canvasWidth = client.getCanvasWidth();
 
 		prepareInterfaceTexture(canvasWidth, canvasHeight);
+		drawVrUi(overlayColor, canvasWidth, canvasHeight);
 
 		glClearColor(0, 0, 0, 1);
 		glClear(GL_COLOR_BUFFER_BIT);
@@ -3112,6 +3118,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			if (sceneFboValid && xrContext.getViews() != null)
 			{
+				releaseXrEyeImagesIfAcquired();
 				xrContext.endXrFrameStereo(
 					xrContext.getViews(),
 					eyeSwapchains[0].getSwapchain(),
@@ -3119,6 +3126,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			}
 			else
 			{
+				releaseXrEyeImagesIfAcquired();
 				xrContext.endXrFrame();
 			}
 			xrFrameStarted = false;
@@ -3133,6 +3141,58 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		checkGLErrors();
+	}
+
+	private void drawVrUi(int overlayColor, int canvasWidth, int canvasHeight)
+	{
+		if (!xrFrameStarted || !sceneFboValid || xrContext == null || xrContext.getViews() == null
+			|| eyeSwapchains == null || vrLeftEyeFbo == -1 || vrRightEyeFbo == -1)
+		{
+			return;
+		}
+
+		vrUi.renderCanvasPanel(
+			vrLeftEyeFbo,
+			eyeSwapchains[0].getWidth(),
+			eyeSwapchains[0].getHeight(),
+			xrContext.getViews(),
+			0,
+			interfaceTexture,
+			canvasWidth,
+			canvasHeight,
+			overlayColor);
+		vrUi.renderCanvasPanel(
+			vrRightEyeFbo,
+			eyeSwapchains[1].getWidth(),
+			eyeSwapchains[1].getHeight(),
+			xrContext.getViews(),
+			1,
+			interfaceTexture,
+			canvasWidth,
+			canvasHeight,
+			overlayColor);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+	}
+
+	private void releaseXrEyeImagesIfAcquired()
+	{
+		if (eyeSwapchains == null)
+		{
+			vrLeftEyeFbo = -1;
+			vrRightEyeFbo = -1;
+			return;
+		}
+		if (vrRightEyeFbo != -1)
+		{
+			eyeSwapchains[1].releaseImage();
+			vrRightEyeFbo = -1;
+		}
+		if (vrLeftEyeFbo != -1)
+		{
+			eyeSwapchains[0].releaseImage();
+			vrLeftEyeFbo = -1;
+		}
 	}
 
 	private void drawUi(final int overlayColor, final int canvasHeight, final int canvasWidth)
