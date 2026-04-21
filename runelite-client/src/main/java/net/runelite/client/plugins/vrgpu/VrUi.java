@@ -45,6 +45,15 @@ final class VrUi
 		.add(GL_FRAGMENT_SHADER, "vrui_frag.glsl");
 	private static final int VERTEX_FLOATS = 5;
 	private static final int VERTEX_COUNT = 4;
+	private static final int POINTER_VERTEX_COUNT = 4;
+	private static final float POINTER_SIZE_M = 0.012f;
+
+	static final class PanelHit
+	{
+		float u;
+		float v;
+		float t;
+	}
 
 	private int program;
 	private int vao;
@@ -52,7 +61,16 @@ final class VrUi
 	private int uniWorldProj;
 	private int uniTex;
 	private int uniAlphaOverlay;
+	private int uniUseTexture;
+	private int uniSolidColor;
 	private final FloatBuffer vertexBuffer = BufferUtils.createFloatBuffer(VERTEX_COUNT * VERTEX_FLOATS);
+	private final FloatBuffer pointerBuffer = BufferUtils.createFloatBuffer(POINTER_VERTEX_COUNT * VERTEX_FLOATS);
+	private boolean pointerVisible;
+	private float pointerU;
+	private float pointerV;
+	private float pointerRed;
+	private float pointerGreen;
+	private float pointerBlue;
 
 	void init(Template template) throws ShaderException
 	{
@@ -60,6 +78,8 @@ final class VrUi
 		uniWorldProj = glGetUniformLocation(program, "worldProj");
 		uniTex = glGetUniformLocation(program, "tex");
 		uniAlphaOverlay = glGetUniformLocation(program, "alphaOverlay");
+		uniUseTexture = glGetUniformLocation(program, "useTexture");
+		uniSolidColor = glGetUniformLocation(program, "solidColor");
 
 		vao = glGenVertexArrays();
 		vbo = glGenBuffers();
@@ -75,6 +95,36 @@ final class VrUi
 
 		glBindVertexArray(0);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
+	}
+
+	void setPointer(boolean visible, float u, float v, boolean leftDown, boolean rightDown)
+	{
+		pointerVisible = visible;
+		if (!visible)
+		{
+			return;
+		}
+
+		pointerU = Math.max(0f, Math.min(1f, u));
+		pointerV = Math.max(0f, Math.min(1f, v));
+		if (rightDown)
+		{
+			pointerRed = 1f;
+			pointerGreen = 0.15f;
+			pointerBlue = 0.08f;
+		}
+		else if (leftDown)
+		{
+			pointerRed = 0.78f;
+			pointerGreen = 0.58f;
+			pointerBlue = 0.06f;
+		}
+		else
+		{
+			pointerRed = 0.78f;
+			pointerGreen = 0.58f;
+			pointerBlue = 0.06f;
+		}
 	}
 
 	void destroy()
@@ -126,6 +176,7 @@ final class VrUi
 		float[] worldProj = buildProjection(views.get(eye).fov(), views.get(eye).pose());
 		glUniformMatrix4fv(uniWorldProj, false, worldProj);
 		glUniform1i(uniTex, 0);
+		glUniform1i(uniUseTexture, 1);
 		glUniform4f(uniAlphaOverlay,
 			(overlayColor >> 16 & 0xFF) / 255f,
 			(overlayColor >> 8 & 0xFF) / 255f,
@@ -140,6 +191,7 @@ final class VrUi
 
 		glBindVertexArray(vao);
 		glDrawArrays(GL_TRIANGLE_FAN, 0, VERTEX_COUNT);
+		drawPointer(canvasWidth, canvasHeight);
 
 		glBindVertexArray(0);
 		glBindTexture(GL_TEXTURE_2D, 0);
@@ -147,6 +199,78 @@ final class VrUi
 		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 		glDisable(GL_BLEND);
 		glDepthMask(true);
+	}
+
+	boolean raycastPanel(
+		float originX, float originY, float originZ,
+		float dirX, float dirY, float dirZ,
+		int canvasWidth, int canvasHeight,
+		PanelHit out)
+	{
+		if (canvasWidth <= 0 || canvasHeight <= 0 || Math.abs(dirZ) < 1e-6f)
+		{
+			return false;
+		}
+
+		float t = (-PANEL_DISTANCE_M - originZ) / dirZ;
+		if (t <= 0f)
+		{
+			return false;
+		}
+
+		float aspect = canvasWidth / (float) canvasHeight;
+		float halfW = PANEL_WIDTH_M * 0.5f;
+		float halfH = (PANEL_WIDTH_M / aspect) * 0.5f;
+		float centerX = PANEL_HORIZONTAL_OFFSET_M;
+		float centerY = PANEL_VERTICAL_OFFSET_M;
+		float x = originX + dirX * t;
+		float y = originY + dirY * t;
+		float u = (x - (centerX - halfW)) / (halfW * 2f);
+		float v = ((centerY + halfH) - y) / (halfH * 2f);
+
+		if (u < 0f || u > 1f || v < 0f || v > 1f)
+		{
+			return false;
+		}
+
+		out.u = u;
+		out.v = v;
+		out.t = t;
+		return true;
+	}
+
+	private void drawPointer(int canvasWidth, int canvasHeight)
+	{
+		if (!pointerVisible || canvasWidth <= 0 || canvasHeight <= 0)
+		{
+			return;
+		}
+
+		float aspect = canvasWidth / (float) canvasHeight;
+		float halfW = PANEL_WIDTH_M * 0.5f;
+		float halfH = (PANEL_WIDTH_M / aspect) * 0.5f;
+		float centerX = PANEL_HORIZONTAL_OFFSET_M;
+		float centerY = PANEL_VERTICAL_OFFSET_M;
+		float centerZ = -PANEL_DISTANCE_M + 0.001f;
+		float x = centerX - halfW + pointerU * halfW * 2f;
+		float y = centerY + halfH - pointerV * halfH * 2f;
+		float size = POINTER_SIZE_M;
+
+		pointerBuffer.clear();
+		pointerBuffer
+			.put(x - size).put(y - size).put(centerZ).put(0f).put(0f)
+			.put(x + size).put(y + size).put(centerZ).put(0f).put(0f)
+			.put(x - size).put(y + size).put(centerZ).put(0f).put(0f)
+			.put(x + size).put(y - size).put(centerZ).put(0f).put(0f);
+		pointerBuffer.flip();
+
+		glBindBuffer(GL_ARRAY_BUFFER, vbo);
+		glBufferSubData(GL_ARRAY_BUFFER, 0, pointerBuffer);
+		glUniform1i(uniUseTexture, 0);
+		glUniform4f(uniSolidColor, pointerRed, pointerGreen, pointerBlue, 1f);
+		glLineWidth(2f);
+		glDrawArrays(GL_LINES, 0, POINTER_VERTEX_COUNT);
+		glUniform1i(uniUseTexture, 1);
 	}
 
 	private void updatePanelVertices(XrView.Buffer views, int canvasWidth, int canvasHeight)

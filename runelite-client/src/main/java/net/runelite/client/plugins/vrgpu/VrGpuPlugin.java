@@ -282,6 +282,17 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private volatile boolean vrPendingWalkMousePrimed;
 	/** Remaining ticks before staged walk dispatch. */
 	private volatile int vrPendingWalkInspectRetries;
+	private final VrUi.PanelHit vrUiHitScratch = new VrUi.PanelHit();
+	private boolean vrUiMouseInside;
+	private boolean vrUiMousePressed;
+	private int vrUiMouseButton;
+	private int vrUiMouseX;
+	private int vrUiMouseY;
+	private volatile boolean vrUiPointerVisible;
+	private volatile float vrUiPointerU;
+	private volatile float vrUiPointerV;
+	private volatile boolean vrUiPointerLmbDown;
+	private volatile boolean vrUiPointerRmbDown;
 
 	private static final class ReplayBuffers
 	{
@@ -1823,6 +1834,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					vrLeftRayHit != null, vrRightRayHit != null);
 			}
 
+			if (handleVrUiMouse(lmb, rmb))
+			{
+				prevLmb = lmb;
+				prevRmb = rmb;
+				return;
+			}
+
 			// Prefer the hand that just pressed; fall back to any valid hit.
 			float[] activeHit = null;
 			if (xrInput.getRightTrigger() >= 0.7f || xrInput.getRightSqueeze() >= 0.7f)
@@ -1908,6 +1926,137 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			}
 			prevLmb = lmb;
 			prevRmb = rmb;
+		}
+	}
+
+	private boolean handleVrUiMouse(float lmb, float rmb)
+	{
+		int canvasWidth = client.getCanvasWidth();
+		int canvasHeight = client.getCanvasHeight();
+		boolean hit = getVrUiHit(canvasWidth, canvasHeight, vrUiHitScratch);
+		if (!hit && !vrUiMousePressed)
+		{
+			vrUiPointerVisible = false;
+			if (vrUiMouseInside)
+			{
+				dispatchVrUiMouse(MouseEvent.MOUSE_EXITED, vrUiMouseX, vrUiMouseY, MouseEvent.NOBUTTON, 0, 0);
+				vrUiMouseInside = false;
+			}
+			return false;
+		}
+
+		if (hit)
+		{
+			vrUiPointerVisible = true;
+			vrUiPointerU = vrUiHitScratch.u;
+			vrUiPointerV = vrUiHitScratch.v;
+			vrUiPointerLmbDown = lmb >= 0.7f;
+			vrUiPointerRmbDown = rmb >= 0.7f;
+			vrUiMouseX = Math.max(0, Math.min(canvasWidth - 1, Math.round(vrUiHitScratch.u * (canvasWidth - 1))));
+			vrUiMouseY = Math.max(0, Math.min(canvasHeight - 1, Math.round(vrUiHitScratch.v * (canvasHeight - 1))));
+			if (!vrUiMouseInside)
+			{
+				dispatchVrUiMouse(MouseEvent.MOUSE_ENTERED, vrUiMouseX, vrUiMouseY, MouseEvent.NOBUTTON, 0, 0);
+				vrUiMouseInside = true;
+			}
+		}
+
+		boolean lmbDown = lmb >= 0.7f;
+		boolean rmbDown = rmb >= 0.7f;
+		if (!vrUiMousePressed)
+		{
+			dispatchVrUiMouse(MouseEvent.MOUSE_MOVED, vrUiMouseX, vrUiMouseY, MouseEvent.NOBUTTON, 0, 0);
+
+			boolean lmbPressed = lmbDown && prevLmb < 0.7f;
+			boolean rmbPressed = rmbDown && prevRmb < 0.7f;
+			if (lmbPressed || rmbPressed)
+			{
+				vrUiMousePressed = true;
+				vrUiMouseButton = lmbPressed ? MouseEvent.BUTTON1 : MouseEvent.BUTTON3;
+				dispatchVrUiMouse(
+					MouseEvent.MOUSE_PRESSED,
+					vrUiMouseX,
+					vrUiMouseY,
+					vrUiMouseButton,
+					mouseMask(vrUiMouseButton),
+					1);
+				log.info("VR UI mouse press: button={} canvas=({}, {})", vrUiMouseButton, vrUiMouseX, vrUiMouseY);
+			}
+			return true;
+		}
+
+		dispatchVrUiMouse(
+			MouseEvent.MOUSE_DRAGGED,
+			vrUiMouseX,
+			vrUiMouseY,
+			MouseEvent.NOBUTTON,
+			mouseMask(vrUiMouseButton),
+			0);
+
+		boolean pressedButtonDown = vrUiMouseButton == MouseEvent.BUTTON1 ? lmbDown : rmbDown;
+		if (!pressedButtonDown)
+		{
+			int button = vrUiMouseButton;
+			dispatchVrUiMouse(MouseEvent.MOUSE_RELEASED, vrUiMouseX, vrUiMouseY, button, 0, 1);
+			dispatchVrUiMouse(MouseEvent.MOUSE_CLICKED, vrUiMouseX, vrUiMouseY, button, 0, 1);
+			vrUiMousePressed = false;
+			vrUiMouseButton = MouseEvent.NOBUTTON;
+			log.info("VR UI mouse release: button={} canvas=({}, {})", button, vrUiMouseX, vrUiMouseY);
+		}
+		return true;
+	}
+
+	private boolean getVrUiHit(int canvasWidth, int canvasHeight, VrUi.PanelHit out)
+	{
+		if (xrInput == null)
+		{
+			return false;
+		}
+		if (xrInput.isRightActive() && vrUi.raycastPanel(
+			xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
+			xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ(),
+			canvasWidth, canvasHeight, out))
+		{
+			return true;
+		}
+		return xrInput.isLeftActive() && vrUi.raycastPanel(
+			xrInput.getLeftPosX(), xrInput.getLeftPosY(), xrInput.getLeftPosZ(),
+			xrInput.getLeftDirX(), xrInput.getLeftDirY(), xrInput.getLeftDirZ(),
+			canvasWidth, canvasHeight, out);
+	}
+
+	private void dispatchVrUiMouse(int id, int x, int y, int button, int modifiersEx, int clickCount)
+	{
+		Canvas targetCanvas = canvas != null ? canvas : client.getCanvas();
+		if (targetCanvas == null)
+		{
+			return;
+		}
+
+		targetCanvas.dispatchEvent(new MouseEvent(
+			targetCanvas,
+			id,
+			System.currentTimeMillis(),
+			modifiersEx,
+			x,
+			y,
+			clickCount,
+			false,
+			button));
+	}
+
+	private static int mouseMask(int button)
+	{
+		switch (button)
+		{
+			case MouseEvent.BUTTON1:
+				return MouseEvent.BUTTON1_DOWN_MASK;
+			case MouseEvent.BUTTON2:
+				return MouseEvent.BUTTON2_DOWN_MASK;
+			case MouseEvent.BUTTON3:
+				return MouseEvent.BUTTON3_DOWN_MASK;
+			default:
+				return 0;
 		}
 	}
 
@@ -3151,6 +3300,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		vrUi.setPointer(
+			vrUiPointerVisible,
+			vrUiPointerU,
+			vrUiPointerV,
+			vrUiPointerLmbDown,
+			vrUiPointerRmbDown);
 		vrUi.renderCanvasPanel(
 			vrLeftEyeFbo,
 			eyeSwapchains[0].getWidth(),
