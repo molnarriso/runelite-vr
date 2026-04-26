@@ -41,12 +41,14 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import net.runelite.api.AABB;
+import net.runelite.api.Actor;
 import net.runelite.api.DecorativeObject;
 import net.runelite.api.GroundObject;
 import net.runelite.api.ItemComposition;
@@ -88,6 +90,7 @@ import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.PostClientTick;
 import net.runelite.api.hooks.DrawCallbacks;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.callback.RenderCallback;
 import net.runelite.client.callback.RenderCallbackManager;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -232,6 +235,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private int glDebugProgram;
 	private int uniDebugWorldProj;
 	private final VrUi vrUi = new VrUi();
+	private final VrBillboardRenderer vrBillboards = new VrBillboardRenderer();
 	private int debugVboId;
 	private int debugVaoId;
 	/** Scratch buffer for per-frame debug vertices (max 16 verts × 7 floats). */
@@ -293,6 +297,73 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private volatile float vrUiPointerV;
 	private volatile boolean vrUiPointerLmbDown;
 	private volatile boolean vrUiPointerRmbDown;
+
+	// --- Vanilla actor UI capture (hitsplats, health bars, other actor 2D extras) ---
+	private static final int VR_ACTOR_UI_CAPTURE_WIDTH = 320;
+	private static final int VR_ACTOR_UI_CAPTURE_ABOVE_ANCHOR = 156;
+	private static final int VR_ACTOR_UI_CAPTURE_BELOW_ANCHOR = 36;
+	private static final int VR_ACTOR_UI_CAPTURE_HEIGHT = VR_ACTOR_UI_CAPTURE_ABOVE_ANCHOR + VR_ACTOR_UI_CAPTURE_BELOW_ANCHOR;
+	private static final int VR_ACTOR_UI_CAPTURE_KEY_COLOR = 0xffff00ff;
+	private static final float VR_ACTOR_UI_METERS_PER_PIXEL = 0.0022f;
+
+	private final RenderCallback vrActorUiCaptureCallback = new RenderCallback()
+	{
+		@Override
+		public boolean addEntity(Renderable renderable, boolean ui)
+		{
+			return captureVrActorUi(renderable, ui);
+		}
+	};
+	private final List<VrCapturedActorOverlay> vrCapturedActorOverlays = new ArrayList<>(64);
+	private VrPendingActorUiCapture vrPendingActorUiCapture;
+
+	private static final class VrPendingActorUiCapture
+	{
+		final Actor actor;
+		final Rectangle crop;
+		final int[] originalPixels;
+		final int canvasX;
+		final int canvasY;
+		final float anchorX;
+		final float anchorY;
+		final float anchorZ;
+
+		private VrPendingActorUiCapture(Actor actor, Rectangle crop, int[] originalPixels, int canvasX, int canvasY, float[] anchor)
+		{
+			this.actor = actor;
+			this.crop = crop;
+			this.originalPixels = originalPixels;
+			this.canvasX = canvasX;
+			this.canvasY = canvasY;
+			this.anchorX = anchor[0];
+			this.anchorY = anchor[1];
+			this.anchorZ = anchor[2];
+		}
+	}
+
+	private static final class VrCapturedActorOverlay
+	{
+		final int[] argbPixels;
+		final int width;
+		final int height;
+		final float anchorX;
+		final float anchorY;
+		final float anchorZ;
+		final float offsetXM;
+		final float offsetYM;
+
+		private VrCapturedActorOverlay(int[] argbPixels, int width, int height, float anchorX, float anchorY, float anchorZ, float offsetXM, float offsetYM)
+		{
+			this.argbPixels = argbPixels;
+			this.width = width;
+			this.height = height;
+			this.anchorX = anchorX;
+			this.anchorY = anchorY;
+			this.anchorZ = anchorZ;
+			this.offsetXM = offsetXM;
+			this.offsetYM = offsetYM;
+		}
+	}
 
 	private static final class ReplayBuffers
 	{
@@ -473,6 +544,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		clientUploader = new SceneUploader(renderCallbackManager);
 		mapUploader = new SceneUploader(renderCallbackManager);
 		facePrioritySorter = new FacePrioritySorter(clientUploader);
+		renderCallbackManager.register(vrActorUiCaptureCallback);
 		clientThread.invoke(() ->
 		{
 			try
@@ -648,6 +720,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	protected void shutDown()
 	{
+		renderCallbackManager.unregister(vrActorUiCaptureCallback);
 		clientThread.invoke(() ->
 		{
 			client.setGpuFlags(0);
@@ -806,6 +879,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glDebugProgram = DEBUG_PROGRAM.compile(template);
 		uniDebugWorldProj = glGetUniformLocation(glDebugProgram, "worldProj");
 		vrUi.init(template);
+		vrBillboards.init(template);
 
 		glBindVertexArray(0);
 
@@ -853,6 +927,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (debugVaoId != 0) { glDeleteVertexArrays(debugVaoId); debugVaoId = 0; }
 		if (debugVboId != 0) { glDeleteBuffers(debugVboId); debugVboId = 0; }
 		vrUi.destroy();
+		vrBillboards.destroy();
 	}
 
 	private void initVao()
@@ -3213,6 +3288,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int canvasHeight = client.getCanvasHeight();
 		final int canvasWidth = client.getCanvasWidth();
 
+		finishPendingVrActorUiCapture();
+		prepareVrActorOverlayBillboards();
 		prepareInterfaceTexture(canvasWidth, canvasHeight);
 		drawVrUi(overlayColor, canvasWidth, canvasHeight);
 
@@ -3327,7 +3404,270 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			canvasHeight,
 			overlayColor);
 
+		drawVrActorOverlays(0, vrLeftEyeFbo);
+		drawVrActorOverlays(1, vrRightEyeFbo);
+
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+	}
+
+	private void drawVrActorOverlays(int eye, int framebuffer)
+	{
+		if (!xrFrameStarted || xrContext == null || xrContext.getViews() == null || eyeSwapchains == null
+			|| framebuffer == -1 || Float.isNaN(vrWorldAnchorY))
+		{
+			return;
+		}
+
+		XrView leftView = xrContext.getViews().get(0);
+		XrView rightView = xrContext.getViews().get(1);
+		float centerEyeX = (leftView.pose().position$().x() + rightView.pose().position$().x()) * 0.5f;
+		float centerEyeY = (leftView.pose().position$().y() + rightView.pose().position$().y()) * 0.5f;
+		float centerEyeZ = (leftView.pose().position$().z() + rightView.pose().position$().z()) * 0.5f;
+
+		vrBillboards.render(
+			framebuffer,
+			eyeSwapchains[eye].getWidth(),
+			eyeSwapchains[eye].getHeight(),
+			computeVrWorldProj(eye),
+			centerEyeX,
+			centerEyeY,
+			centerEyeZ,
+			DEFAULT_WORLD_SCALE,
+			vrWorldAnchorY,
+			VR_STAGE_CHARACTER_OFFSET_Z,
+			getVrAnchorWorldX(),
+			getVrAnchorWorldY(),
+			getVrAnchorWorldZ());
+	}
+
+	private boolean captureVrActorUi(Renderable renderable, boolean ui)
+	{
+		if (!ui || !(renderable instanceof Actor))
+		{
+			return true;
+		}
+
+		Actor actor = (Actor) renderable;
+		finishPendingVrActorUiCapture();
+		if (!xrFrameStarted || xrContext == null)
+		{
+			return true;
+		}
+
+		float[] anchor = getVrActorAnchor(actor);
+		net.runelite.api.Point canvasAnchor = getVrActorUiCanvasAnchor(actor);
+		Rectangle crop = computeVrActorUiCaptureCrop(canvasAnchor);
+		if (anchor == null || canvasAnchor == null || crop == null)
+		{
+			return true;
+		}
+
+		BufferProvider bufferProvider = client.getBufferProvider();
+		int[] original = copyVrActorUiCrop(bufferProvider, crop);
+		fillVrActorUiCrop(bufferProvider, crop, VR_ACTOR_UI_CAPTURE_KEY_COLOR);
+		vrPendingActorUiCapture = new VrPendingActorUiCapture(actor, crop, original, canvasAnchor.getX(), canvasAnchor.getY(), anchor);
+		return true;
+	}
+
+	private void finishPendingVrActorUiCapture()
+	{
+		VrPendingActorUiCapture pending = vrPendingActorUiCapture;
+		if (pending == null)
+		{
+			return;
+		}
+
+		vrPendingActorUiCapture = null;
+		BufferProvider bufferProvider = client.getBufferProvider();
+		int[] captured = copyVrActorUiCrop(bufferProvider, pending.crop);
+		Rectangle bounds = findVrActorUiCapturedBounds(captured, pending.crop.width, pending.crop.height);
+		if (bounds != null)
+		{
+			int[] argb = copyVrActorUiCapturedSubRect(captured, pending.crop.width, bounds);
+			float offsetXM = (pending.crop.x + bounds.x + bounds.width * 0.5f - pending.canvasX)
+				* VR_ACTOR_UI_METERS_PER_PIXEL;
+			float offsetYM = (pending.canvasY - (pending.crop.y + bounds.y + bounds.height * 0.5f))
+				* VR_ACTOR_UI_METERS_PER_PIXEL;
+			vrCapturedActorOverlays.add(new VrCapturedActorOverlay(
+				argb,
+				bounds.width,
+				bounds.height,
+				pending.anchorX,
+				pending.anchorY,
+				pending.anchorZ,
+				offsetXM,
+				offsetYM));
+			while (vrCapturedActorOverlays.size() > 64)
+			{
+				vrCapturedActorOverlays.remove(0);
+			}
+		}
+		restoreVrActorUiCrop(bufferProvider, pending.crop, pending.originalPixels);
+	}
+
+	private void prepareVrActorOverlayBillboards()
+	{
+		vrBillboards.clear();
+		for (VrCapturedActorOverlay overlay : vrCapturedActorOverlays)
+		{
+			float widthM = overlay.width * VR_ACTOR_UI_METERS_PER_PIXEL;
+			float heightM = overlay.height * VR_ACTOR_UI_METERS_PER_PIXEL;
+			vrBillboards.addImage(
+				overlay.anchorX,
+				overlay.anchorY,
+				overlay.anchorZ,
+				widthM,
+				heightM,
+				overlay.offsetXM,
+				overlay.offsetYM,
+				overlay.argbPixels,
+				overlay.width,
+				overlay.height);
+		}
+		vrCapturedActorOverlays.clear();
+	}
+
+	private net.runelite.api.Point getVrActorUiCanvasAnchor(Actor actor)
+	{
+		LocalPoint lp = actor.getLocalLocation();
+		WorldView wv = actor.getWorldView();
+		if (lp == null || wv == null || !wv.isTopLevel())
+		{
+			return null;
+		}
+
+		return Perspective.localToCanvas(client, lp, wv.getPlane(), actor.getLogicalHeight());
+	}
+
+	private Rectangle computeVrActorUiCaptureCrop(net.runelite.api.Point point)
+	{
+		if (point == null)
+		{
+			return null;
+		}
+
+		int x = point.getX() - VR_ACTOR_UI_CAPTURE_WIDTH / 2;
+		int y = point.getY() - VR_ACTOR_UI_CAPTURE_ABOVE_ANCHOR;
+		return clampVrActorUiCrop(x, y, VR_ACTOR_UI_CAPTURE_WIDTH, VR_ACTOR_UI_CAPTURE_HEIGHT);
+	}
+
+	private Rectangle clampVrActorUiCrop(int x, int y, int width, int height)
+	{
+		BufferProvider bufferProvider = client.getBufferProvider();
+		int bufferWidth = bufferProvider.getWidth();
+		int bufferHeight = bufferProvider.getHeight();
+		int x0 = Math.max(0, x);
+		int y0 = Math.max(0, y);
+		int x1 = Math.min(bufferWidth, x + width);
+		int y1 = Math.min(bufferHeight, y + height);
+		if (x1 <= x0 || y1 <= y0)
+		{
+			return null;
+		}
+		return new Rectangle(x0, y0, x1 - x0, y1 - y0);
+	}
+
+	private int[] copyVrActorUiCrop(BufferProvider bufferProvider, Rectangle crop)
+	{
+		int[] source = bufferProvider.getPixels();
+		int sourceWidth = bufferProvider.getWidth();
+		int[] out = new int[crop.width * crop.height];
+		for (int row = 0; row < crop.height; row++)
+		{
+			System.arraycopy(source, (crop.y + row) * sourceWidth + crop.x, out, row * crop.width, crop.width);
+		}
+		return out;
+	}
+
+	private void fillVrActorUiCrop(BufferProvider bufferProvider, Rectangle crop, int color)
+	{
+		int[] pixels = bufferProvider.getPixels();
+		int width = bufferProvider.getWidth();
+		for (int row = 0; row < crop.height; row++)
+		{
+			int offset = (crop.y + row) * width + crop.x;
+			Arrays.fill(pixels, offset, offset + crop.width, color);
+		}
+	}
+
+	private void restoreVrActorUiCrop(BufferProvider bufferProvider, Rectangle crop, int[] original)
+	{
+		int[] pixels = bufferProvider.getPixels();
+		int width = bufferProvider.getWidth();
+		for (int row = 0; row < crop.height; row++)
+		{
+			System.arraycopy(original, row * crop.width, pixels, (crop.y + row) * width + crop.x, crop.width);
+		}
+	}
+
+	private Rectangle findVrActorUiCapturedBounds(int[] captured, int width, int height)
+	{
+		int minX = width;
+		int minY = height;
+		int maxX = -1;
+		int maxY = -1;
+		for (int y = 0; y < height; y++)
+		{
+			int row = y * width;
+			for (int x = 0; x < width; x++)
+			{
+				if (captured[row + x] == VR_ACTOR_UI_CAPTURE_KEY_COLOR)
+				{
+					continue;
+				}
+				if (x < minX)
+				{
+					minX = x;
+				}
+				if (x > maxX)
+				{
+					maxX = x;
+				}
+				if (y < minY)
+				{
+					minY = y;
+				}
+				if (y > maxY)
+				{
+					maxY = y;
+				}
+			}
+		}
+
+		if (maxX < minX || maxY < minY)
+		{
+			return null;
+		}
+		return new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+	}
+
+	private int[] copyVrActorUiCapturedSubRect(int[] captured, int sourceWidth, Rectangle bounds)
+	{
+		int[] out = new int[bounds.width * bounds.height];
+		for (int row = 0; row < bounds.height; row++)
+		{
+			for (int x = 0; x < bounds.width; x++)
+			{
+				int pixel = captured[(bounds.y + row) * sourceWidth + bounds.x + x];
+				out[row * bounds.width + x] = pixel == VR_ACTOR_UI_CAPTURE_KEY_COLOR ? 0 : pixel;
+			}
+		}
+		return out;
+	}
+
+	private float[] getVrActorAnchor(Actor actor)
+	{
+		LocalPoint lp = actor.getLocalLocation();
+		WorldView wv = actor.getWorldView();
+		if (lp == null || wv == null || !wv.isTopLevel())
+		{
+			return null;
+		}
+
+		int plane = wv.getPlane();
+		float tileHeight = Perspective.getTileHeight(client, lp, plane);
+		float y = tileHeight - actor.getLogicalHeight() - actor.getAnimationHeightOffset();
+		return new float[]{lp.getX(), y, lp.getY()};
 	}
 
 	private void releaseXrEyeImagesIfAcquired()
