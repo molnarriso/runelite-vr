@@ -235,6 +235,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private int glDebugProgram;
 	private int uniDebugWorldProj;
 	private final VrUi vrUi = new VrUi();
+	private final VrInteraction vrInteraction = new VrInteraction(this);
 	private final VrBillboardRenderer vrBillboards = new VrBillboardRenderer();
 	private int debugVboId;
 	private int debugVaoId;
@@ -283,14 +284,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private volatile VrHoverTarget vrHoverTarget;
 	private VrContextHintOverlay vrContextHintOverlay;
 	private long vrLastHoverProcessMs;
-	/** Pending staged walk dispatch [sceneX, sceneY, localX, localY(height), localZ]. */
-	private volatile float[] vrPendingWalkInspect;
 	/** Pending staged walk canvas point [x, y]. */
 	private volatile int[] vrPendingWalkCanvasPoint;
-	/** True once we have moved the live canvas mouse to the staged walk point. */
-	private volatile boolean vrPendingWalkMousePrimed;
-	/** Remaining ticks before staged walk dispatch. */
-	private volatile int vrPendingWalkInspectRetries;
 	private final VrUi.PanelHit vrUiHitScratch = new VrUi.PanelHit();
 	private boolean vrUiMouseInside;
 	private boolean vrUiMousePressed;
@@ -315,9 +310,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_CONTEXT_HINT_CAPTURE_WIDTH = 640;
 	private static final int VR_CONTEXT_HINT_CAPTURE_HEIGHT = 48;
 	private static final long VR_CONTEXT_HINT_STALE_MS = 500L;
-	private static final long VR_CONTEXT_HINT_HOVER_INTERVAL_MS = 50L;
+	static final long VR_CONTEXT_HINT_HOVER_INTERVAL_MS = 50L;
 	private static final float VR_CONTEXT_HINT_METERS_PER_PIXEL = 0.0017f;
-	private static final float VR_CONTEXT_HINT_WORLD_Y_OFFSET = -96f;
+	static final float VR_CONTEXT_HINT_WORLD_Y_OFFSET = -96f;
 	private static final float VR_CONTEXT_HINT_OFFSET_XM = 0.10f;
 	private static final float VR_CONTEXT_HINT_OFFSET_YM = 0.08f;
 	private static final long VR_DESKTOP_CLICK_MARKER_STALE_MS = 2000L;
@@ -3159,8 +3154,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	@Subscribe
 	public void onPostClientTick(PostClientTick event)
 	{
-		processPendingStagedWalk();
-		processVrHover();
+		vrInteraction.onPostClientTick();
 
 		// Process any pending VR controller click (ray produced on render thread).
 		float[] clickRay = vrPendingClickRay;
@@ -3170,98 +3164,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			int button = vrPendingClickButton;
 			float[] clickHit = vrPendingClickHit; // depth-buffer position for WALK fallback
 			vrPendingClickHit = null;
-
-			WorldView wvClick = client.getTopLevelWorldView();
-			if (wvClick != null)
-			{
-				float ox = clickRay[0], oy = clickRay[1], oz = clickRay[2];
-				float dx = clickRay[3], dy = clickRay[4], dz = clickRay[5];
-
-				VrGroundHit groundHit = vrIntersectGround(ox, oy, oz, dx, dy, dz, wvClick, clickHit);
-				List<VrMenuHit> hits = vrRaycastScene(ox, oy, oz, dx, dy, dz, wvClick, groundHit);
-
-				StringBuilder menuLog = new StringBuilder();
-				menuLog.append("VR ").append(button == MouseEvent.BUTTON1 ? "LMB" : "RMB")
-					.append(" menu (").append(hits.size()).append(" hits)");
-
-				if (groundHit != null)
-				{
-					menuLog.append(" ground=(").append(groundHit.sceneX).append(",").append(groundHit.sceneY)
-						.append(") t=").append(String.format("%.1f", groundHit.t))
-						.append(" local=(").append(String.format("%.1f", groundHit.x)).append(',')
-						.append(String.format("%.1f", groundHit.y)).append(',')
-						.append(String.format("%.1f", groundHit.z)).append(')');
-				}
-				menuLog.append('\n');
-
-				int entryCount = 0;
-				for (VrMenuHit hit : hits)
-				{
-					for (VrMenuEntry entry : hit.entries)
-					{
-						menuLog.append(String.format("  %2d. %s %s  [t=%.1f, %s]\n",
-							++entryCount, entry.option, entry.target, hit.t, hit.entityType));
-					}
-				}
-
-				if (groundHit != null)
-				{
-					menuLog.append(String.format("  %2d. Walk here  [scene=%d,%d, t=%.1f]\n",
-						++entryCount, groundHit.sceneX, groundHit.sceneY, groundHit.t));
-				}
-				menuLog.append(String.format("  %2d. Cancel\n", ++entryCount));
-				log.info("{}", menuLog);
-				log.info("VR click diag: rayOrigin=({},{},{}) rayDir=({},{},{}) depthHit={} groundHit={}",
-					String.format("%.1f", ox), String.format("%.1f", oy), String.format("%.1f", oz),
-					String.format("%.4f", dx), String.format("%.4f", dy), String.format("%.4f", dz),
-					clickHit == null ? "null" : String.format("(%.1f,%.1f,%.1f)", clickHit[0], clickHit[1], clickHit[2]),
-					groundHit == null ? "null" : String.format("(scene=%d,%d local=%.1f,%.1f,%.1f t=%.1f)",
-						groundHit.sceneX, groundHit.sceneY, groundHit.x, groundHit.y, groundHit.z, groundHit.t));
-
-				vrLastGroundHit = groundHit == null ? null : new float[]{groundHit.x, groundHit.y, groundHit.z};
-				updateClientWalkDiagnostics(wvClick);
-
-				VrMenuEntry defaultEntry = !hits.isEmpty() && !hits.get(0).entries.isEmpty()
-					? hits.get(0).entries.get(0)
-					: null;
-
-				if (button == MouseEvent.BUTTON1)
-				{
-					if (defaultEntry != null)
-					{
-						MenuEntry liveEntry = findMatchingLiveMenuEntry(defaultEntry);
-						int p0 = liveEntry != null ? liveEntry.getParam0() : defaultEntry.p0;
-						int p1 = liveEntry != null ? liveEntry.getParam1() : defaultEntry.p1;
-						MenuAction action = liveEntry != null ? liveEntry.getType() : defaultEntry.action;
-						int id = liveEntry != null ? liveEntry.getIdentifier() : defaultEntry.id;
-						int itemId = liveEntry != null ? liveEntry.getItemId() : defaultEntry.itemId;
-						String option = liveEntry != null ? liveEntry.getOption() : defaultEntry.option;
-						String target = liveEntry != null ? liveEntry.getTarget() : defaultEntry.target;
-
-						vrLastWalkParams = null;
-						vrLastDispatchSceneTile = action == MenuAction.WALK ? null : new int[]{p0, p1};
-						net.runelite.api.Point mousePoint = client.getMouseCanvasPosition();
-						if (mousePoint != null)
-						{
-							setVrDesktopClickMarker(mousePoint.getX(), mousePoint.getY());
-						}
-						log.info("VR LMB dispatch ({}): {} {} action={} p0={} p1={} id={} itemId={}",
-							liveEntry != null ? "matched vanilla menu entry" : "synthesized VR entry",
-							option, target, action, p0, p1, id, itemId);
-						client.menuAction(p0, p1, action, id, itemId, option, target);
-					}
-					else if (groundHit != null)
-					{
-						cancelPendingWalkInspection();
-						vrLastWalkParams = null;
-						vrLastClientSelectedSceneTile = null;
-						vrLastClientDestination = null;
-						vrLastDispatchSceneTile = new int[]{groundHit.sceneX, groundHit.sceneY};
-						aimDesktopCameraAtGroundHit(groundHit);
-						beginStagedWalkDispatch(groundHit);
-					}
-				}
-			}
+			vrInteraction.handleClick(button, clickRay, clickHit);
 		}
 
 		WorldView wv = client.getTopLevelWorldView();
@@ -3276,6 +3179,89 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			wv = we.getWorldView();
 			rebuild(wv);
 		}
+	}
+
+	Client getClient()
+	{
+		return client;
+	}
+
+	boolean hasPendingClickRay()
+	{
+		return vrPendingClickRay != null;
+	}
+
+	float[] getPendingHoverRay()
+	{
+		return vrPendingHoverRay;
+	}
+
+	long getLastHoverProcessMs()
+	{
+		return vrLastHoverProcessMs;
+	}
+
+	void setLastHoverProcessMs(long timeMs)
+	{
+		vrLastHoverProcessMs = timeMs;
+	}
+
+	void clearHoverTarget()
+	{
+		vrHoverTarget = null;
+	}
+
+	void setHoverTarget(float x, float y, float z, long timeMs)
+	{
+		vrHoverTarget = new VrHoverTarget(x, y, z, timeMs);
+	}
+
+	void setLastGroundHit(VrInteraction.GroundHit groundHit)
+	{
+		vrLastGroundHit = groundHit == null ? null : new float[]{groundHit.x, groundHit.y, groundHit.z};
+	}
+
+	void clearWalkDiagnosticsForDispatch(int sceneX, int sceneY)
+	{
+		vrLastWalkParams = null;
+		vrLastClientSelectedSceneTile = null;
+		vrLastClientDestination = null;
+		vrLastDispatchSceneTile = new int[]{sceneX, sceneY};
+	}
+
+	void setLastDesktopRayHit(float[] hit)
+	{
+		vrLastDesktopRayHit = hit;
+	}
+
+	void setPendingWalkCanvasPoint(int x, int y)
+	{
+		vrPendingWalkCanvasPoint = new int[]{x, y};
+	}
+
+	void setPendingWalkCanvasPoint(int[] point)
+	{
+		vrPendingWalkCanvasPoint = point;
+	}
+
+	void setLastWalkParams(int p0, int p1)
+	{
+		vrLastWalkParams = new int[]{p0, p1};
+	}
+
+	void clearLastWalkParams()
+	{
+		vrLastWalkParams = null;
+	}
+
+	void setLastDispatchSceneTile(int sceneX, int sceneY)
+	{
+		vrLastDispatchSceneTile = new int[]{sceneX, sceneY};
+	}
+
+	void clearLastDispatchSceneTile()
+	{
+		vrLastDispatchSceneTile = null;
 	}
 
 	private void rebuild(WorldView wv)
@@ -3373,7 +3359,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glBindTexture(GL_TEXTURE_2D, 0);
 	}
 
-	private void setVrDesktopClickMarker(int x, int y)
+	void setVrDesktopClickMarker(int x, int y)
 	{
 		int canvasWidth = client.getCanvasWidth();
 		int canvasHeight = client.getCanvasHeight();
@@ -4696,38 +4682,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	// VR ray-scene intersection (client thread)
 	// -------------------------------------------------------------------------
 
-	/** Holds one intersected entity and its available menu options. */
-	private static final class VrMenuHit
-	{
-		float t;
-		String entityType;
-		String entityName;
-		int sceneX;
-		int sceneY;
-		List<VrMenuEntry> entries = new ArrayList<>();
-	}
-
-	private static final class VrMenuEntry
-	{
-		String option;
-		String target;
-		MenuAction action;
-		int p0;
-		int p1;
-		int id;
-		int itemId = -1;
-	}
-
-	private static final class VrGroundHit
-	{
-		float t;
-		float x;
-		float y;
-		float z;
-		int sceneX;
-		int sceneY;
-	}
-
 	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
@@ -4753,39 +4707,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
-	private static final class VrRenderablePlacement
-	{
-		final Renderable renderable;
-		final int orientation;
-		final int x;
-		final int y;
-		final int z;
-
-		private VrRenderablePlacement(Renderable renderable, int orientation, int x, int y, int z)
-		{
-			this.renderable = renderable;
-			this.orientation = orientation;
-			this.x = x;
-			this.y = y;
-			this.z = z;
-		}
-	}
-
 	/**
 	 * Cast a ray through the scene, collecting all intersected entities sorted by distance.
 	 * Tests actors and tile entities against actual model geometry, plus ground tiles for Walk here.
 	 * Must be called on the client thread.
 	 */
-	private List<VrMenuHit> vrRaycastScene(float ox, float oy, float oz,
-		float dx, float dy, float dz, WorldView wv, VrGroundHit groundHit)
+	List<VrInteraction.Hit> vrRaycastScene(float ox, float oy, float oz,
+		float dx, float dy, float dz, WorldView wv, VrInteraction.GroundHit groundHit)
 	{
-		List<VrMenuHit> hits = new ArrayList<>();
+		List<VrInteraction.Hit> hits = new ArrayList<>();
 		int plane = wv.getPlane();
 
 		for (NPC npc : wv.npcs())
 		{
 			if (npc == null) continue;
-			VrMenuHit hit = buildNpcHit(ox, oy, oz, dx, dy, dz, plane, npc);
+			VrInteraction.Hit hit = buildNpcHit(ox, oy, oz, dx, dy, dz, plane, npc);
 			if (hit != null)
 			{
 				hits.add(hit);
@@ -4799,7 +4735,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				continue;
 			}
 
-			VrMenuHit hit = buildPlayerHit(ox, oy, oz, dx, dy, dz, plane, player);
+			VrInteraction.Hit hit = buildPlayerHit(ox, oy, oz, dx, dy, dz, plane, player);
 			if (hit != null)
 			{
 				hits.add(hit);
@@ -4823,12 +4759,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 						{
 							continue;
 						}
-						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+						VrInteraction.Hit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
 							"GameObject",
 							clampScene(obj.getX() >> 7, wv.getSizeX()),
 							clampScene(obj.getY() >> 7, wv.getSizeY()),
 							obj.getId(),
-							new VrRenderablePlacement(obj.getRenderable(), obj.getModelOrientation() & 2047, obj.getX(), obj.getZ(), obj.getY()));
+							new VrInteraction.RenderablePlacement(obj.getRenderable(), obj.getModelOrientation() & 2047, obj.getX(), obj.getZ(), obj.getY()));
 						if (hit != null)
 						{
 							hits.add(hit);
@@ -4838,13 +4774,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					WallObject wall = tile.getWallObject();
 					if (wall != null && wall.getId() != -1)
 					{
-						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+						VrInteraction.Hit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
 							"WallObject",
 							scX,
 							scY,
 							wall.getId(),
-							new VrRenderablePlacement(wall.getRenderable1(), 0, wall.getX(), wall.getZ(), wall.getY()),
-							new VrRenderablePlacement(wall.getRenderable2(), 0, wall.getX(), wall.getZ(), wall.getY()));
+							new VrInteraction.RenderablePlacement(wall.getRenderable1(), 0, wall.getX(), wall.getZ(), wall.getY()),
+							new VrInteraction.RenderablePlacement(wall.getRenderable2(), 0, wall.getX(), wall.getZ(), wall.getY()));
 						if (hit != null)
 						{
 							hits.add(hit);
@@ -4854,14 +4790,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					DecorativeObject deco = tile.getDecorativeObject();
 					if (deco != null && deco.getId() != -1)
 					{
-						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+						VrInteraction.Hit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
 							"DecorativeObject",
 							scX,
 							scY,
 							deco.getId(),
-							new VrRenderablePlacement(deco.getRenderable(), 0,
+							new VrInteraction.RenderablePlacement(deco.getRenderable(), 0,
 								deco.getX() + deco.getXOffset(), deco.getZ(), deco.getY() + deco.getYOffset()),
-							new VrRenderablePlacement(deco.getRenderable2(), 0,
+							new VrInteraction.RenderablePlacement(deco.getRenderable2(), 0,
 								deco.getX() + deco.getXOffset2(), deco.getZ(), deco.getY() + deco.getYOffset2()));
 						if (hit != null)
 						{
@@ -4872,12 +4808,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					GroundObject ground = tile.getGroundObject();
 					if (ground != null && ground.getId() != -1)
 					{
-						VrMenuHit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
+						VrInteraction.Hit hit = buildObjectHit(ox, oy, oz, dx, dy, dz,
 							"GroundObject",
 							scX,
 							scY,
 							ground.getId(),
-							new VrRenderablePlacement(ground.getRenderable(), 0, ground.getX(), ground.getZ(), ground.getY()));
+							new VrInteraction.RenderablePlacement(ground.getRenderable(), 0, ground.getX(), ground.getZ(), ground.getY()));
 						if (hit != null)
 						{
 							hits.add(hit);
@@ -4900,7 +4836,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 						for (TileItem item : items)
 						{
 							if (item == null) continue;
-							VrMenuHit hit = buildGroundItemHit(itemT, scX, scY, item);
+							VrInteraction.Hit hit = buildGroundItemHit(itemT, scX, scY, item);
 							if (hit != null)
 							{
 								hits.add(hit);
@@ -4915,7 +4851,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return hits;
 	}
 
-	private VrMenuHit buildNpcHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, NPC npc)
+	private VrInteraction.Hit buildNpcHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, NPC npc)
 	{
 		Model model = npc.getModel();
 		LocalPoint lp = npc.getLocalLocation();
@@ -4937,7 +4873,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			comp = npc.getComposition();
 		}
 
-		VrMenuHit hit = new VrMenuHit();
+		VrInteraction.Hit hit = new VrInteraction.Hit();
 		hit.t = t;
 		hit.entityType = "npc";
 		hit.entityName = safeName(npc.getName(), "NPC");
@@ -4951,12 +4887,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			MenuAction.NPC_FOURTH_OPTION,
 			MenuAction.NPC_FIFTH_OPTION
 		};
-		addEntries(hit, comp != null ? comp.getActions() : null, actions, npc.getIndex(), 0, 0, hit.entityName);
-		addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_NPC, 0, 0, npc.getIndex(), -1);
+		VrInteraction.addEntries(hit, comp != null ? comp.getActions() : null, actions, npc.getIndex(), 0, 0, hit.entityName);
+		VrInteraction.addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_NPC, 0, 0, npc.getIndex(), -1);
 		return hit;
 	}
 
-	private VrMenuHit buildPlayerHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, Player player)
+	private VrInteraction.Hit buildPlayerHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, Player player)
 	{
 		Model model = player.getModel();
 		LocalPoint lp = player.getLocalLocation();
@@ -4972,7 +4908,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return null;
 		}
 
-		VrMenuHit hit = new VrMenuHit();
+		VrInteraction.Hit hit = new VrInteraction.Hit();
 		hit.t = t;
 		hit.entityType = "player";
 		hit.entityName = safeName(player.getName(), "Player");
@@ -4989,12 +4925,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			MenuAction.PLAYER_SEVENTH_OPTION,
 			MenuAction.PLAYER_EIGHTH_OPTION
 		};
-		addEntries(hit, client.getPlayerOptions(), actions, player.getId(), 0, 0, hit.entityName);
+		VrInteraction.addEntries(hit, client.getPlayerOptions(), actions, player.getId(), 0, 0, hit.entityName);
 		return hit.entries.isEmpty() ? null : hit;
 	}
 
-	private VrMenuHit buildObjectHit(float ox, float oy, float oz, float dx, float dy, float dz,
-		String entityType, int sceneX, int sceneY, int objId, VrRenderablePlacement... placements)
+	private VrInteraction.Hit buildObjectHit(float ox, float oy, float oz, float dx, float dy, float dz,
+		String entityType, int sceneX, int sceneY, int objId, VrInteraction.RenderablePlacement... placements)
 	{
 		ObjectComposition def = client.getObjectDefinition(objId);
 		if (def == null)
@@ -5011,7 +4947,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		float bestT = Float.MAX_VALUE;
-		for (VrRenderablePlacement placement : placements)
+		for (VrInteraction.RenderablePlacement placement : placements)
 		{
 			if (placement == null || placement.renderable == null)
 			{
@@ -5036,7 +4972,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return null;
 		}
 
-		VrMenuHit hit = new VrMenuHit();
+		VrInteraction.Hit hit = new VrInteraction.Hit();
 		hit.t = bestT;
 		hit.entityType = entityType;
 		hit.entityName = safeName(def.getName(), "Object");
@@ -5050,12 +4986,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			MenuAction.GAME_OBJECT_FOURTH_OPTION,
 			MenuAction.GAME_OBJECT_FIFTH_OPTION
 		};
-		addEntries(hit, def.getActions(), actions, objId, sceneX, sceneY, hit.entityName);
-		addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_OBJECT, sceneX, sceneY, objId, -1);
+		VrInteraction.addEntries(hit, def.getActions(), actions, objId, sceneX, sceneY, hit.entityName);
+		VrInteraction.addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_OBJECT, sceneX, sceneY, objId, -1);
 		return hit;
 	}
 
-	private VrMenuHit buildGroundItemHit(float t, int sceneX, int sceneY, TileItem item)
+	private VrInteraction.Hit buildGroundItemHit(float t, int sceneX, int sceneY, TileItem item)
 	{
 		ItemComposition def = client.getItemDefinition(item.getId());
 		if (def == null)
@@ -5063,201 +4999,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return null;
 		}
 
-		VrMenuHit hit = new VrMenuHit();
+		VrInteraction.Hit hit = new VrInteraction.Hit();
 		hit.t = t;
 		hit.entityType = "ground-item";
 		hit.entityName = safeName(def.getName(), "Item");
 		hit.sceneX = sceneX;
 		hit.sceneY = sceneY;
 
-		addEntry(hit, "Take", hit.entityName, MenuAction.GROUND_ITEM_FIRST_OPTION, sceneX, sceneY, item.getId(), item.getId());
-		addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_ITEM_GROUND, sceneX, sceneY, item.getId(), item.getId());
+		VrInteraction.addEntry(hit, "Take", hit.entityName, MenuAction.GROUND_ITEM_FIRST_OPTION, sceneX, sceneY, item.getId(), item.getId());
+		VrInteraction.addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_ITEM_GROUND, sceneX, sceneY, item.getId(), item.getId());
 		return hit;
 	}
 
-	private static void addEntries(VrMenuHit hit, String[] options, MenuAction[] actions, int id, int p0, int p1, String target)
+	VrInteraction.GroundHit vrIntersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv, float[] fallbackHit)
 	{
-		if (options == null)
-		{
-			return;
-		}
-
-		for (int i = 0; i < options.length && i < actions.length; i++)
-		{
-			String option = options[i];
-			if (option == null || option.isEmpty() || "null".equals(option))
-			{
-				continue;
-			}
-			addEntry(hit, option, target, actions[i], p0, p1, id, -1);
-		}
-	}
-
-	private static void addEntry(VrMenuHit hit, String option, String target, MenuAction action, int p0, int p1, int id, int itemId)
-	{
-		VrMenuEntry entry = new VrMenuEntry();
-		entry.option = option;
-		entry.target = target;
-		entry.action = action;
-		entry.p0 = p0;
-		entry.p1 = p1;
-		entry.id = id;
-		entry.itemId = itemId;
-		hit.entries.add(entry);
-	}
-
-	private MenuEntry findMatchingLiveMenuEntry(VrMenuEntry vrEntry)
-	{
-		MenuEntry[] liveEntries = client.getMenuEntries();
-		if (liveEntries == null)
-		{
-			log.info("VR live menu match miss: client menu entries are null for {} {} action={} p0={} p1={} id={} itemId={}",
-				vrEntry.option, vrEntry.target, vrEntry.action, vrEntry.p0, vrEntry.p1, vrEntry.id, vrEntry.itemId);
-			return null;
-		}
-
-		MenuEntry best = null;
-		int bestScore = -1;
-		for (MenuEntry liveEntry : liveEntries)
-		{
-			if (liveEntry == null)
-			{
-				continue;
-			}
-
-			String option = liveEntry.getOption();
-			if (option == null
-				|| !option.equals(vrEntry.option)
-				|| liveEntry.getIdentifier() != vrEntry.id
-				|| liveEntry.getParam0() != vrEntry.p0
-				|| liveEntry.getParam1() != vrEntry.p1
-				|| !targetMatches(liveEntry.getTarget(), vrEntry.target))
-			{
-				continue;
-			}
-
-			int score = 20;
-			if (liveEntry.getType() == vrEntry.action)
-			{
-				score += 4;
-			}
-			if (liveEntry.getItemId() == vrEntry.itemId)
-			{
-				score += 2;
-			}
-			if (score > bestScore)
-			{
-				best = liveEntry;
-				bestScore = score;
-			}
-		}
-
-		if (best != null)
-		{
-			log.info("VR live menu matched with score={}: option={} target={} action={} p0={} p1={} id={} itemId={}",
-				bestScore, best.getOption(), best.getTarget(), best.getType(),
-				best.getParam0(), best.getParam1(), best.getIdentifier(), best.getItemId());
-			return best;
-		}
-
-		logLiveMenuMatchMiss(vrEntry, liveEntries);
-		return null;
-	}
-
-	private void logLiveMenuMatchMiss(VrMenuEntry vrEntry, MenuEntry[] liveEntries)
-	{
-		StringBuilder sb = new StringBuilder();
-		sb.append("VR live menu match miss for ")
-			.append(vrEntry.option).append(' ').append(vrEntry.target)
-			.append(" action=").append(vrEntry.action)
-			.append(" p0=").append(vrEntry.p0)
-			.append(" p1=").append(vrEntry.p1)
-			.append(" id=").append(vrEntry.id)
-			.append(" itemId=").append(vrEntry.itemId)
-			.append("; live entries=").append(liveEntries.length);
-		int logged = 0;
-		for (MenuEntry liveEntry : liveEntries)
-		{
-			if (liveEntry == null)
-			{
-				continue;
-			}
-			if (logged++ >= 8)
-			{
-				sb.append("\n  ...");
-				break;
-			}
-			sb.append("\n  ")
-				.append(liveEntry.getOption()).append(' ').append(liveEntry.getTarget())
-				.append(" action=").append(liveEntry.getType())
-				.append(" p0=").append(liveEntry.getParam0())
-				.append(" p1=").append(liveEntry.getParam1())
-				.append(" id=").append(liveEntry.getIdentifier())
-				.append(" itemId=").append(liveEntry.getItemId());
-			if (isPotentialLiveMenuCandidate(vrEntry, liveEntry))
-			{
-				sb.append(" diffs=").append(describeLiveMenuDiff(vrEntry, liveEntry));
-			}
-		}
-		log.info("{}", sb);
-	}
-
-	private static boolean isPotentialLiveMenuCandidate(VrMenuEntry vrEntry, MenuEntry liveEntry)
-	{
-		return liveEntry.getType() == vrEntry.action
-			|| liveEntry.getIdentifier() == vrEntry.id
-			|| safeEquals(liveEntry.getOption(), vrEntry.option)
-			|| targetMatches(liveEntry.getTarget(), vrEntry.target);
-	}
-
-	private static String describeLiveMenuDiff(VrMenuEntry vrEntry, MenuEntry liveEntry)
-	{
-		List<String> diffs = new ArrayList<>();
-		if (!safeEquals(liveEntry.getOption(), vrEntry.option))
-		{
-			diffs.add("option live='" + liveEntry.getOption() + "' vr='" + vrEntry.option + "'");
-		}
-		if (!safeEquals(liveEntry.getTarget(), vrEntry.target) && (liveEntry.getTarget() == null || !liveEntry.getTarget().contains(vrEntry.target)))
-		{
-			diffs.add("target live='" + liveEntry.getTarget() + "' vr='" + vrEntry.target + "'");
-		}
-		if (liveEntry.getType() != vrEntry.action)
-		{
-			diffs.add("action live=" + liveEntry.getType() + " vr=" + vrEntry.action);
-		}
-		if (liveEntry.getParam0() != vrEntry.p0)
-		{
-			diffs.add("p0 live=" + liveEntry.getParam0() + " vr=" + vrEntry.p0);
-		}
-		if (liveEntry.getParam1() != vrEntry.p1)
-		{
-			diffs.add("p1 live=" + liveEntry.getParam1() + " vr=" + vrEntry.p1);
-		}
-		if (liveEntry.getIdentifier() != vrEntry.id)
-		{
-			diffs.add("id live=" + liveEntry.getIdentifier() + " vr=" + vrEntry.id);
-		}
-		if (liveEntry.getItemId() != vrEntry.itemId)
-		{
-			diffs.add("itemId live=" + liveEntry.getItemId() + " vr=" + vrEntry.itemId);
-		}
-		return diffs.isEmpty() ? "none" : String.join(", ", diffs);
-	}
-
-	private static boolean safeEquals(String a, String b)
-	{
-		return a == null ? b == null : a.equals(b);
-	}
-
-	private static boolean targetMatches(String liveTarget, String vrTarget)
-	{
-		return safeEquals(liveTarget, vrTarget)
-			|| (liveTarget != null && vrTarget != null && liveTarget.contains(vrTarget));
-	}
-
-	private VrGroundHit vrIntersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv, float[] fallbackHit)
-	{
-		VrGroundHit best = null;
+		VrInteraction.GroundHit best = null;
 		Tile[][][] tiles = wv.getScene().getTiles();
 		int plane = wv.getPlane();
 		if (plane >= 0 && plane < tiles.length && tiles[plane] != null)
@@ -5272,7 +5028,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 						continue;
 					}
 
-					VrGroundHit hit = intersectGroundTile(ox, oy, oz, dx, dy, dz, wv, plane, sceneX, sceneY, tile);
+					VrInteraction.GroundHit hit = intersectGroundTile(ox, oy, oz, dx, dy, dz, wv, plane, sceneX, sceneY, tile);
 					if (hit != null && (best == null || hit.t < best.t))
 					{
 						best = hit;
@@ -5283,7 +5039,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		if (best == null && fallbackHit != null)
 		{
-			VrGroundHit fallback = new VrGroundHit();
+			VrInteraction.GroundHit fallback = new VrInteraction.GroundHit();
 			fallback.x = fallbackHit[0];
 			fallback.y = fallbackHit[1];
 			fallback.z = fallbackHit[2];
@@ -5295,7 +5051,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return best;
 	}
 
-	private VrGroundHit intersectGroundTile(float ox, float oy, float oz, float dx, float dy, float dz,
+	private VrInteraction.GroundHit intersectGroundTile(float ox, float oy, float oz, float dx, float dy, float dz,
 		WorldView wv, int plane, int sceneX, int sceneY, Tile tile)
 	{
 		SceneTileModel model = tile.getSceneTileModel();
@@ -5309,7 +5065,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			int[] vertexZ = model.getVertexZ();
 			if (faceX != null && faceY != null && faceZ != null && vertexX != null && vertexY != null && vertexZ != null)
 			{
-				VrGroundHit best = null;
+				VrInteraction.GroundHit best = null;
 				for (int i = 0; i < faceX.length; i++)
 				{
 					int a = faceX[i];
@@ -5365,9 +5121,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return t > 0f ? buildGroundHit(ox, oy, oz, dx, dy, dz, t, sceneX, sceneY) : null;
 	}
 
-	private static VrGroundHit buildGroundHit(float ox, float oy, float oz, float dx, float dy, float dz, float t, int sceneX, int sceneY)
+	private static VrInteraction.GroundHit buildGroundHit(float ox, float oy, float oz, float dx, float dy, float dz, float t, int sceneX, int sceneY)
 	{
-		VrGroundHit hit = new VrGroundHit();
+		VrInteraction.GroundHit hit = new VrInteraction.GroundHit();
 		hit.t = t;
 		hit.x = ox + dx * t;
 		hit.y = oy + dy * t;
@@ -5433,109 +5189,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return root.cameraZ;
 	}
 
-	private void cancelPendingWalkInspection()
-	{
-		vrPendingWalkInspect = null;
-		vrPendingWalkCanvasPoint = null;
-		vrPendingWalkMousePrimed = false;
-		vrPendingWalkInspectRetries = 0;
-	}
-
-	private void beginStagedWalkDispatch(VrGroundHit groundHit)
-	{
-		vrPendingWalkInspect = new float[]{
-			groundHit.sceneX, groundHit.sceneY,
-			groundHit.x, groundHit.y, groundHit.z
-		};
-		vrPendingWalkCanvasPoint = null;
-		vrPendingWalkMousePrimed = false;
-		vrPendingWalkInspectRetries = 1;
-		log.info("VR staged walk begin: scene=({}, {}) local=({},{},{}) delayTicks={}",
-			groundHit.sceneX, groundHit.sceneY,
-			String.format("%.1f", groundHit.x), String.format("%.1f", groundHit.y), String.format("%.1f", groundHit.z),
-			vrPendingWalkInspectRetries);
-	}
-
-	private void processVrHover()
-	{
-		if (vrPendingWalkInspect != null || vrPendingClickRay != null)
-		{
-			return;
-		}
-
-		float[] hoverRay = vrPendingHoverRay;
-		if (hoverRay == null)
-		{
-			vrHoverTarget = null;
-			return;
-		}
-
-		long now = System.currentTimeMillis();
-		if (now - vrLastHoverProcessMs < VR_CONTEXT_HINT_HOVER_INTERVAL_MS)
-		{
-			return;
-		}
-		vrLastHoverProcessMs = now;
-
-		WorldView wv = client.getTopLevelWorldView();
-		if (wv == null)
-		{
-			vrHoverTarget = null;
-			return;
-		}
-
-		float ox = hoverRay[0];
-		float oy = hoverRay[1];
-		float oz = hoverRay[2];
-		float dx = hoverRay[3];
-		float dy = hoverRay[4];
-		float dz = hoverRay[5];
-		float[] depthHit = new float[]{hoverRay[6], hoverRay[7], hoverRay[8]};
-
-		VrGroundHit groundHit = vrIntersectGround(ox, oy, oz, dx, dy, dz, wv, depthHit);
-		List<VrMenuHit> hits = vrRaycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
-		VrMenuHit hit = !hits.isEmpty() ? hits.get(0) : null;
-
-		float t;
-		int sceneX;
-		int sceneY;
-		if (hit != null)
-		{
-			t = hit.t;
-			sceneX = hit.sceneX;
-			sceneY = hit.sceneY;
-		}
-		else if (groundHit != null)
-		{
-			t = groundHit.t;
-			sceneX = groundHit.sceneX;
-			sceneY = groundHit.sceneY;
-		}
-		else
-		{
-			vrHoverTarget = null;
-			return;
-		}
-
-		float hitX = ox + dx * t;
-		float hitY = oy + dy * t;
-		float hitZ = oz + dz * t;
-		aimDesktopCameraAtLocal(hitX, hitY, hitZ, sceneX, sceneY, false);
-
-		net.runelite.api.Point canvasPoint = projectVrHoverCanvasPoint(wv, hitX, hitY, hitZ, groundHit);
-		if (canvasPoint == null)
-		{
-			vrHoverTarget = null;
-			return;
-		}
-		int canvasX = Math.max(0, Math.min(client.getCanvasWidth() - 1, canvasPoint.getX()));
-		int canvasY = Math.max(0, Math.min(client.getCanvasHeight() - 1, canvasPoint.getY()));
-		primeCanvasMouseForWalk(canvasX, canvasY);
-
-		vrHoverTarget = new VrHoverTarget(hitX, hitY + VR_CONTEXT_HINT_WORLD_Y_OFFSET, hitZ, now);
-	}
-
-	private net.runelite.api.Point projectVrHoverCanvasPoint(WorldView wv, float hitX, float hitY, float hitZ, VrGroundHit groundHit)
+	net.runelite.api.Point projectVrHoverCanvasPoint(WorldView wv, float hitX, float hitY, float hitZ, VrInteraction.GroundHit groundHit)
 	{
 		net.runelite.api.Point projected = Perspective.localToCanvas(
 			client,
@@ -5558,12 +5212,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			wv);
 	}
 
-	private void aimDesktopCameraAtGroundHit(VrGroundHit groundHit)
+	private void aimDesktopCameraAtGroundHit(VrInteraction.GroundHit groundHit)
 	{
 		aimDesktopCameraAtLocal(groundHit.x, groundHit.y, groundHit.z, groundHit.sceneX, groundHit.sceneY, true);
 	}
 
-	private void aimDesktopCameraAtLocal(float x, float y, float z, int sceneX, int sceneY, boolean verbose)
+	void aimDesktopCameraAtLocal(float x, float y, float z, int sceneX, int sceneY, boolean verbose)
 	{
 		if (verbose)
 		{
@@ -5630,7 +5284,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return angle;
 	}
 
-	private net.runelite.api.Point projectStagedWalkCanvasPoint(float[] pending, WorldView wv)
+	net.runelite.api.Point projectStagedWalkCanvasPoint(float[] pending, WorldView wv)
 	{
 		int centerX = client.getViewportXOffset() + client.getViewportWidth() / 2;
 		LocalPoint tileCenter = LocalPoint.fromScene((int) pending[0], (int) pending[1], wv);
@@ -5663,7 +5317,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return new net.runelite.api.Point(centerX, projected.getY());
 	}
 
-	private void primeCanvasMouseForWalk(int canvasX, int canvasY)
+	net.runelite.api.Point projectStagedWalkCanvasPoint(VrInteraction.Entry entry, WorldView wv)
+	{
+		return projectStagedWalkCanvasPoint(new float[]{
+			entry.sceneX, entry.sceneY,
+			entry.x, entry.y, entry.z
+		}, wv);
+	}
+
+	void primeCanvasMouseForWalk(int canvasX, int canvasY)
 	{
 		Canvas targetCanvas = canvas != null ? canvas : client.getCanvas();
 		if (targetCanvas == null)
@@ -5694,7 +5356,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			MouseEvent.NOBUTTON));
 	}
 
-	private float[] reconstructDesktopScreenRayGroundHit(int canvasX, int canvasY, WorldView wv)
+	float[] reconstructDesktopScreenRayGroundHit(int canvasX, int canvasY, WorldView wv)
 	{
 		final float viewportXMiddle = client.getViewportWidth() / 2f;
 		final float viewportYMiddle = client.getViewportHeight() / 2f;
@@ -5737,7 +5399,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		dirY /= len;
 		dirZ /= len;
 
-		VrGroundHit desktopGroundHit = vrIntersectGround(originX, originY, originZ, dirX, dirY, dirZ, wv, null);
+		VrInteraction.GroundHit desktopGroundHit = vrIntersectGround(originX, originY, originZ, dirX, dirY, dirZ, wv, null);
 		if (desktopGroundHit == null)
 		{
 			return null;
@@ -5746,79 +5408,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return new float[]{desktopGroundHit.x, desktopGroundHit.y, desktopGroundHit.z};
 	}
 
-	private void processPendingStagedWalk()
-	{
-		float[] pending = vrPendingWalkInspect;
-		if (pending == null)
-		{
-			return;
-		}
-
-		WorldView wv = client.getTopLevelWorldView();
-		if (wv == null)
-		{
-			cancelPendingWalkInspection();
-			return;
-		}
-
-		if (vrPendingWalkInspectRetries > 0)
-		{
-			int ticksRemainingAfterThis = vrPendingWalkInspectRetries - 1;
-			vrPendingWalkInspectRetries--;
-			if (ticksRemainingAfterThis > 0)
-			{
-				return;
-			}
-		}
-
-		net.runelite.api.Point canvasPoint = projectStagedWalkCanvasPoint(pending, wv);
-		if (canvasPoint == null)
-		{
-			log.info("VR staged walk: projection failed scene=({}, {}) local=({},{},{})",
-				(int) pending[0], (int) pending[1],
-				String.format("%.1f", pending[2]), String.format("%.1f", pending[3]), String.format("%.1f", pending[4]));
-			cancelPendingWalkInspection();
-			return;
-		}
-
-		net.runelite.api.Point rawProjected = Perspective.localToCanvas(
-			client,
-			wv.getId(),
-			Math.round(pending[2]),
-			Math.round(pending[4]),
-			Math.round(pending[3]));
-		float[] desktopRayHit = reconstructDesktopScreenRayGroundHit(canvasPoint.getX(), canvasPoint.getY(), wv);
-		vrLastDesktopRayHit = desktopRayHit;
-		vrPendingWalkCanvasPoint = new int[]{canvasPoint.getX(), canvasPoint.getY()};
-		vrLastWalkParams = new int[]{canvasPoint.getX(), canvasPoint.getY()};
-		net.runelite.api.Point mouseBefore = client.getMouseCanvasPosition();
-		if (!vrPendingWalkMousePrimed)
-		{
-			primeCanvasMouseForWalk(canvasPoint.getX(), canvasPoint.getY());
-			vrPendingWalkMousePrimed = true;
-			vrPendingWalkInspectRetries = 1;
-			log.info("VR staged walk mouse prime: scene=({}, {}) dispatchCanvas=({}, {}) mouseBefore={} mouseAfter={} delayTicks={}",
-				(int) pending[0], (int) pending[1],
-				canvasPoint.getX(), canvasPoint.getY(),
-				mouseBefore,
-				client.getMouseCanvasPosition(),
-				vrPendingWalkInspectRetries);
-			return;
-		}
-		log.info("VR staged walk dispatch: scene=({}, {}) rawCanvas={} dispatchCanvas=({}, {}) desktopRayHit={} local=({},{},{})",
-			(int) pending[0], (int) pending[1],
-			rawProjected,
-			canvasPoint.getX(), canvasPoint.getY(),
-			desktopRayHit == null ? "null" : String.format("(%.1f,%.1f,%.1f)", desktopRayHit[0], desktopRayHit[1], desktopRayHit[2]),
-			String.format("%.1f", pending[2]), String.format("%.1f", pending[3]), String.format("%.1f", pending[4]));
-		setVrDesktopClickMarker(canvasPoint.getX(), canvasPoint.getY());
-		client.menuAction(canvasPoint.getX(), canvasPoint.getY(), MenuAction.WALK, 0, 0, "Walk here", "");
-		updateClientWalkDiagnostics(wv);
-		logClientWalkState("after staged walk dispatch", wv);
-		cancelPendingWalkInspection();
-	}
-
-	private void updateClientWalkDiagnostics(WorldView wv)
+	void updateClientWalkDiagnostics(WorldView wv)
 	{
 		if (wv != null)
 		{
@@ -5856,7 +5446,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
-	private void logClientWalkState(String context, WorldView wv)
+	void logClientWalkState(String context, WorldView wv)
 	{
 		Tile selected = wv != null ? wv.getSelectedSceneTile() : null;
 		LocalPoint destination = client.getLocalDestinationLocation();
