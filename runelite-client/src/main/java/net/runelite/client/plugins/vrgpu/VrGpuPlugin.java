@@ -308,6 +308,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final long VR_DESKTOP_CLICK_MARKER_STALE_MS = 2000L;
 	private static final int VR_DESKTOP_CLICK_MARKER_RADIUS = 10;
 	private static final int VR_DESKTOP_CLICK_MARKER_COLOR = 0xfff5d000;
+	private static final int VR_DESKTOP_CLICK_MARKER_RMB_COLOR = 0xffff3030;
+	private static final long VR_MENU_STALE_MS = 5000L;
+	private static final float VR_MENU_METERS_PER_PIXEL = 0.0017f;
+	static final float VR_MENU_WORLD_Y_OFFSET = -96f;
+	private static final float VR_MENU_OFFSET_XM = 0f;
+	private static final float VR_MENU_OFFSET_YM = 0.10f;
+	private volatile VrMenuOverlay vrMenuOverlay;
+	private volatile float[] vrPendingMenuAnchor;
+	private final VrMenuHit vrMenuHitScratch = new VrMenuHit();
 
 	private final RenderCallback vrActorUiCaptureCallback = new RenderCallback()
 	{
@@ -321,6 +330,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private VrPendingActorUiCapture vrPendingActorUiCapture;
 	private volatile int[] vrDesktopClickMarkerPoint;
 	private volatile long vrDesktopClickMarkerMs;
+	private volatile int vrDesktopClickMarkerButton = MouseEvent.BUTTON1;
 
 	private static final class VrPendingActorUiCapture
 	{
@@ -406,6 +416,44 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			this.anchorZ = anchorZ;
 			this.timeMs = timeMs;
 		}
+	}
+
+	private static final class VrMenuOverlay
+	{
+		final int[] argbPixels;
+		final int width;
+		final int height;
+		final int canvasX;
+		final int canvasY;
+		final float anchorX;
+		final float anchorY;
+		final float anchorZ;
+		final float widthMeters;
+		final float heightMeters;
+		final long timeMs;
+
+		private VrMenuOverlay(int[] argbPixels, int width, int height, int canvasX, int canvasY,
+			float anchorX, float anchorY, float anchorZ, long timeMs)
+		{
+			this.argbPixels = argbPixels;
+			this.width = width;
+			this.height = height;
+			this.canvasX = canvasX;
+			this.canvasY = canvasY;
+			this.anchorX = anchorX;
+			this.anchorY = anchorY;
+			this.anchorZ = anchorZ;
+			this.widthMeters = width * VR_MENU_METERS_PER_PIXEL;
+			this.heightMeters = height * VR_MENU_METERS_PER_PIXEL;
+			this.timeMs = timeMs;
+		}
+	}
+
+	static final class VrMenuHit
+	{
+		float u;
+		float v;
+		float t;
 	}
 
 	private static final class ReplayBuffers
@@ -1962,6 +2010,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				return;
 			}
 
+			if (handleVrMenuMouse(lmb, rmb))
+			{
+				vrPendingHoverRay = null;
+				prevLmb = lmb;
+				prevRmb = rmb;
+				return;
+			}
+
 			// Prefer the hand that just pressed; fall back to any valid hit.
 			float[] activeHit = null;
 			if (xrInput.getRightTrigger() >= 0.7f || xrInput.getRightSqueeze() >= 0.7f)
@@ -3356,7 +3412,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glBindTexture(GL_TEXTURE_2D, 0);
 	}
 
-	void setVrDesktopClickMarker(int x, int y)
+	void setVrDesktopClickMarker(int x, int y, int button)
 	{
 		int canvasWidth = client.getCanvasWidth();
 		int canvasHeight = client.getCanvasHeight();
@@ -3368,7 +3424,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		int clampedY = Math.max(0, Math.min(canvasHeight - 1, y));
 		vrDesktopClickMarkerPoint = new int[]{clampedX, clampedY};
 		vrDesktopClickMarkerMs = System.currentTimeMillis();
-		log.info("VR desktop click marker: canvas=({}, {}) requested=({}, {})", clampedX, clampedY, x, y);
+		vrDesktopClickMarkerButton = button;
+		log.info("VR desktop click marker: canvas=({}, {}) requested=({}, {}) button={}", clampedX, clampedY, x, y, button);
 	}
 
 	private void drawVrDesktopClickMarker(int[] pixels, int width, int height)
@@ -3385,15 +3442,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		int x = marker[0];
 		int y = marker[1];
+		int color = vrDesktopClickMarkerButton == MouseEvent.BUTTON3
+			? VR_DESKTOP_CLICK_MARKER_RMB_COLOR
+			: VR_DESKTOP_CLICK_MARKER_COLOR;
 		for (int i = -VR_DESKTOP_CLICK_MARKER_RADIUS; i <= VR_DESKTOP_CLICK_MARKER_RADIUS; i++)
 		{
 			if (x + i >= 0 && x + i < width && y + i >= 0 && y + i < height)
 			{
-				pixels[(y + i) * width + x + i] = VR_DESKTOP_CLICK_MARKER_COLOR;
+				pixels[(y + i) * width + x + i] = color;
 			}
 			if (x + i >= 0 && x + i < width && y - i >= 0 && y - i < height)
 			{
-				pixels[(y - i) * width + x + i] = VR_DESKTOP_CLICK_MARKER_COLOR;
+				pixels[(y - i) * width + x + i] = color;
 			}
 		}
 	}
@@ -3456,6 +3516,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		finishPendingVrActorUiCapture();
 		prepareVrContextHintOverlay();
+		prepareVrMenuOverlay();
 		prepareVrActorOverlayBillboards();
 		prepareInterfaceTexture(canvasWidth, canvasHeight, false);
 		drawVrUi(overlayColor, canvasWidth, canvasHeight);
@@ -3707,7 +3768,76 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				hint.width,
 				hint.height);
 		}
+		VrMenuOverlay menu = vrMenuOverlay;
+		if (menu != null && System.currentTimeMillis() - menu.timeMs <= VR_MENU_STALE_MS)
+		{
+			vrBillboards.addImage(
+				menu.anchorX,
+				menu.anchorY,
+				menu.anchorZ,
+				menu.widthMeters,
+				menu.heightMeters,
+				VR_MENU_OFFSET_XM,
+				VR_MENU_OFFSET_YM,
+				menu.argbPixels,
+				menu.width,
+				menu.height);
+		}
 		vrCapturedActorOverlays.clear();
+	}
+
+	private void prepareVrMenuOverlay()
+	{
+		if (!client.isMenuOpen())
+		{
+			vrMenuOverlay = null;
+			return;
+		}
+
+		int menuX = client.getMenuX();
+		int menuY = client.getMenuY();
+		int menuW = client.getMenuWidth();
+		int menuH = client.getMenuHeight();
+		Rectangle crop = clampVrActorUiCrop(menuX, menuY, menuW, menuH);
+		if (crop == null)
+		{
+			vrMenuOverlay = null;
+			return;
+		}
+
+		int[] pixels = copyVrActorUiCrop(client.getBufferProvider(), crop);
+
+		VrMenuOverlay existing = vrMenuOverlay;
+		float ax;
+		float ay;
+		float az;
+		// Keep the anchor stable for the lifetime of one menu so the billboard does not jitter.
+		if (existing != null)
+		{
+			ax = existing.anchorX;
+			ay = existing.anchorY;
+			az = existing.anchorZ;
+		}
+		else
+		{
+			float[] pending = vrPendingMenuAnchor;
+			vrPendingMenuAnchor = null;
+			if (pending != null)
+			{
+				ax = pending[0];
+				ay = pending[1];
+				az = pending[2];
+			}
+			else
+			{
+				ax = getVrAnchorWorldX();
+				ay = getVrAnchorWorldY() + VR_MENU_WORLD_Y_OFFSET;
+				az = getVrAnchorWorldZ();
+			}
+		}
+
+		vrMenuOverlay = new VrMenuOverlay(pixels, crop.width, crop.height,
+			crop.x, crop.y, ax, ay, az, System.currentTimeMillis());
 	}
 
 	private void prepareVrContextHintOverlay()
@@ -4873,6 +5003,191 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			entry.sceneX, entry.sceneY,
 			entry.x, entry.y, entry.z
 		}, wv);
+	}
+
+	void dispatchCanvasMouseClick(int canvasX, int canvasY, int button)
+	{
+		Canvas targetCanvas = canvas != null ? canvas : client.getCanvas();
+		if (targetCanvas == null)
+		{
+			return;
+		}
+
+		long now = System.currentTimeMillis();
+		int mask = mouseMask(button);
+		boolean popupTrigger = button == MouseEvent.BUTTON3;
+
+		targetCanvas.dispatchEvent(new MouseEvent(
+			targetCanvas, MouseEvent.MOUSE_PRESSED, now, mask,
+			canvasX, canvasY, 1, popupTrigger, button));
+		targetCanvas.dispatchEvent(new MouseEvent(
+			targetCanvas, MouseEvent.MOUSE_RELEASED, now, 0,
+			canvasX, canvasY, 1, popupTrigger, button));
+		targetCanvas.dispatchEvent(new MouseEvent(
+			targetCanvas, MouseEvent.MOUSE_CLICKED, now, 0,
+			canvasX, canvasY, 1, popupTrigger, button));
+	}
+
+	void setVrPendingMenuAnchor(float x, float y, float z)
+	{
+		vrPendingMenuAnchor = new float[]{x, y, z};
+	}
+
+	private boolean handleVrMenuMouse(float lmb, float rmb)
+	{
+		VrMenuOverlay menu = vrMenuOverlay;
+		if (menu == null || xrInput == null || Float.isNaN(vrWorldAnchorY))
+		{
+			return false;
+		}
+		if (System.currentTimeMillis() - menu.timeMs > VR_MENU_STALE_MS)
+		{
+			return false;
+		}
+
+		boolean hit = false;
+		if (xrInput.isRightActive() && raycastVrMenu(menu,
+			xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
+			xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ(),
+			vrMenuHitScratch))
+		{
+			hit = true;
+		}
+		else if (xrInput.isLeftActive() && raycastVrMenu(menu,
+			xrInput.getLeftPosX(), xrInput.getLeftPosY(), xrInput.getLeftPosZ(),
+			xrInput.getLeftDirX(), xrInput.getLeftDirY(), xrInput.getLeftDirZ(),
+			vrMenuHitScratch))
+		{
+			hit = true;
+		}
+
+		if (!hit)
+		{
+			return false;
+		}
+
+		boolean lmbPressed = lmb >= 0.7f && prevLmb < 0.7f;
+		if (lmbPressed)
+		{
+			int canvasX = menu.canvasX + Math.max(0, Math.min(menu.width - 1,
+				Math.round(vrMenuHitScratch.u * (menu.width - 1))));
+			int canvasY = menu.canvasY + Math.max(0, Math.min(menu.height - 1,
+				Math.round(vrMenuHitScratch.v * (menu.height - 1))));
+			primeCanvasMouseForWalk(canvasX, canvasY);
+			dispatchCanvasMouseClick(canvasX, canvasY, MouseEvent.BUTTON1);
+			setVrDesktopClickMarker(canvasX, canvasY, MouseEvent.BUTTON1);
+			log.info("VR menu LMB dispatch: canvas=({}, {}) uv=({}, {})",
+				canvasX, canvasY,
+				String.format("%.3f", vrMenuHitScratch.u),
+				String.format("%.3f", vrMenuHitScratch.v));
+		}
+		return true;
+	}
+
+	private boolean raycastVrMenu(VrMenuOverlay menu,
+		float ox, float oy, float oz,
+		float dx, float dy, float dz,
+		VrMenuHit out)
+	{
+		final float s = DEFAULT_WORLD_SCALE;
+		final float anchorWorldX = getVrAnchorWorldX();
+		final float anchorWorldY = getVrAnchorWorldY();
+		final float anchorWorldZ = getVrAnchorWorldZ();
+
+		// Anchor in stage coords (matches VrBillboardRenderer).
+		float anchorStageX = -(menu.anchorX - anchorWorldX) * s;
+		float anchorStageY = -(menu.anchorY - anchorWorldY) * s + vrWorldAnchorY;
+		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + VR_STAGE_CHARACTER_OFFSET_Z;
+
+		// Compute eye→anchor right vector in xz plane (matches drawBillboard).
+		org.lwjgl.openxr.XrView.Buffer views = xrContext != null ? xrContext.getViews() : null;
+		float eyeX;
+		float eyeY;
+		float eyeZ;
+		if (views != null && views.capacity() >= 2)
+		{
+			XrView l = views.get(0);
+			XrView r = views.get(1);
+			eyeX = (l.pose().position$().x() + r.pose().position$().x()) * 0.5f;
+			eyeY = (l.pose().position$().y() + r.pose().position$().y()) * 0.5f;
+			eyeZ = (l.pose().position$().z() + r.pose().position$().z()) * 0.5f;
+		}
+		else
+		{
+			eyeX = ox;
+			eyeY = oy;
+			eyeZ = oz;
+		}
+
+		float fx = eyeX - anchorStageX;
+		float fy = eyeY - anchorStageY;
+		float fz = eyeZ - anchorStageZ;
+		float fl = (float) Math.sqrt(fx * fx + fy * fy + fz * fz);
+		if (fl < 1e-5f)
+		{
+			fx = 0f; fy = 0f; fz = 1f;
+		}
+		else
+		{
+			fx /= fl; fy /= fl; fz /= fl;
+		}
+
+		float rx = fz;
+		float rz = -fx;
+		float rl = (float) Math.sqrt(rx * rx + rz * rz);
+		if (rl < 1e-5f)
+		{
+			rx = 1f; rz = 0f;
+		}
+		else
+		{
+			rx /= rl; rz /= rl;
+		}
+
+		// Billboard center in stage coords (anchor + local right/up offsets in metres).
+		float cx = anchorStageX + rx * VR_MENU_OFFSET_XM;
+		float cy = anchorStageY + VR_MENU_OFFSET_YM;
+		float cz = anchorStageZ + rz * VR_MENU_OFFSET_XM;
+
+		// Plane normal = facing toward eye (use fx,fy,fz from anchor).
+		float nx = fx, ny = fy, nz = fz;
+		float denom = dx * nx + dy * ny + dz * nz;
+		if (Math.abs(denom) < 1e-6f)
+		{
+			return false;
+		}
+		float t = ((cx - ox) * nx + (cy - oy) * ny + (cz - oz) * nz) / denom;
+		if (t <= 0f)
+		{
+			return false;
+		}
+
+		float px = ox + dx * t;
+		float py = oy + dy * t;
+		float pz = oz + dz * t;
+		float lx = (px - cx) * rx + (pz - cz) * rz;       // along right
+		float ly = py - cy;                                // along up (0,1,0)
+
+		float halfW = menu.widthMeters * 0.5f;
+		float halfH = menu.heightMeters * 0.5f;
+		if (lx < -halfW || lx > halfW || ly < -halfH || ly > halfH)
+		{
+			return false;
+		}
+
+		// putQuadVertex uses xMul=-0.5 → vertex is +rx*(-widthM/2) i.e. localX is added with sign…
+		// But the renderer expands quad with xMul ∈ [-0.5, 0.5], so vertex stage_dx = rx*(offsetXM + xMul*widthM).
+		// xMul=+0.5 → +rx*widthM/2, which is the +right side. So u=0 corresponds to xMul=-0.5 (left). u increases with xMul.
+		float u = (lx + halfW) / menu.widthMeters;
+		// Same for y: yMul=+0.5 corresponds to vertex localY = +heightM/2 (i.e. top, since v=0 there per addImage).
+		// In putQuadVertex order (-0.5,-0.5)->(0,1), (0.5,-0.5)->(1,1), (0.5,0.5)->(1,0), (-0.5,0.5)->(0,0).
+		// So yMul=+0.5 → v=0 (top). ly increases with yMul (up=+y), so v=0 at top means v = 1 - (ly+halfH)/heightM.
+		float v = 1f - (ly + halfH) / menu.heightMeters;
+
+		out.u = Math.max(0f, Math.min(1f, u));
+		out.v = Math.max(0f, Math.min(1f, v));
+		out.t = t;
+		return true;
 	}
 
 	void primeCanvasMouseForWalk(int canvasX, int canvasY)

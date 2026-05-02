@@ -19,6 +19,7 @@ final class VrInteraction
 {
 	private final VrGpuPlugin plugin;
 	private Entry pendingStagedEntry;
+	private int pendingStagedButton = MouseEvent.BUTTON1;
 	private boolean pendingWalkMousePrimed;
 	private int pendingWalkDelayTicks;
 
@@ -126,6 +127,42 @@ final class VrInteraction
 				dispatch(defaultEntry);
 			}
 		}
+		else if (button == MouseEvent.BUTTON3)
+		{
+			Entry rmbEntry = defaultEntry;
+			if (rmbEntry == null && groundHit != null)
+			{
+				rmbEntry = addEntry(null, "Walk here", "", MenuAction.WALK, groundHit.sceneX, groundHit.sceneY, 0, 0);
+			}
+			if (rmbEntry != null)
+			{
+				// Hit entries carry only p0/p1; back-fill sceneX/Y and local x/y/z so
+				// camera aim and canvas projection target the actual click location.
+				if (groundHit != null)
+				{
+					copyGroundHitToEntry(rmbEntry, groundHit);
+				}
+				else if (!hits.isEmpty())
+				{
+					rmbEntry.sceneX = hits.get(0).sceneX;
+					rmbEntry.sceneY = hits.get(0).sceneY;
+				}
+				beginStagedRightClickDispatch(rmbEntry);
+			}
+		}
+	}
+
+	private void beginStagedRightClickDispatch(Entry entry)
+	{
+		cancelPendingWalkInspection();
+		plugin.aimDesktopCameraAtLocal(entry.x, entry.y, entry.z, entry.sceneX, entry.sceneY, true);
+		pendingStagedEntry = entry;
+		pendingStagedButton = MouseEvent.BUTTON3;
+		pendingWalkDelayTicks = 1;
+		log.info("VR staged RMB begin: scene=({}, {}) local=({},{},{}) delayTicks={}",
+			entry.sceneX, entry.sceneY,
+			String.format("%.1f", entry.x), String.format("%.1f", entry.y), String.format("%.1f", entry.z),
+			pendingWalkDelayTicks);
 	}
 
 	private void logMenu(int button, List<Hit> hits, GroundHit groundHit, float ox, float oy, float oz, float dx, float dy, float dz, float[] clickHit)
@@ -257,6 +294,7 @@ final class VrInteraction
 
 		// WALK dispatch p0/p1 are canvas coordinates, so fill them after the camera/mouse prime settles.
 		pendingStagedEntry = entry;
+		pendingStagedButton = MouseEvent.BUTTON1;
 		pendingWalkDelayTicks = 1;
 		log.info("VR staged walk begin: scene=({}, {}) local=({},{},{}) delayTicks={}",
 			entry.sceneX, entry.sceneY,
@@ -290,11 +328,25 @@ final class VrInteraction
 			}
 		}
 
-		net.runelite.api.Point canvasPoint = plugin.projectStagedWalkCanvasPoint(pendingEntry, wv);
+		net.runelite.api.Point canvasPoint;
+		if (pendingStagedButton == MouseEvent.BUTTON3 && pendingEntry.action != MenuAction.WALK)
+		{
+			// For RMB on an entity/object, place the cursor on the entity so the vanilla menu shows its actions.
+			canvasPoint = Perspective.localToCanvas(client, wv.getId(),
+				Math.round(pendingEntry.x), Math.round(pendingEntry.z), Math.round(pendingEntry.y));
+			if (canvasPoint == null)
+			{
+				canvasPoint = plugin.projectStagedWalkCanvasPoint(pendingEntry, wv);
+			}
+		}
+		else
+		{
+			canvasPoint = plugin.projectStagedWalkCanvasPoint(pendingEntry, wv);
+		}
 		if (canvasPoint == null)
 		{
-			log.info("VR staged walk: projection failed scene=({}, {}) local=({},{},{})",
-				pendingEntry.sceneX, pendingEntry.sceneY,
+			log.info("VR staged action: projection failed button={} scene=({}, {}) local=({},{},{})",
+				pendingStagedButton, pendingEntry.sceneX, pendingEntry.sceneY,
 				String.format("%.1f", pendingEntry.x), String.format("%.1f", pendingEntry.y), String.format("%.1f", pendingEntry.z));
 			cancelPendingWalkInspection();
 			return;
@@ -324,23 +376,33 @@ final class VrInteraction
 				pendingWalkDelayTicks);
 			return;
 		}
-		log.info("VR staged walk dispatch: scene=({}, {}) rawCanvas={} dispatchCanvas=({}, {}) desktopRayHit={} local=({},{},{})",
-			pendingEntry.sceneX, pendingEntry.sceneY,
+		log.info("VR staged dispatch: button={} scene=({}, {}) rawCanvas={} dispatchCanvas=({}, {}) desktopRayHit={} local=({},{},{})",
+			pendingStagedButton, pendingEntry.sceneX, pendingEntry.sceneY,
 			rawProjected,
 			canvasPoint.getX(), canvasPoint.getY(),
 			desktopRayHit == null ? "null" : String.format("(%.1f,%.1f,%.1f)", desktopRayHit[0], desktopRayHit[1], desktopRayHit[2]),
 			String.format("%.1f", pendingEntry.x), String.format("%.1f", pendingEntry.y), String.format("%.1f", pendingEntry.z));
-		pendingEntry.p0 = canvasPoint.getX();
-		pendingEntry.p1 = canvasPoint.getY();
-		dispatch(pendingEntry);
-		plugin.updateClientWalkDiagnostics(wv);
-		plugin.logClientWalkState("after staged walk dispatch", wv);
+		if (pendingStagedButton == MouseEvent.BUTTON3)
+		{
+			plugin.setVrPendingMenuAnchor(pendingEntry.x, pendingEntry.y + VrGpuPlugin.VR_MENU_WORLD_Y_OFFSET, pendingEntry.z);
+			plugin.dispatchCanvasMouseClick(canvasPoint.getX(), canvasPoint.getY(), MouseEvent.BUTTON3);
+			plugin.setVrDesktopClickMarker(canvasPoint.getX(), canvasPoint.getY(), MouseEvent.BUTTON3);
+		}
+		else
+		{
+			pendingEntry.p0 = canvasPoint.getX();
+			pendingEntry.p1 = canvasPoint.getY();
+			dispatch(pendingEntry);
+			plugin.updateClientWalkDiagnostics(wv);
+			plugin.logClientWalkState("after staged walk dispatch", wv);
+		}
 		cancelPendingWalkInspection();
 	}
 
 	private void cancelPendingWalkInspection()
 	{
 		pendingStagedEntry = null;
+		pendingStagedButton = MouseEvent.BUTTON1;
 		plugin.setPendingWalkCanvasPoint(null);
 		pendingWalkMousePrimed = false;
 		pendingWalkDelayTicks = 0;
@@ -416,7 +478,7 @@ final class VrInteraction
 		net.runelite.api.Point mousePoint = plugin.getClient().getMouseCanvasPosition();
 		if (mousePoint != null)
 		{
-			plugin.setVrDesktopClickMarker(mousePoint.getX(), mousePoint.getY());
+			plugin.setVrDesktopClickMarker(mousePoint.getX(), mousePoint.getY(), MouseEvent.BUTTON1);
 		}
 		log.info("VR LMB dispatch ({}): {} {} action={} p0={} p1={} id={} itemId={}",
 			liveEntry != null ? "matched vanilla menu entry" : "synthesized VR entry",
