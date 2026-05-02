@@ -100,8 +100,8 @@ final class VrInteraction
 		float ox = clickRay[0], oy = clickRay[1], oz = clickRay[2];
 		float dx = clickRay[3], dy = clickRay[4], dz = clickRay[5];
 
-		GroundHit groundHit = plugin.vrIntersectGround(ox, oy, oz, dx, dy, dz, wv, clickHit);
-		List<Hit> hits = plugin.vrRaycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
+		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv, clickHit);
+		List<Hit> hits = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
 		logMenu(button, hits, groundHit, ox, oy, oz, dx, dy, dz, clickHit);
 		plugin.setLastGroundHit(groundHit);
 		plugin.updateClientWalkDiagnostics(wv);
@@ -206,8 +206,8 @@ final class VrInteraction
 		float dz = hoverRay[5];
 		float[] depthHit = new float[]{hoverRay[6], hoverRay[7], hoverRay[8]};
 
-		GroundHit groundHit = plugin.vrIntersectGround(ox, oy, oz, dx, dy, dz, wv, depthHit);
-		List<Hit> hits = plugin.vrRaycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
+		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv, depthHit);
+		List<Hit> hits = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
 		Hit hit = !hits.isEmpty() ? hits.get(0) : null;
 
 		float t;
