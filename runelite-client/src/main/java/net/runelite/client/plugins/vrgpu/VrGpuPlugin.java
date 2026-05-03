@@ -229,8 +229,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private VrSceneRaycaster vrSceneRaycaster;
 	private int debugVboId;
 	private int debugVaoId;
-	/** Scratch buffer for per-frame debug vertices (max 16 verts × 7 floats). */
+	private static final int DEBUG_VERTEX_FLOAT_CAPACITY = 8192;
+	/** Scratch buffer for per-frame debug vertices (7 floats per vertex). */
 	private java.nio.FloatBuffer debugRayFb;
+	private int controllerTriangleFloatCount;
 	/** Scratch buffers for depth-buffer picking (single pixel read). */
 	private java.nio.FloatBuffer depthReadBuf;
 	private java.nio.IntBuffer fboReadBuf;
@@ -1613,7 +1615,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		debugVaoId = glGenVertexArrays();
 		debugVboId = glGenBuffers();
-		debugRayFb  = BufferUtils.createFloatBuffer(768); // 2 rays + tile outlines + click marker + entity tile, 7 floats/vert
+		debugRayFb  = BufferUtils.createFloatBuffer(DEBUG_VERTEX_FLOAT_CAPACITY);
 		depthReadBuf = BufferUtils.createFloatBuffer(1);
 		fboReadBuf   = BufferUtils.createIntBuffer(1);
 		desktopSorterScratchOpaque = BufferUtils.createIntBuffer(FacePrioritySorter.MAX_FACE_COUNT * (VAO.VERT_SIZE >> 2) * 3);
@@ -1621,7 +1623,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glBindVertexArray(debugVaoId);
 		glBindBuffer(GL_ARRAY_BUFFER, debugVboId);
 		// Pre-allocate GPU buffer for the max vertex count.
-		glBufferData(GL_ARRAY_BUFFER, (long) 768 * Float.BYTES, GL_STREAM_DRAW);
+		glBufferData(GL_ARRAY_BUFFER, (long) DEBUG_VERTEX_FLOAT_CAPACITY * Float.BYTES, GL_STREAM_DRAW);
 
 		// Attribute 0: vec3 position (OSRS world coords)
 		glEnableVertexAttribArray(0);
@@ -1648,10 +1650,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final float camY = getVrAnchorWorldY();
 		final float camZ = getVrAnchorWorldZ();
 		final float RAY_M = 5f;          // ray length in metres
-		final float CROSS = 17f;         // crosshair arm half-length in OSRS units (~3× smaller)
+		final float RAY_R = 0.05f;
+		final float RAY_G = 0.18f;
+		final float RAY_B = 0.55f;
 		final float TILE  = 128f;        // one tile in OSRS local units
 
 		debugRayFb.clear();
+		controllerTriangleFloatCount = 0;
 
 		// Colors: idle=hand color (left=green, right=blue), trigger=yellow (LMB), squeeze=red (RMB).
 		boolean lTrig = xrInput.getLeftTrigger()  > 0.7f, lSqz = xrInput.getLeftSqueeze()  > 0.7f;
@@ -1680,8 +1685,24 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			float[] c = controllers[ci];
 			if (c == null) continue;
 			float px = c[0], py = c[1], pz = c[2];
-			float dx = c[3], dy = c[4], dz = c[5];
 			float r = c[6], g = c[7], b = c[8];
+
+			boolean left = ci == 0;
+			controllerTriangleFloatCount += VrControllerModel.put(debugRayFb, left,
+				px, py, pz,
+				left ? xrInput.getLeftOriX() : xrInput.getRightOriX(),
+				left ? xrInput.getLeftOriY() : xrInput.getRightOriY(),
+				left ? xrInput.getLeftOriZ() : xrInput.getRightOriZ(),
+				left ? xrInput.getLeftOriW() : xrInput.getRightOriW(),
+				r, g, b, s, oy, oz, camX, camY, camZ);
+		}
+
+		for (int ci = 0; ci < controllers.length; ci++)
+		{
+			float[] c = controllers[ci];
+			if (c == null) continue;
+			float px = c[0], py = c[1], pz = c[2];
+			float dx = c[3], dy = c[4], dz = c[5];
 
 			// Convert stage-space (metres) to the same anchored OSRS world coordinates
 			// used by computeVrWorldProj() and the staged click ray path.
@@ -1702,35 +1723,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				ez = camZ + ((pz + dz * RAY_M) - oz) / s;
 			}
 
-			// Ray line: origin → endpoint
-			debugRayFb.put(ox2).put(oy2).put(oz2).put(r).put(g).put(b).put(1f);
-			debugRayFb.put(ex) .put(ey) .put(ez) .put(r).put(g).put(b).put(1f);
-
-			// Crosshair at endpoint (3 axes)
-			debugRayFb.put(ex - CROSS).put(ey).put(ez).put(r).put(g).put(b).put(1f);
-			debugRayFb.put(ex + CROSS).put(ey).put(ez).put(r).put(g).put(b).put(1f);
-			debugRayFb.put(ex).put(ey - CROSS).put(ez).put(r).put(g).put(b).put(1f);
-			debugRayFb.put(ex).put(ey + CROSS).put(ez).put(r).put(g).put(b).put(1f);
-			debugRayFb.put(ex).put(ey).put(ez - CROSS).put(r).put(g).put(b).put(1f);
-			debugRayFb.put(ex).put(ey).put(ez + CROSS).put(r).put(g).put(b).put(1f);
-
-			// Tile outline on the ground at the hit tile.
-			// Snap ex/ez to tile-grid SW corner; use ey for ground height.
-			if (hit != null)
-			{
-				float tx = (float) (((int) ex >> 7) << 7);
-				float tz = (float) (((int) ez >> 7) << 7);
-				float ty = ey;
-				// 4 segments: SW→SE, SE→NE, NE→NW, NW→SW
-				debugRayFb.put(tx       ).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx + TILE).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx + TILE).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx + TILE).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx + TILE).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx       ).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx       ).put(ty).put(tz + TILE).put(r).put(g).put(b).put(0.7f);
-				debugRayFb.put(tx       ).put(ty).put(tz       ).put(r).put(g).put(b).put(0.7f);
-			}
+			debugRayFb.put(ox2).put(oy2).put(oz2).put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
+			debugRayFb.put(ex) .put(ey) .put(ez) .put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
 		}
 
 		// Persistent click diagnostics: visible for 3 seconds.
@@ -1980,8 +1974,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glUseProgram(glDebugProgram);
 		glUniformMatrix4fv(uniDebugWorldProj, false, computeVrWorldProj(eye));
+		if (controllerTriangleFloatCount > 0)
+		{
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			glDrawArrays(GL_TRIANGLES, 0, controllerTriangleFloatCount / 7);
+			glDisable(GL_BLEND);
+		}
 		glLineWidth(3f);
-		glDrawArrays(GL_LINES, 0, n / 7);
+		glDrawArrays(GL_LINES, controllerTriangleFloatCount / 7, (n - controllerTriangleFloatCount) / 7);
 
 		glBindVertexArray(0);
 		glUseProgram(glProgram);

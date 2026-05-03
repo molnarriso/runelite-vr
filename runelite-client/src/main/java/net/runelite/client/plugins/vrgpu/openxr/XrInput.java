@@ -91,11 +91,15 @@ public class XrInput
 	@Getter private float leftPosX, leftPosY, leftPosZ;
 	/** Left controller aim direction (unit vector) in stage space. */
 	@Getter private float leftDirX, leftDirY, leftDirZ;
+	/** Left controller aim orientation quaternion in stage space. */
+	@Getter private float leftOriX, leftOriY, leftOriZ, leftOriW = 1f;
 
 	/** Right controller aim origin in stage space (metres). */
 	@Getter private float rightPosX, rightPosY, rightPosZ;
 	/** Right controller aim direction (unit vector) in stage space. */
 	@Getter private float rightDirX, rightDirY, rightDirZ;
+	/** Right controller aim orientation quaternion in stage space. */
+	@Getter private float rightOriX, rightOriY, rightOriZ, rightOriW = 1f;
 
 	// -------------------------------------------------------------------------
 	// Public API
@@ -377,11 +381,13 @@ public class XrInput
 		{
 			leftPosX = px; leftPosY = py; leftPosZ = pz;
 			leftDirX = dx; leftDirY = dy; leftDirZ = dz;
+			leftOriX = qx; leftOriY = qy; leftOriZ = qz; leftOriW = qw;
 		}
 		else
 		{
 			rightPosX = px; rightPosY = py; rightPosZ = pz;
 			rightDirX = dx; rightDirY = dy; rightDirZ = dz;
+			rightOriX = qx; rightOriY = qy; rightOriZ = qz; rightOriW = qw;
 		}
 		return true;
 	}
