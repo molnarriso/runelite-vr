@@ -65,6 +65,23 @@ final class VrControllerModel
 		return out.position() - start;
 	}
 
+	static int putEndpointCube(FloatBuffer out, float x, float y, float z, float sizeWorld, float r, float g, float b)
+	{
+		int start = out.position();
+		float h = sizeWorld * 0.5f;
+		float[][] v = {
+			{x - h, y - h, z - h}, {x + h, y - h, z - h}, {x + h, y + h, z - h}, {x - h, y + h, z - h},
+			{x - h, y - h, z + h}, {x + h, y - h, z + h}, {x + h, y + h, z + h}, {x - h, y + h, z + h},
+		};
+		addWorldFace(out, v, 0, 1, 2, 3, r * 1.20f, g * 1.20f, b * 1.20f);
+		addWorldFace(out, v, 5, 4, 7, 6, r * 0.78f, g * 0.78f, b * 0.78f);
+		addWorldFace(out, v, 3, 2, 6, 7, r * 1.05f, g * 1.05f, b * 1.05f);
+		addWorldFace(out, v, 4, 5, 1, 0, r * 0.70f, g * 0.70f, b * 0.70f);
+		addWorldFace(out, v, 1, 5, 6, 2, r * 0.92f, g * 0.92f, b * 0.92f);
+		addWorldFace(out, v, 4, 0, 3, 7, r * 0.86f, g * 0.86f, b * 0.86f);
+		return out.position() - start;
+	}
+
 	private static void addBox(
 		FloatBuffer out,
 		float px, float py, float pz,
@@ -141,6 +158,26 @@ final class VrControllerModel
 		float wy = anchorWorldY - ((py + ry) - stageOffsetY) / worldScale;
 		float wz = anchorWorldZ + ((pz + rz) - stageOffsetZ) / worldScale;
 		out.put(wx).put(wy).put(wz)
+			.put(Math.min(r, 1f)).put(Math.min(g, 1f)).put(Math.min(b, 1f)).put(ALPHA);
+	}
+
+	private static void addWorldFace(FloatBuffer out, float[][] v, int a, int b, int c, int d, float r, float g, float blue)
+	{
+		putWorldVertex(out, v[a], r, g, blue);
+		putWorldVertex(out, v[b], r, g, blue);
+		putWorldVertex(out, v[c], r, g, blue);
+		putWorldVertex(out, v[a], r, g, blue);
+		putWorldVertex(out, v[c], r, g, blue);
+		putWorldVertex(out, v[d], r, g, blue);
+	}
+
+	private static void putWorldVertex(FloatBuffer out, float[] world, float r, float g, float b)
+	{
+		if (out.remaining() < 7)
+		{
+			return;
+		}
+		out.put(world[0]).put(world[1]).put(world[2])
 			.put(Math.min(r, 1f)).put(Math.min(g, 1f)).put(Math.min(b, 1f)).put(ALPHA);
 	}
 }

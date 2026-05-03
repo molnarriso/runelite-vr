@@ -273,6 +273,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private volatile float[] vrPendingClickRay;
 	/** OSRS-space hover ray [ox,oy,oz,dx,dy,dz, hitX,hitY,hitZ] produced on render thread, consumed on client thread. */
 	private volatile float[] vrPendingHoverRay;
+	private volatile float[] vrHoverMarkerColor = new float[]{0.95f, 0.82f, 0.12f};
 	private volatile VrHoverTarget vrHoverTarget;
 	private VrContextHintOverlay vrContextHintOverlay;
 	private long vrLastHoverProcessMs;
@@ -1653,6 +1654,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final float RAY_R = 0.05f;
 		final float RAY_G = 0.18f;
 		final float RAY_B = 0.55f;
+		final float MARKER_SIZE = 0.01f / s;
 		final float TILE  = 128f;        // one tile in OSRS local units
 
 		debugRayFb.clear();
@@ -1695,6 +1697,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				left ? xrInput.getLeftOriZ() : xrInput.getRightOriZ(),
 				left ? xrInput.getLeftOriW() : xrInput.getRightOriW(),
 				r, g, b, s, oy, oz, camX, camY, camZ);
+		}
+
+		float[] markerColor = vrHoverMarkerColor;
+		for (int ci = 0; ci < controllers.length; ci++)
+		{
+			float[] hit = (ci == 0) ? leftHit : rightHit;
+			if (hit == null)
+			{
+				continue;
+			}
+			controllerTriangleFloatCount += VrControllerModel.putEndpointCube(debugRayFb,
+				hit[0], hit[1], hit[2], MARKER_SIZE,
+				markerColor[0], markerColor[1], markerColor[2]);
 		}
 
 		for (int ci = 0; ci < controllers.length; ci++)
@@ -3263,11 +3278,28 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	void clearHoverTarget()
 	{
 		vrHoverTarget = null;
+		vrHoverMarkerColor = new float[]{0.95f, 0.82f, 0.12f};
 	}
 
 	void setHoverTarget(float x, float y, float z, long timeMs)
 	{
 		vrHoverTarget = new VrHoverTarget(x, y, z, timeMs);
+	}
+
+	void setHoverMarkerAction(MenuAction action, String option)
+	{
+		if (action == MenuAction.WALK)
+		{
+			vrHoverMarkerColor = new float[]{0.16f, 0.85f, 0.20f};
+		}
+		else if (option != null && "Attack".equalsIgnoreCase(option.trim()))
+		{
+			vrHoverMarkerColor = new float[]{0.95f, 0.12f, 0.10f};
+		}
+		else
+		{
+			vrHoverMarkerColor = new float[]{0.95f, 0.82f, 0.12f};
+		}
 	}
 
 	void setLastGroundHit(VrInteraction.GroundHit groundHit)

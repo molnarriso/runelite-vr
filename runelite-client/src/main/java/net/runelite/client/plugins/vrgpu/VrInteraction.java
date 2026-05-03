@@ -246,6 +246,13 @@ final class VrInteraction
 		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv, depthHit);
 		List<Hit> hits = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
 		Hit hit = !hits.isEmpty() ? hits.get(0) : null;
+		Entry defaultEntry = hit != null && !hit.entries.isEmpty()
+			? hit.entries.get(0)
+			: null;
+		if (defaultEntry == null && groundHit != null)
+		{
+			defaultEntry = addEntry(null, "Walk here", "", MenuAction.WALK, groundHit.sceneX, groundHit.sceneY, 0, 0);
+		}
 
 		float t;
 		int sceneX;
@@ -266,6 +273,11 @@ final class VrInteraction
 		{
 			plugin.clearHoverTarget();
 			return;
+		}
+
+		if (defaultEntry != null)
+		{
+			plugin.setHoverMarkerAction(defaultEntry.action, defaultEntry.option);
 		}
 
 		float hitX = ox + dx * t;
