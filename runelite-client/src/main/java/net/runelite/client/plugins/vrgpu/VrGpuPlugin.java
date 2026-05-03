@@ -37,16 +37,24 @@ import java.awt.Rectangle;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import javax.imageio.ImageIO;
 import net.runelite.api.Actor;
 import net.runelite.api.coords.LocalPoint;
 import javax.inject.Inject;
@@ -298,10 +306,23 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_ACTOR_UI_CAPTURE_HEIGHT = VR_ACTOR_UI_CAPTURE_ABOVE_ANCHOR + VR_ACTOR_UI_CAPTURE_BELOW_ANCHOR;
 	private static final int VR_ACTOR_UI_CAPTURE_KEY_COLOR = 0xffff00ff;
 	private static final float VR_ACTOR_UI_METERS_PER_PIXEL = 0.0022f;
+	private static final int VR_ACTOR_UI_ACCEPT_MAX_WIDTH = 72;
+	private static final int VR_ACTOR_UI_ACCEPT_MAX_HEIGHT = 48;
+	private static final int VR_ACTOR_UI_ACCEPT_MAX_CENTER_DX = 48;
+	private static final int VR_ACTOR_UI_ACCEPT_MIN_CENTER_DY = -32;
+	private static final int VR_ACTOR_UI_ACCEPT_MAX_CENTER_DY = 48;
+	private static final int VR_ACTOR_UI_REJECT_MOUSE_RADIUS_X = 170;
+	private static final int VR_ACTOR_UI_REJECT_MOUSE_RADIUS_Y = 70;
+	private static final boolean VR_UI_CAPTURE_DEBUG_LOGS = false;
+	private static final long VR_UI_CAPTURE_DEBUG_INTERVAL_MS = 1000L;
+	private static final boolean VR_UI_CAPTURE_DEBUG_FILES = false;
+	private static final Path VR_UI_CAPTURE_DEBUG_DIR = Paths.get("C:\\tmp\\captures");
 	private static final int VR_CONTEXT_HINT_CAPTURE_X = 0;
 	private static final int VR_CONTEXT_HINT_CAPTURE_Y = 0;
 	private static final int VR_CONTEXT_HINT_CAPTURE_WIDTH = 640;
 	private static final int VR_CONTEXT_HINT_CAPTURE_HEIGHT = 48;
+	private static final int VR_CONTEXT_HINT_CURSOR_EXCLUDE_WIDTH = 320;
+	private static final int VR_CONTEXT_HINT_CURSOR_EXCLUDE_HEIGHT = 96;
 	private static final long VR_CONTEXT_HINT_STALE_MS = 500L;
 	static final long VR_CONTEXT_HINT_HOVER_INTERVAL_MS = 50L;
 	private static final float VR_CONTEXT_HINT_METERS_PER_PIXEL = 0.0017f;
@@ -313,10 +334,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_DESKTOP_CLICK_MARKER_COLOR = 0xfff5d000;
 	private static final int VR_DESKTOP_CLICK_MARKER_RMB_COLOR = 0xffff3030;
 	private static final long VR_MENU_STALE_MS = 5000L;
-	private static final float VR_MENU_METERS_PER_PIXEL = 0.0017f;
+	private static final float VR_MENU_METERS_PER_PIXEL = 0.00068f;
 	static final float VR_MENU_WORLD_Y_OFFSET = -96f;
 	private static final float VR_MENU_OFFSET_XM = 0f;
 	private static final float VR_MENU_OFFSET_YM = 0.10f;
+	private static final float VR_MENU_CONTEXT_HINT_GAP_M = 0.035f;
+	private static final float VR_HOVER_TARGET_SMOOTHING = 0.35f;
 	private volatile VrMenuOverlay vrMenuOverlay;
 	private volatile float[] vrPendingMenuAnchor;
 	private final VrMenuHit vrMenuHitScratch = new VrMenuHit();
@@ -326,6 +349,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		@Override
 		public boolean addEntity(Renderable renderable, boolean ui)
 		{
+			logVrUiCaptureRenderable(renderable, ui);
 			return captureVrActorUi(renderable, ui);
 		}
 	};
@@ -334,6 +358,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private volatile int[] vrDesktopClickMarkerPoint;
 	private volatile long vrDesktopClickMarkerMs;
 	private volatile int vrDesktopClickMarkerButton = MouseEvent.BUTTON1;
+	private long vrLastUiCaptureDebugLogMs;
+	private long vrUiCaptureDebugFrame;
+	private int vrUiCaptureDebugImageIndex;
+	private final Map<Long, String> vrUiCaptureDebugImages = new HashMap<>();
 
 	private static final class VrPendingActorUiCapture
 	{
@@ -3283,6 +3311,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	void setHoverTarget(float x, float y, float z, long timeMs)
 	{
+		VrHoverTarget previous = vrHoverTarget;
+		if (previous != null && timeMs - previous.timeMs <= VR_CONTEXT_HINT_STALE_MS)
+		{
+			float a = VR_HOVER_TARGET_SMOOTHING;
+			x = previous.anchorX + (x - previous.anchorX) * a;
+			y = previous.anchorY + (y - previous.anchorY) * a;
+			z = previous.anchorZ + (z - previous.anchorZ) * a;
+		}
 		vrHoverTarget = new VrHoverTarget(x, y, z, timeMs);
 	}
 
@@ -3547,6 +3583,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int canvasHeight = client.getCanvasHeight();
 		final int canvasWidth = client.getCanvasWidth();
 
+		logVrUiCaptureFrameDelimiter();
 		finishPendingVrActorUiCapture();
 		prepareVrContextHintOverlay();
 		prepareVrMenuOverlay();
@@ -3726,9 +3763,257 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		BufferProvider bufferProvider = client.getBufferProvider();
 		int[] original = copyVrActorUiCrop(bufferProvider, crop);
+		writeVrUiCaptureDebugImage("actor-" + actor.getName() + "-before", original, crop.width, crop.height);
 		fillVrActorUiCrop(bufferProvider, crop, VR_ACTOR_UI_CAPTURE_KEY_COLOR);
 		vrPendingActorUiCapture = new VrPendingActorUiCapture(actor, crop, original, canvasAnchor.getX(), canvasAnchor.getY(), anchor);
+		logVrActorUiCapture("armed", actor, canvasAnchor, crop, anchor);
 		return true;
+	}
+
+	private void logVrUiCaptureRenderable(Renderable renderable, boolean ui)
+	{
+		if (!VR_UI_CAPTURE_DEBUG_LOGS)
+		{
+			return;
+		}
+
+		if (renderable instanceof Actor)
+		{
+			Actor actor = (Actor) renderable;
+			LocalPoint lp = actor.getLocalLocation();
+			logVrUiCaptureDebugLine("VR UI frame " + vrUiCaptureDebugFrame
+				+ " addEntity: ui=" + ui
+				+ " ap=" + readVrRenderablePrivateString(renderable, "ap")
+				+ " class=" + renderable.getClass().getName()
+				+ " interfaces=" + describeVrRenderableInterfaces(renderable)
+				+ " actorName='" + actor.getName() + "'"
+				+ " local=" + (lp == null ? "null" : "(" + lp.getX() + "," + lp.getY() + ")")
+				+ " worldView=" + (actor.getWorldView() == null ? "null" : actor.getWorldView().getId())
+				+ " health=" + actor.getHealthRatio()
+				+ " interacting=" + (actor.getInteracting() == null ? "null" : actor.getInteracting().getName()));
+			/*log.info("VR UI frame {} addEntity: ui={} class={} interfaces={} actorName='{}' local={} worldView={} health={} interacting={}",
+				vrUiCaptureDebugFrame,
+				ui,
+				renderable.getClass().getName(),
+				describeVrRenderableInterfaces(renderable),
+				actor.getName(),
+				lp == null ? "null" : "(" + lp.getX() + "," + lp.getY() + ")",
+				actor.getWorldView() == null ? "null" : actor.getWorldView().getId(),
+				actor.getHealthRatio(),
+				actor.getInteracting() == null ? "null" : actor.getInteracting().getName());*/
+		}
+		else
+		{
+			logVrUiCaptureDebugLine("VR UI frame " + vrUiCaptureDebugFrame
+				+ " addEntity: ui=" + ui
+				+ " ap=" + readVrRenderablePrivateString(renderable, "ap")
+				+ " class=" + (renderable == null ? "null" : renderable.getClass().getName())
+				+ " interfaces=" + describeVrRenderableInterfaces(renderable));
+		}
+	}
+
+	private static String readVrRenderablePrivateString(Renderable renderable, String fieldName)
+	{
+		if (renderable == null)
+		{
+			return "null";
+		}
+
+		Class<?> type = renderable.getClass();
+		while (type != null)
+		{
+			try
+			{
+				Field field = type.getDeclaredField(fieldName);
+				field.setAccessible(true);
+				Object value = field.get(renderable);
+				return value instanceof String ? "'" + value + "'" : String.valueOf(value);
+			}
+			catch (NoSuchFieldException ex)
+			{
+				type = type.getSuperclass();
+			}
+			catch (ReflectiveOperationException | RuntimeException ex)
+			{
+				return "unreadable:" + ex.getClass().getSimpleName();
+			}
+		}
+		return "missing";
+	}
+
+	private static String describeVrRenderableInterfaces(Renderable renderable)
+	{
+		if (renderable == null)
+		{
+			return "[]";
+		}
+
+		Set<String> names = new LinkedHashSet<>();
+		Class<?> type = renderable.getClass();
+		while (type != null)
+		{
+			collectVrInterfaceNames(type, names);
+			type = type.getSuperclass();
+		}
+		return names.toString();
+	}
+
+	private static void collectVrInterfaceNames(Class<?> type, Set<String> names)
+	{
+		for (Class<?> iface : type.getInterfaces())
+		{
+			names.add(iface.getName());
+			collectVrInterfaceNames(iface, names);
+		}
+	}
+
+	private void logVrUiCaptureFrameDelimiter()
+	{
+		if (!VR_UI_CAPTURE_DEBUG_LOGS)
+		{
+			return;
+		}
+
+		long now = System.currentTimeMillis();
+		if (VR_UI_CAPTURE_DEBUG_INTERVAL_MS > 0L && now - vrLastUiCaptureDebugLogMs < VR_UI_CAPTURE_DEBUG_INTERVAL_MS)
+		{
+			return;
+		}
+
+		vrLastUiCaptureDebugLogMs = now;
+		vrUiCaptureDebugFrame++;
+		vrUiCaptureDebugImageIndex = 0;
+		logVrUiCaptureDebugLine("========== VR UI capture frame " + vrUiCaptureDebugFrame
+			+ " gameCycle=" + client.getGameCycle()
+			+ " menuOpen=" + client.isMenuOpen()
+			+ " mouse=" + client.getMouseCanvasPosition()
+			+ " ==========");
+	}
+
+	private void logVrActorUiCapture(String stage, Actor actor, net.runelite.api.Point canvasAnchor, Rectangle crop, float[] anchor)
+	{
+		if (!VR_UI_CAPTURE_DEBUG_LOGS)
+		{
+			return;
+		}
+
+		logVrUiCaptureDebugLine("VR actor UI capture " + stage
+			+ ": actor='" + actor.getName() + "'"
+			+ " type=" + actor.getClass().getName()
+			+ " canvasAnchor=" + canvasAnchor
+			+ " crop=" + crop
+			+ " vrAnchor=" + (anchor == null ? "null" : String.format("(%.1f,%.1f,%.1f)", anchor[0], anchor[1], anchor[2])));
+	}
+
+	private void logVrUiCaptureDebugLine(String line)
+	{
+		log.info("{}", line);
+		if (!VR_UI_CAPTURE_DEBUG_FILES)
+		{
+			return;
+		}
+
+		try
+		{
+			Path dir = getVrUiCaptureDebugFrameDir();
+			Files.createDirectories(dir);
+			Files.write(dir.resolve("log.txt"),
+				(line + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+				java.nio.file.StandardOpenOption.CREATE,
+				java.nio.file.StandardOpenOption.APPEND);
+		}
+		catch (IOException ex)
+		{
+			log.debug("Unable to write VR UI capture debug log", ex);
+		}
+	}
+
+	private Path getVrUiCaptureDebugFrameDir()
+	{
+		return VR_UI_CAPTURE_DEBUG_DIR.resolve(String.format("frame-%06d", vrUiCaptureDebugFrame));
+	}
+
+	private void writeVrUiCaptureDebugImage(String label, int[] argb, int width, int height)
+	{
+		if (!VR_UI_CAPTURE_DEBUG_LOGS || !VR_UI_CAPTURE_DEBUG_FILES || argb == null || width <= 0 || height <= 0)
+		{
+			return;
+		}
+
+		try
+		{
+			long fingerprint = fingerprintVrUiCaptureImage(argb, width, height);
+			String existing = vrUiCaptureDebugImages.get(fingerprint);
+			if (existing != null)
+			{
+				logVrUiCaptureDebugLine("VR UI capture image duplicate: " + existing + " " + width + "x" + height + " label=" + label);
+				return;
+			}
+
+			Path dir = VR_UI_CAPTURE_DEBUG_DIR.resolve("unique");
+			Files.createDirectories(dir);
+			String filename = String.format("%04d-%016x-%s.png",
+				++vrUiCaptureDebugImageIndex,
+				fingerprint,
+				sanitizeVrUiCaptureFilename(label));
+			writePng(dir.resolve(filename), argb, width, height);
+			vrUiCaptureDebugImages.put(fingerprint, "unique/" + filename);
+			logVrUiCaptureDebugLine("VR UI capture image unique: unique/" + filename + " " + width + "x" + height + " label=" + label);
+		}
+		catch (IOException ex)
+		{
+			log.debug("Unable to write VR UI capture debug image", ex);
+		}
+	}
+
+	private static long fingerprintVrUiCaptureImage(int[] argb, int width, int height)
+	{
+		long hash = 0xcbf29ce484222325L;
+		hash ^= width;
+		hash *= 0x100000001b3L;
+		hash ^= height;
+		hash *= 0x100000001b3L;
+		int limit = Math.min(argb.length, width * height);
+		for (int i = 0; i < limit; i++)
+		{
+			hash ^= argb[i];
+			hash *= 0x100000001b3L;
+		}
+		return hash;
+	}
+
+	private static String sanitizeVrUiCaptureFilename(String label)
+	{
+		if (label == null || label.isEmpty())
+		{
+			return "capture";
+		}
+		StringBuilder sb = new StringBuilder(label.length());
+		for (int i = 0; i < label.length(); i++)
+		{
+			char ch = label.charAt(i);
+			if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')
+			{
+				sb.append(ch);
+			}
+			else
+			{
+				sb.append('_');
+			}
+		}
+		return sb.toString();
+	}
+
+	private static void writePng(Path path, int[] argb, int width, int height) throws IOException
+	{
+		BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+		int[] data = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
+		int limit = Math.min(argb.length, width * height);
+		System.arraycopy(argb, 0, data, 0, limit);
+		if (!ImageIO.write(image, "png", path.toFile()))
+		{
+			throw new IOException("No PNG writer available");
+		}
 	}
 
 	private void finishPendingVrActorUiCapture()
@@ -3742,29 +4027,102 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vrPendingActorUiCapture = null;
 		BufferProvider bufferProvider = client.getBufferProvider();
 		int[] captured = copyVrActorUiCrop(bufferProvider, pending.crop);
+		writeVrUiCaptureDebugImage("actor-" + pending.actor.getName() + "-after", captured, pending.crop.width, pending.crop.height);
 		Rectangle bounds = findVrActorUiCapturedBounds(captured, pending.crop.width, pending.crop.height);
 		if (bounds != null)
 		{
-			int[] argb = copyVrActorUiCapturedSubRect(captured, pending.crop.width, bounds);
-			float offsetXM = (pending.crop.x + bounds.x + bounds.width * 0.5f - pending.canvasX)
-				* VR_ACTOR_UI_METERS_PER_PIXEL;
-			float offsetYM = (pending.canvasY - (pending.crop.y + bounds.y + bounds.height * 0.5f))
-				* VR_ACTOR_UI_METERS_PER_PIXEL;
-			vrCapturedActorOverlays.add(new VrCapturedActorOverlay(
-				argb,
-				bounds.width,
-				bounds.height,
-				pending.anchorX,
-				pending.anchorY,
-				pending.anchorZ,
-				offsetXM,
-				offsetYM));
-			while (vrCapturedActorOverlays.size() > 64)
+			String rejectReason = getVrActorUiCaptureRejectReason(pending, bounds);
+			if (rejectReason != null)
 			{
-				vrCapturedActorOverlays.remove(0);
+				if (VR_UI_CAPTURE_DEBUG_LOGS)
+				{
+					logVrActorUiCapture("rejected bounds=" + bounds + " reason=" + rejectReason, pending.actor,
+						new net.runelite.api.Point(pending.canvasX, pending.canvasY),
+						pending.crop,
+						new float[]{pending.anchorX, pending.anchorY, pending.anchorZ});
+				}
+			}
+			else
+			{
+				if (VR_UI_CAPTURE_DEBUG_LOGS)
+				{
+					logVrActorUiCapture("accepted bounds=" + bounds + " signals=" + describeVrActorUiCaptureSignals(pending, bounds), pending.actor,
+						new net.runelite.api.Point(pending.canvasX, pending.canvasY),
+						pending.crop,
+						new float[]{pending.anchorX, pending.anchorY, pending.anchorZ});
+				}
+				int[] argb = copyVrActorUiCapturedSubRect(captured, pending.crop.width, bounds);
+				writeVrUiCaptureDebugImage("actor-" + pending.actor.getName() + "-diff", argb, bounds.width, bounds.height);
+				float offsetXM = (pending.crop.x + bounds.x + bounds.width * 0.5f - pending.canvasX)
+					* VR_ACTOR_UI_METERS_PER_PIXEL;
+				float offsetYM = (pending.canvasY - (pending.crop.y + bounds.y + bounds.height * 0.5f))
+					* VR_ACTOR_UI_METERS_PER_PIXEL;
+				vrCapturedActorOverlays.add(new VrCapturedActorOverlay(
+					argb,
+					bounds.width,
+					bounds.height,
+					pending.anchorX,
+					pending.anchorY,
+					pending.anchorZ,
+					offsetXM,
+					offsetYM));
+				while (vrCapturedActorOverlays.size() > 64)
+				{
+					vrCapturedActorOverlays.remove(0);
+				}
 			}
 		}
 		restoreVrActorUiCrop(bufferProvider, pending.crop, pending.originalPixels);
+	}
+
+	private String getVrActorUiCaptureRejectReason(VrPendingActorUiCapture pending, Rectangle bounds)
+	{
+		float centerX = pending.crop.x + bounds.x + bounds.width * 0.5f;
+		float centerY = pending.crop.y + bounds.y + bounds.height * 0.5f;
+		float dx = centerX - pending.canvasX;
+		float dy = centerY - pending.canvasY;
+		if (bounds.width > VR_ACTOR_UI_ACCEPT_MAX_WIDTH || bounds.height > VR_ACTOR_UI_ACCEPT_MAX_HEIGHT)
+		{
+			return "size " + describeVrActorUiCaptureMetrics(pending, bounds);
+		}
+		if (Math.abs(dx) > VR_ACTOR_UI_ACCEPT_MAX_CENTER_DX)
+		{
+			return "off-center " + describeVrActorUiCaptureMetrics(pending, bounds);
+		}
+		if (dy < VR_ACTOR_UI_ACCEPT_MIN_CENTER_DY || dy > VR_ACTOR_UI_ACCEPT_MAX_CENTER_DY)
+		{
+			return "vertical-offset " + describeVrActorUiCaptureMetrics(pending, bounds);
+		}
+
+		return null;
+	}
+
+	private String describeVrActorUiCaptureSignals(VrPendingActorUiCapture pending, Rectangle bounds)
+	{
+		String metrics = describeVrActorUiCaptureMetrics(pending, bounds);
+		float centerX = pending.crop.x + bounds.x + bounds.width * 0.5f;
+		float centerY = pending.crop.y + bounds.y + bounds.height * 0.5f;
+		net.runelite.api.Point mouse = client.getMouseCanvasPosition();
+		if (mouse != null
+			&& Math.abs(centerX - mouse.getX()) <= VR_ACTOR_UI_REJECT_MOUSE_RADIUS_X
+			&& Math.abs(centerY - mouse.getY()) <= VR_ACTOR_UI_REJECT_MOUSE_RADIUS_Y)
+		{
+			return metrics
+				+ " nearMouse=true"
+				+ " mouse=(" + mouse.getX() + "," + mouse.getY() + ")";
+		}
+		return metrics + " nearMouse=false";
+	}
+
+	private static String describeVrActorUiCaptureMetrics(VrPendingActorUiCapture pending, Rectangle bounds)
+	{
+		float centerX = pending.crop.x + bounds.x + bounds.width * 0.5f;
+		float centerY = pending.crop.y + bounds.y + bounds.height * 0.5f;
+		return String.format("size=%dx%d centerDelta=(%.1f,%.1f)",
+			bounds.width,
+			bounds.height,
+			centerX - pending.canvasX,
+			centerY - pending.canvasY);
 	}
 
 	private void prepareVrActorOverlayBillboards()
@@ -3811,12 +4169,31 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				menu.widthMeters,
 				menu.heightMeters,
 				VR_MENU_OFFSET_XM,
-				VR_MENU_OFFSET_YM,
+				getVrMenuOffsetYM(menu),
 				menu.argbPixels,
 				menu.width,
 				menu.height);
 		}
 		vrCapturedActorOverlays.clear();
+	}
+
+	private float getVrMenuOffsetYM(VrMenuOverlay menu)
+	{
+		VrContextHintOverlay hint = vrContextHintOverlay;
+		if (hint == null || System.currentTimeMillis() - hint.timeMs > VR_CONTEXT_HINT_STALE_MS)
+		{
+			return VR_MENU_OFFSET_YM;
+		}
+		float dx = hint.anchorX - menu.anchorX;
+		float dy = hint.anchorY - menu.anchorY;
+		float dz = hint.anchorZ - menu.anchorZ;
+		if (dx * dx + dy * dy + dz * dz > 64f * 64f)
+		{
+			return VR_MENU_OFFSET_YM;
+		}
+		float hintHalfHeightM = hint.height * VR_CONTEXT_HINT_METERS_PER_PIXEL * 0.5f;
+		float menuHalfHeightM = menu.heightMeters * 0.5f;
+		return VR_CONTEXT_HINT_OFFSET_YM + hintHalfHeightM + VR_MENU_CONTEXT_HINT_GAP_M + menuHalfHeightM;
 	}
 
 	private void prepareVrMenuOverlay()
@@ -3841,11 +4218,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		int[] pixels = copyVrActorUiCrop(client.getBufferProvider(), crop);
 
 		VrMenuOverlay existing = vrMenuOverlay;
+		float[] pending = vrPendingMenuAnchor;
+		vrPendingMenuAnchor = null;
 		float ax;
 		float ay;
 		float az;
 		// Keep the anchor stable for the lifetime of one menu so the billboard does not jitter.
-		if (existing != null)
+		if (pending != null)
+		{
+			ax = pending[0];
+			ay = pending[1];
+			az = pending[2];
+		}
+		else if (existing != null)
 		{
 			ax = existing.anchorX;
 			ay = existing.anchorY;
@@ -3853,20 +4238,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		else
 		{
-			float[] pending = vrPendingMenuAnchor;
-			vrPendingMenuAnchor = null;
-			if (pending != null)
-			{
-				ax = pending[0];
-				ay = pending[1];
-				az = pending[2];
-			}
-			else
-			{
-				ax = getVrAnchorWorldX();
-				ay = getVrAnchorWorldY() + VR_MENU_WORLD_Y_OFFSET;
-				az = getVrAnchorWorldZ();
-			}
+			ax = getVrAnchorWorldX();
+			ay = getVrAnchorWorldY() + VR_MENU_WORLD_Y_OFFSET;
+			az = getVrAnchorWorldZ();
 		}
 
 		vrMenuOverlay = new VrMenuOverlay(pixels, crop.width, crop.height,
@@ -3895,6 +4269,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		int[] captured = copyVrActorUiCrop(client.getBufferProvider(), crop);
+		writeVrUiCaptureDebugImage("context-hint-raw", captured, crop.width, crop.height);
+		clearVrContextHintCursorRegion(captured, crop);
+		writeVrUiCaptureDebugImage("context-hint-masked", captured, crop.width, crop.height);
 		Rectangle bounds = findVrContextHintBounds(captured, crop.width, crop.height);
 		if (bounds == null)
 		{
@@ -3903,6 +4280,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		int[] argb = copyVrContextHintSubRect(captured, crop.width, bounds);
+		writeVrUiCaptureDebugImage("context-hint-diff", argb, bounds.width, bounds.height);
 		vrContextHintOverlay = new VrContextHintOverlay(
 			argb,
 			bounds.width,
@@ -3911,6 +4289,31 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			target.anchorY,
 			target.anchorZ,
 			now);
+	}
+
+	private void clearVrContextHintCursorRegion(int[] captured, Rectangle crop)
+	{
+		net.runelite.api.Point mouse = client.getMouseCanvasPosition();
+		if (mouse == null)
+		{
+			return;
+		}
+
+		int localX = mouse.getX() - crop.x;
+		int localY = mouse.getY() - crop.y;
+		if (localX < 0 || localY < 0 || localX >= crop.width || localY >= crop.height)
+		{
+			return;
+		}
+
+		int minX = Math.max(0, localX - VR_CONTEXT_HINT_CURSOR_EXCLUDE_WIDTH / 2);
+		int maxX = Math.min(crop.width, localX + VR_CONTEXT_HINT_CURSOR_EXCLUDE_WIDTH / 2);
+		int minY = Math.max(0, localY - VR_CONTEXT_HINT_CURSOR_EXCLUDE_HEIGHT / 2);
+		int maxY = Math.min(crop.height, localY + VR_CONTEXT_HINT_CURSOR_EXCLUDE_HEIGHT / 2);
+		for (int y = minY; y < maxY; y++)
+		{
+			Arrays.fill(captured, y * crop.width + minX, y * crop.width + maxX, 0);
+		}
 	}
 
 	private net.runelite.api.Point getVrActorUiCanvasAnchor(Actor actor)
@@ -4044,11 +4447,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private Rectangle findVrContextHintBounds(int[] captured, int width, int height)
 	{
 		boolean[] mask = buildVrContextHintMask(captured, width, height);
+		Rectangle rowBand = findVrContextHintTopTextBand(mask, width, height);
+		if (rowBand == null)
+		{
+			return null;
+		}
+
 		int minX = width;
-		int minY = height;
 		int maxX = -1;
-		int maxY = -1;
-		for (int y = 0; y < height; y++)
+		for (int y = rowBand.y; y < rowBand.y + rowBand.height; y++)
 		{
 			int row = y * width;
 			for (int x = 0; x < width; x++)
@@ -4065,27 +4472,61 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				{
 					maxX = x;
 				}
-				if (y < minY)
-				{
-					minY = y;
-				}
-				if (y > maxY)
-				{
-					maxY = y;
-				}
 			}
 		}
 
-		if (maxX < minX || maxY < minY)
+		if (maxX < minX)
 		{
 			return null;
 		}
 		int pad = 2;
 		minX = Math.max(0, minX - pad);
-		minY = Math.max(0, minY - pad);
 		maxX = Math.min(width - 1, maxX + pad);
-		maxY = Math.min(height - 1, maxY + pad);
+		int minY = Math.max(0, rowBand.y - pad);
+		int maxY = Math.min(height - 1, rowBand.y + rowBand.height - 1 + pad);
 		return new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+	}
+
+	private static Rectangle findVrContextHintTopTextBand(boolean[] mask, int width, int height)
+	{
+		int startY = -1;
+		int endY = -1;
+		int emptyRows = 0;
+		for (int y = 0; y < height; y++)
+		{
+			boolean rowHasText = false;
+			int row = y * width;
+			for (int x = 0; x < width; x++)
+			{
+				if (mask[row + x])
+				{
+					rowHasText = true;
+					break;
+				}
+			}
+
+			if (rowHasText)
+			{
+				if (startY < 0)
+				{
+					startY = y;
+				}
+				endY = y;
+				emptyRows = 0;
+				continue;
+			}
+
+			if (startY >= 0 && ++emptyRows > 2)
+			{
+				break;
+			}
+		}
+
+		if (startY < 0 || endY < startY)
+		{
+			return null;
+		}
+		return new Rectangle(0, startY, width, endY - startY + 1);
 	}
 
 	private int[] copyVrContextHintSubRect(int[] captured, int sourceWidth, Rectangle bounds)
@@ -5099,14 +5540,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return false;
 		}
 
+		int canvasX = menu.canvasX + Math.max(0, Math.min(menu.width - 1,
+			Math.round(vrMenuHitScratch.u * (menu.width - 1))));
+		int canvasY = menu.canvasY + Math.max(0, Math.min(menu.height - 1,
+			Math.round(vrMenuHitScratch.v * (menu.height - 1))));
+		primeCanvasMouseForWalk(canvasX, canvasY);
+
 		boolean lmbPressed = lmb >= 0.7f && prevLmb < 0.7f;
 		if (lmbPressed)
 		{
-			int canvasX = menu.canvasX + Math.max(0, Math.min(menu.width - 1,
-				Math.round(vrMenuHitScratch.u * (menu.width - 1))));
-			int canvasY = menu.canvasY + Math.max(0, Math.min(menu.height - 1,
-				Math.round(vrMenuHitScratch.v * (menu.height - 1))));
-			primeCanvasMouseForWalk(canvasX, canvasY);
 			dispatchCanvasMouseClick(canvasX, canvasY, MouseEvent.BUTTON1);
 			setVrDesktopClickMarker(canvasX, canvasY, MouseEvent.BUTTON1);
 			log.info("VR menu LMB dispatch: canvas=({}, {}) uv=({}, {})",
@@ -5179,7 +5621,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Billboard center in stage coords (anchor + local right/up offsets in metres).
 		float cx = anchorStageX + rx * VR_MENU_OFFSET_XM;
-		float cy = anchorStageY + VR_MENU_OFFSET_YM;
+		float cy = anchorStageY + getVrMenuOffsetYM(menu);
 		float cz = anchorStageZ + rz * VR_MENU_OFFSET_XM;
 
 		// Plane normal = facing toward eye (use fx,fy,fz from anchor).

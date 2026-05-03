@@ -110,6 +110,10 @@ final class VrInteraction
 		Entry defaultEntry = !hits.isEmpty() && !hits.get(0).entries.isEmpty()
 			? hits.get(0).entries.get(0)
 			: null;
+		if (defaultEntry != null && !hits.isEmpty())
+		{
+			copyHitToEntry(defaultEntry, hits.get(0), ox, oy, oz, dx, dy, dz);
+		}
 		if (defaultEntry == null && groundHit != null)
 		{
 			defaultEntry = addEntry(null, "Walk here", "", MenuAction.WALK, groundHit.sceneX, groundHit.sceneY, 0, 0);
@@ -138,14 +142,13 @@ final class VrInteraction
 			{
 				// Hit entries carry only p0/p1; back-fill sceneX/Y and local x/y/z so
 				// camera aim and canvas projection target the actual click location.
-				if (groundHit != null)
+				if (rmbEntry.action == MenuAction.WALK && groundHit != null)
 				{
 					copyGroundHitToEntry(rmbEntry, groundHit);
 				}
 				else if (!hits.isEmpty())
 				{
-					rmbEntry.sceneX = hits.get(0).sceneX;
-					rmbEntry.sceneY = hits.get(0).sceneY;
+					copyHitToEntry(rmbEntry, hits.get(0), ox, oy, oz, dx, dy, dz);
 				}
 				beginStagedRightClickDispatch(rmbEntry);
 			}
@@ -278,6 +281,10 @@ final class VrInteraction
 		if (defaultEntry != null)
 		{
 			plugin.setHoverMarkerAction(defaultEntry.action, defaultEntry.option);
+			if (hit != null)
+			{
+				copyHitToEntry(defaultEntry, hit, ox, oy, oz, dx, dy, dz);
+			}
 		}
 
 		float hitX = ox + dx * t;
@@ -463,6 +470,16 @@ final class VrInteraction
 		entry.t = groundHit.t;
 		entry.sceneX = groundHit.sceneX;
 		entry.sceneY = groundHit.sceneY;
+	}
+
+	static void copyHitToEntry(Entry entry, Hit hit, float ox, float oy, float oz, float dx, float dy, float dz)
+	{
+		entry.x = ox + dx * hit.t;
+		entry.y = oy + dy * hit.t;
+		entry.z = oz + dz * hit.t;
+		entry.t = hit.t;
+		entry.sceneX = hit.sceneX;
+		entry.sceneY = hit.sceneY;
 	}
 
 	private void dispatch(Entry vrEntry)
