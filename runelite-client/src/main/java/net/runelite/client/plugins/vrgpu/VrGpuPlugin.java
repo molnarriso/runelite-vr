@@ -108,6 +108,10 @@ import net.runelite.client.ui.ClientUI;
 import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.JagexColors;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.util.Text;
 import net.runelite.rlawt.AWTContext;
 import org.lwjgl.opengl.GL;
@@ -167,6 +171,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	@Inject
 	private DrawManager drawManager;
+
+	@Inject
+	private OverlayManager overlayManager;
 
 	@Inject
 	private PluginManager pluginManager;
@@ -339,7 +346,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_DESKTOP_CLICK_MARKER_COLOR = 0xfff5d000;
 	private static final int VR_DESKTOP_CLICK_MARKER_RMB_COLOR = 0xffff3030;
 	private static final long VR_MENU_STALE_MS = 5000L;
-	private static final float VR_MENU_METERS_PER_PIXEL = 0.00068f;
+	private static final float VR_MENU_METERS_PER_PIXEL = VR_CONTEXT_HINT_METERS_PER_PIXEL;
 	static final float VR_MENU_WORLD_Y_OFFSET = -96f;
 	private static final float VR_MENU_OFFSET_XM = 0f;
 	private static final float VR_MENU_OFFSET_YM = 0.10f;
@@ -356,6 +363,25 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			logVrUiCaptureRenderable(renderable, ui);
 			return captureVrActorUi(renderable, ui);
+		}
+	};
+
+	private final Overlay vrMenuCaptureOverlay = new Overlay(this)
+	{
+		{
+			setLayer(OverlayLayer.ALWAYS_ON_TOP);
+			setPosition(OverlayPosition.DYNAMIC);
+			setPriority(Overlay.PRIORITY_HIGHEST);
+			setMovable(false);
+			setSnappable(false);
+		}
+
+		@Override
+		public Dimension render(Graphics2D graphics)
+		{
+			// The vanilla menu is only reliably present after the top 2D overlay pass.
+			captureVrMenuOverlayFromTopDraw();
+			return null;
 		}
 	};
 	private final List<VrCapturedActorOverlay> vrCapturedActorOverlays = new ArrayList<>(64);
@@ -686,6 +712,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		mapUploader = new SceneUploader(renderCallbackManager);
 		facePrioritySorter = new FacePrioritySorter(clientUploader);
 		renderCallbackManager.register(vrActorUiCaptureCallback);
+		overlayManager.add(vrMenuCaptureOverlay);
 		clientThread.invoke(() ->
 		{
 			try
@@ -862,6 +889,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	protected void shutDown()
 	{
 		renderCallbackManager.unregister(vrActorUiCaptureCallback);
+		overlayManager.remove(vrMenuCaptureOverlay);
 		clientThread.invoke(() ->
 		{
 			client.setGpuFlags(0);
@@ -3603,7 +3631,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		logVrUiCaptureFrameDelimiter();
 		finishPendingVrActorUiCapture();
 		prepareVrContextHintOverlay();
-		prepareVrMenuOverlay();
 		prepareVrActorOverlayBillboards();
 		prepareInterfaceTexture(canvasWidth, canvasHeight, false);
 		drawVrUi(overlayColor, canvasWidth, canvasHeight);
@@ -4213,11 +4240,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return VR_CONTEXT_HINT_OFFSET_YM + hintHalfHeightM + VR_MENU_CONTEXT_HINT_GAP_M + menuHalfHeightM;
 	}
 
-	private void prepareVrMenuOverlay()
+	private void clearVrMenuOverlay()
+	{
+		vrMenuOverlay = null;
+	}
+
+	private void captureVrMenuOverlayFromTopDraw()
 	{
 		if (!client.isMenuOpen())
 		{
-			vrMenuOverlay = null;
+			clearVrMenuOverlay();
 			return;
 		}
 
@@ -4233,6 +4265,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		int[] pixels = copyVrActorUiCrop(client.getBufferProvider(), crop);
+		forceOpaqueAlpha(pixels);
 
 		VrMenuOverlay existing = vrMenuOverlay;
 		float[] pending = vrPendingMenuAnchor;
@@ -4262,6 +4295,34 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		vrMenuOverlay = new VrMenuOverlay(pixels, crop.width, crop.height,
 			crop.x, crop.y, ax, ay, az, System.currentTimeMillis());
+	}
+
+	void logVrMenuEntries(String context)
+	{
+		MenuEntry[] entries = client.getMenuEntries();
+		StringBuilder sb = new StringBuilder();
+		sb.append("VR ").append(context).append(" live menu entries (")
+			.append(entries == null ? 0 : entries.length).append(")");
+		if (entries != null)
+		{
+			for (int i = entries.length - 1, display = 1; i >= 0; i--, display++)
+			{
+				MenuEntry entry = entries[i];
+				if (entry == null)
+				{
+					sb.append('\n').append("  ").append(display).append(". null");
+					continue;
+				}
+				sb.append('\n').append("  ").append(display).append(". ")
+					.append(entry.getOption()).append(' ').append(entry.getTarget())
+					.append(" action=").append(entry.getType())
+					.append(" p0=").append(entry.getParam0())
+					.append(" p1=").append(entry.getParam1())
+					.append(" id=").append(entry.getIdentifier())
+					.append(" itemId=").append(entry.getItemId());
+			}
+		}
+		log.info("{}", sb);
 	}
 
 	private void prepareVrContextHintOverlay()
@@ -4520,6 +4581,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			System.arraycopy(source, (crop.y + row) * sourceWidth + crop.x, out, row * crop.width, crop.width);
 		}
 		return out;
+	}
+
+	private static void forceOpaqueAlpha(int[] pixels)
+	{
+		for (int i = 0; i < pixels.length; i++)
+		{
+			pixels[i] |= 0xff000000;
+		}
 	}
 
 	private void fillVrActorUiCrop(BufferProvider bufferProvider, Rectangle crop, int color)

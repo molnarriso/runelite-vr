@@ -176,6 +176,7 @@ final class VrInteraction
 		{
 			plugin.setVrPendingMenuAnchor(groundHit.x, groundHit.y + VrGpuPlugin.VR_MENU_WORLD_Y_OFFSET, groundHit.z);
 		}
+		plugin.logVrMenuEntries("RMB before open");
 		plugin.dispatchCanvasMouseClick(mousePoint.getX(), mousePoint.getY(), MouseEvent.BUTTON3);
 		plugin.setVrDesktopClickMarker(mousePoint.getX(), mousePoint.getY(), MouseEvent.BUTTON3);
 		log.info("VR RMB dispatch: open live desktop menu at canvas=({}, {})", mousePoint.getX(), mousePoint.getY());
