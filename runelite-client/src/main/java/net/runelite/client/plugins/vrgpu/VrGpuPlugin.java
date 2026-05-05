@@ -28,12 +28,17 @@ import com.google.common.base.Stopwatch;
 import com.google.common.primitives.Ints;
 import com.google.inject.Provides;
 import java.awt.Canvas;
+import java.awt.Color;
 import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
 import java.awt.event.MouseEvent;
 import java.awt.GraphicsConfiguration;
 import java.awt.Image;
 import java.awt.Polygon;
 import java.awt.Rectangle;
+import java.awt.RenderingHints;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
@@ -101,6 +106,9 @@ import net.runelite.client.plugins.vrgpu.config.UIScalingMode;
 import net.runelite.client.plugins.vrgpu.template.Template;
 import net.runelite.client.ui.ClientUI;
 import net.runelite.client.ui.DrawManager;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.JagexColors;
+import net.runelite.client.util.Text;
 import net.runelite.rlawt.AWTContext;
 import org.lwjgl.opengl.GL;
 import static org.lwjgl.opengl.GL33C.*;
@@ -317,18 +325,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final long VR_UI_CAPTURE_DEBUG_INTERVAL_MS = 1000L;
 	private static final boolean VR_UI_CAPTURE_DEBUG_FILES = false;
 	private static final Path VR_UI_CAPTURE_DEBUG_DIR = Paths.get("C:\\tmp\\captures");
-	private static final int VR_CONTEXT_HINT_CAPTURE_X = 0;
-	private static final int VR_CONTEXT_HINT_CAPTURE_Y = 0;
-	private static final int VR_CONTEXT_HINT_CAPTURE_WIDTH = 640;
-	private static final int VR_CONTEXT_HINT_CAPTURE_HEIGHT = 48;
-	private static final int VR_CONTEXT_HINT_CURSOR_EXCLUDE_WIDTH = 320;
-	private static final int VR_CONTEXT_HINT_CURSOR_EXCLUDE_HEIGHT = 96;
 	private static final long VR_CONTEXT_HINT_STALE_MS = 500L;
 	static final long VR_CONTEXT_HINT_HOVER_INTERVAL_MS = 50L;
 	private static final float VR_CONTEXT_HINT_METERS_PER_PIXEL = 0.0017f;
 	static final float VR_CONTEXT_HINT_WORLD_Y_OFFSET = -96f;
 	private static final float VR_CONTEXT_HINT_OFFSET_XM = 0.10f;
 	private static final float VR_CONTEXT_HINT_OFFSET_YM = 0.08f;
+	private static final int VR_CONTEXT_HINT_TEXT_PAD_X = 2;
+	private static final int VR_CONTEXT_HINT_TEXT_PAD_Y = 2;
+	private static final int VR_CONTEXT_HINT_TEXT_SHADOW_COLOR = 0x000000;
 	private static final long VR_DESKTOP_CLICK_MARKER_STALE_MS = 2000L;
 	private static final int VR_DESKTOP_CLICK_MARKER_RADIUS = 10;
 	private static final int VR_DESKTOP_CLICK_MARKER_COLOR = 0xfff5d000;
@@ -446,6 +451,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			this.anchorY = anchorY;
 			this.anchorZ = anchorZ;
 			this.timeMs = timeMs;
+		}
+	}
+
+	private static final class VrContextHintTextRun
+	{
+		final String text;
+		final Color color;
+
+		private VrContextHintTextRun(String text, Color color)
+		{
+			this.text = text;
+			this.color = color;
 		}
 	}
 
@@ -4257,62 +4274,199 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		Rectangle crop = clampVrActorUiCrop(
-			VR_CONTEXT_HINT_CAPTURE_X,
-			VR_CONTEXT_HINT_CAPTURE_Y,
-			VR_CONTEXT_HINT_CAPTURE_WIDTH,
-			VR_CONTEXT_HINT_CAPTURE_HEIGHT);
-		if (crop == null)
+		VrContextHintOverlay overlay = createVrContextHintOverlay(target, now);
+		if (overlay == null)
 		{
 			vrContextHintOverlay = null;
 			return;
 		}
 
-		int[] captured = copyVrActorUiCrop(client.getBufferProvider(), crop);
-		writeVrUiCaptureDebugImage("context-hint-raw", captured, crop.width, crop.height);
-		clearVrContextHintCursorRegion(captured, crop);
-		writeVrUiCaptureDebugImage("context-hint-masked", captured, crop.width, crop.height);
-		Rectangle bounds = findVrContextHintBounds(captured, crop.width, crop.height);
-		if (bounds == null)
+		writeVrUiCaptureDebugImage("context-hint-rendered", overlay.argbPixels, overlay.width, overlay.height);
+		vrContextHintOverlay = overlay;
+	}
+
+	private VrContextHintOverlay createVrContextHintOverlay(VrHoverTarget target, long now)
+	{
+		MenuEntry entry = getVrContextHintMenuEntry();
+		if (entry == null)
 		{
-			vrContextHintOverlay = null;
-			return;
+			return null;
 		}
 
-		int[] argb = copyVrContextHintSubRect(captured, crop.width, bounds);
-		writeVrUiCaptureDebugImage("context-hint-diff", argb, bounds.width, bounds.height);
-		vrContextHintOverlay = new VrContextHintOverlay(
+		List<VrContextHintTextRun> runs = buildVrContextHintTextRuns(entry);
+		if (runs.isEmpty())
+		{
+			return null;
+		}
+
+		Font font = FontManager.getRunescapeBoldFont();
+		BufferedImage measureImage = new BufferedImage(1, 1, BufferedImage.TYPE_INT_ARGB);
+		Graphics2D measureGraphics = measureImage.createGraphics();
+		int textWidth;
+		int textHeight;
+		int ascent;
+		try
+		{
+			measureGraphics.setFont(font);
+			FontMetrics metrics = measureGraphics.getFontMetrics();
+			textWidth = 0;
+			for (VrContextHintTextRun run : runs)
+			{
+				textWidth += metrics.stringWidth(run.text);
+			}
+			if (textWidth <= 0)
+			{
+				return null;
+			}
+			textHeight = metrics.getAscent() + metrics.getDescent();
+			ascent = metrics.getAscent();
+		}
+		finally
+		{
+			measureGraphics.dispose();
+		}
+
+		int width = Math.max(1, textWidth + VR_CONTEXT_HINT_TEXT_PAD_X * 2);
+		int height = Math.max(1, textHeight + VR_CONTEXT_HINT_TEXT_PAD_Y * 2);
+		BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+		Graphics2D graphics = image.createGraphics();
+		try
+		{
+			graphics.setFont(font);
+			graphics.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
+			int x = VR_CONTEXT_HINT_TEXT_PAD_X;
+			int baseline = VR_CONTEXT_HINT_TEXT_PAD_Y + ascent;
+			for (VrContextHintTextRun run : runs)
+			{
+				graphics.setColor(new Color(VR_CONTEXT_HINT_TEXT_SHADOW_COLOR));
+				graphics.drawString(run.text, x + 1, baseline + 1);
+				graphics.setColor(run.color);
+				graphics.drawString(run.text, x, baseline);
+				x += graphics.getFontMetrics().stringWidth(run.text);
+			}
+		}
+		finally
+		{
+			graphics.dispose();
+		}
+
+		int[] data = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
+		int[] argb = Arrays.copyOf(data, data.length);
+		return new VrContextHintOverlay(
 			argb,
-			bounds.width,
-			bounds.height,
+			width,
+			height,
 			target.anchorX,
 			target.anchorY,
 			target.anchorZ,
 			now);
 	}
 
-	private void clearVrContextHintCursorRegion(int[] captured, Rectangle crop)
+	private MenuEntry getVrContextHintMenuEntry()
 	{
-		net.runelite.api.Point mouse = client.getMouseCanvasPosition();
-		if (mouse == null)
+		MenuEntry[] menuEntries = client.getMenuEntries();
+		if (menuEntries == null || menuEntries.length == 0)
+		{
+			return null;
+		}
+		return menuEntries[menuEntries.length - 1];
+	}
+
+	private static List<VrContextHintTextRun> buildVrContextHintTextRuns(MenuEntry entry)
+	{
+		List<VrContextHintTextRun> runs = new ArrayList<>(4);
+		appendVrContextHintTextRuns(runs, entry.getOption(), Color.WHITE);
+		String target = entry.getTarget();
+		if (target != null && !Text.removeTags(target).isEmpty())
+		{
+			if (!runs.isEmpty())
+			{
+				runs.add(new VrContextHintTextRun(" ", Color.WHITE));
+			}
+			appendVrContextHintTextRuns(runs, target, JagexColors.MENU_TARGET);
+		}
+		return runs;
+	}
+
+	private static void appendVrContextHintTextRuns(List<VrContextHintTextRun> runs, String text, Color defaultColor)
+	{
+		if (text == null || text.isEmpty())
 		{
 			return;
 		}
 
-		int localX = mouse.getX() - crop.x;
-		int localY = mouse.getY() - crop.y;
-		if (localX < 0 || localY < 0 || localX >= crop.width || localY >= crop.height)
+		Color color = defaultColor;
+		StringBuilder segment = new StringBuilder(text.length());
+		for (int i = 0; i < text.length(); )
+		{
+			if (text.startsWith("<col=", i))
+			{
+				int end = text.indexOf('>', i);
+				if (end > i)
+				{
+					flushVrContextHintTextRun(runs, segment, color);
+					Color parsed = parseVrContextHintColor(text.substring(i + 5, end));
+					color = parsed != null ? parsed : color;
+					i = end + 1;
+					continue;
+				}
+			}
+			if (text.startsWith("</col>", i))
+			{
+				flushVrContextHintTextRun(runs, segment, color);
+				color = defaultColor;
+				i += 6;
+				continue;
+			}
+			if (text.startsWith("<lt>", i))
+			{
+				segment.append('<');
+				i += 4;
+				continue;
+			}
+			if (text.startsWith("<gt>", i))
+			{
+				segment.append('>');
+				i += 4;
+				continue;
+			}
+			if (text.charAt(i) == '<')
+			{
+				int end = text.indexOf('>', i);
+				if (end > i)
+				{
+					i = end + 1;
+					continue;
+				}
+			}
+			segment.append(text.charAt(i++));
+		}
+		flushVrContextHintTextRun(runs, segment, color);
+	}
+
+	private static void flushVrContextHintTextRun(List<VrContextHintTextRun> runs, StringBuilder segment, Color color)
+	{
+		if (segment.length() == 0)
 		{
 			return;
 		}
+		runs.add(new VrContextHintTextRun(segment.toString(), color));
+		segment.setLength(0);
+	}
 
-		int minX = Math.max(0, localX - VR_CONTEXT_HINT_CURSOR_EXCLUDE_WIDTH / 2);
-		int maxX = Math.min(crop.width, localX + VR_CONTEXT_HINT_CURSOR_EXCLUDE_WIDTH / 2);
-		int minY = Math.max(0, localY - VR_CONTEXT_HINT_CURSOR_EXCLUDE_HEIGHT / 2);
-		int maxY = Math.min(crop.height, localY + VR_CONTEXT_HINT_CURSOR_EXCLUDE_HEIGHT / 2);
-		for (int y = minY; y < maxY; y++)
+	private static Color parseVrContextHintColor(String hex)
+	{
+		if (hex == null || hex.length() != 6)
 		{
-			Arrays.fill(captured, y * crop.width + minX, y * crop.width + maxX, 0);
+			return null;
+		}
+		try
+		{
+			return new Color(Integer.parseInt(hex, 16));
+		}
+		catch (NumberFormatException ex)
+		{
+			return null;
 		}
 	}
 
@@ -4442,148 +4596,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 		return out;
-	}
-
-	private Rectangle findVrContextHintBounds(int[] captured, int width, int height)
-	{
-		boolean[] mask = buildVrContextHintMask(captured, width, height);
-		Rectangle rowBand = findVrContextHintTopTextBand(mask, width, height);
-		if (rowBand == null)
-		{
-			return null;
-		}
-
-		int minX = width;
-		int maxX = -1;
-		for (int y = rowBand.y; y < rowBand.y + rowBand.height; y++)
-		{
-			int row = y * width;
-			for (int x = 0; x < width; x++)
-			{
-				if (!mask[row + x])
-				{
-					continue;
-				}
-				if (x < minX)
-				{
-					minX = x;
-				}
-				if (x > maxX)
-				{
-					maxX = x;
-				}
-			}
-		}
-
-		if (maxX < minX)
-		{
-			return null;
-		}
-		int pad = 2;
-		minX = Math.max(0, minX - pad);
-		maxX = Math.min(width - 1, maxX + pad);
-		int minY = Math.max(0, rowBand.y - pad);
-		int maxY = Math.min(height - 1, rowBand.y + rowBand.height - 1 + pad);
-		return new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
-	}
-
-	private static Rectangle findVrContextHintTopTextBand(boolean[] mask, int width, int height)
-	{
-		int startY = -1;
-		int endY = -1;
-		int emptyRows = 0;
-		for (int y = 0; y < height; y++)
-		{
-			boolean rowHasText = false;
-			int row = y * width;
-			for (int x = 0; x < width; x++)
-			{
-				if (mask[row + x])
-				{
-					rowHasText = true;
-					break;
-				}
-			}
-
-			if (rowHasText)
-			{
-				if (startY < 0)
-				{
-					startY = y;
-				}
-				endY = y;
-				emptyRows = 0;
-				continue;
-			}
-
-			if (startY >= 0 && ++emptyRows > 2)
-			{
-				break;
-			}
-		}
-
-		if (startY < 0 || endY < startY)
-		{
-			return null;
-		}
-		return new Rectangle(0, startY, width, endY - startY + 1);
-	}
-
-	private int[] copyVrContextHintSubRect(int[] captured, int sourceWidth, Rectangle bounds)
-	{
-		int[] source = new int[bounds.width * bounds.height];
-		for (int row = 0; row < bounds.height; row++)
-		{
-			System.arraycopy(captured, (bounds.y + row) * sourceWidth + bounds.x, source, row * bounds.width, bounds.width);
-		}
-
-		boolean[] mask = buildVrContextHintMask(source, bounds.width, bounds.height);
-		boolean[] expanded = new boolean[mask.length];
-		for (int y = 0; y < bounds.height; y++)
-		{
-			for (int x = 0; x < bounds.width; x++)
-			{
-				int idx = y * bounds.width + x;
-				if (!mask[idx])
-				{
-					continue;
-				}
-				for (int yy = Math.max(0, y - 1); yy <= Math.min(bounds.height - 1, y + 1); yy++)
-				{
-					for (int xx = Math.max(0, x - 1); xx <= Math.min(bounds.width - 1, x + 1); xx++)
-					{
-						expanded[yy * bounds.width + xx] = true;
-					}
-				}
-			}
-		}
-
-		int[] out = new int[source.length];
-		for (int i = 0; i < source.length; i++)
-		{
-			out[i] = expanded[i] ? source[i] : 0;
-		}
-		return out;
-	}
-
-	private static boolean[] buildVrContextHintMask(int[] pixels, int width, int height)
-	{
-		boolean[] mask = new boolean[width * height];
-		for (int i = 0; i < pixels.length; i++)
-		{
-			int pixel = pixels[i];
-			int r = (pixel >>> 16) & 0xff;
-			int g = (pixel >>> 8) & 0xff;
-			int b = pixel & 0xff;
-			int max = Math.max(r, Math.max(g, b));
-			int min = Math.min(r, Math.min(g, b));
-			boolean brightText = max >= 180 && (max - min >= 45 || min >= 150);
-			boolean yellowText = r >= 150 && g >= 120 && b <= 120;
-			boolean greenText = g >= 140 && r <= 170 && b <= 170;
-			boolean cyanText = g >= 140 && b >= 140 && r <= 170;
-			mask[i] = brightText || yellowText || greenText || cyanText;
-		}
-		return mask;
 	}
 
 	private float[] getVrActorAnchor(Actor actor)

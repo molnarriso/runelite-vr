@@ -25,6 +25,17 @@ We are building a RuneLite VR GPU plugin: OpenXR stereo rendering for the 3D wor
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSceneRaycaster.java`: VR ray picking against scene/world objects.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/openxr/`: OpenXR context, swapchains, and input.
 
+## Useful RuneLite sources
+
+- `runelite-api/src/main/java/net/runelite/api/Client.java`: menu entry access, rasterizer access, selected widget state, and core client dimensions.
+- `runelite-api/src/main/java/net/runelite/api/MenuEntry.java`: option/target/action fields used to reconstruct hover context text.
+- `runelite-api/src/main/java/net/runelite/api/events/PostMenuSort.java`: fires after menu sorting; useful hook for authoritative top menu entry state.
+- `runelite-api/src/main/java/net/runelite/api/FontID.java`: OSRS cache font ids; `BOLD_12` maps to the normal bold menu/context font.
+- `runelite-api/src/main/java/net/runelite/api/FontTypeFace.java`: actual Jagex bitmap font interface, including width/baseline/text drawing.
+- `runelite-client/src/main/java/net/runelite/client/ui/FontManager.java`: RuneLite bundled RuneScape-style TTF fonts for offscreen Java2D rendering.
+- `runelite-client/src/main/java/net/runelite/client/plugins/interacthighlight/InteractHighlightOverlay.java`: example of using the top sorted `MenuEntry` as the current hovered action.
+- `cache/src/main/java/net/runelite/cache/FontName.java`: cache font archive names such as `b12_full`.
+- `cache/src/main/java/net/runelite/cache/item/Rasterizer2D.java`: cache-side raster buffer switching model that would be useful to expose at runtime later.
 
 # AI Workflows
 - after edit, run ```./gradlew :client:compileJava``` to check compilation error. Do not run tests or try to execute the program.
