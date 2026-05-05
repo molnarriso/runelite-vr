@@ -5483,14 +5483,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return new net.runelite.api.Point(centerX, projected.getY());
 	}
 
-	net.runelite.api.Point projectStagedWalkCanvasPoint(VrInteraction.Entry entry, WorldView wv)
-	{
-		return projectStagedWalkCanvasPoint(new float[]{
-			entry.sceneX, entry.sceneY,
-			entry.x, entry.y, entry.z
-		}, wv);
-	}
-
 	void dispatchCanvasMouseClick(int canvasX, int canvasY, int button)
 	{
 		Canvas targetCanvas = canvas != null ? canvas : client.getCanvas();

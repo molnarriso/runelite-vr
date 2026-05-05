@@ -12,10 +12,8 @@ import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
 import net.runelite.api.GroundObject;
 import net.runelite.api.ItemComposition;
-import net.runelite.api.MenuAction;
 import net.runelite.api.Model;
 import net.runelite.api.NPC;
-import net.runelite.api.NPCComposition;
 import net.runelite.api.ObjectComposition;
 import net.runelite.api.Perspective;
 import net.runelite.api.Player;
@@ -240,28 +238,12 @@ final class VrSceneRaycaster
 			return null;
 		}
 
-		NPCComposition comp = npc.getTransformedComposition();
-		if (comp == null)
-		{
-			comp = npc.getComposition();
-		}
-
 		VrInteraction.Hit hit = new VrInteraction.Hit();
 		hit.t = t;
 		hit.entityType = "npc";
 		hit.entityName = safeName(npc.getName(), "NPC");
 		hit.sceneX = lp.getX() >> 7;
 		hit.sceneY = lp.getY() >> 7;
-
-		MenuAction[] actions = {
-			MenuAction.NPC_FIRST_OPTION,
-			MenuAction.NPC_SECOND_OPTION,
-			MenuAction.NPC_THIRD_OPTION,
-			MenuAction.NPC_FOURTH_OPTION,
-			MenuAction.NPC_FIFTH_OPTION
-		};
-		VrInteraction.addEntries(hit, comp != null ? comp.getActions() : null, actions, npc.getIndex(), 0, 0, hit.entityName);
-		VrInteraction.addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_NPC, 0, 0, npc.getIndex(), -1);
 		return hit;
 	}
 
@@ -287,19 +269,7 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(player.getName(), "Player");
 		hit.sceneX = lp.getX() >> 7;
 		hit.sceneY = lp.getY() >> 7;
-
-		MenuAction[] actions = {
-			MenuAction.PLAYER_FIRST_OPTION,
-			MenuAction.PLAYER_SECOND_OPTION,
-			MenuAction.PLAYER_THIRD_OPTION,
-			MenuAction.PLAYER_FOURTH_OPTION,
-			MenuAction.PLAYER_FIFTH_OPTION,
-			MenuAction.PLAYER_SIXTH_OPTION,
-			MenuAction.PLAYER_SEVENTH_OPTION,
-			MenuAction.PLAYER_EIGHTH_OPTION
-		};
-		VrInteraction.addEntries(hit, client.getPlayerOptions(), actions, player.getId(), 0, 0, hit.entityName);
-		return hit.entries.isEmpty() ? null : hit;
+		return hit;
 	}
 
 	private VrInteraction.Hit buildObjectHit(float ox, float oy, float oz, float dx, float dy, float dz,
@@ -351,16 +321,6 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(def.getName(), "Object");
 		hit.sceneX = sceneX;
 		hit.sceneY = sceneY;
-
-		MenuAction[] actions = {
-			MenuAction.GAME_OBJECT_FIRST_OPTION,
-			MenuAction.GAME_OBJECT_SECOND_OPTION,
-			MenuAction.GAME_OBJECT_THIRD_OPTION,
-			MenuAction.GAME_OBJECT_FOURTH_OPTION,
-			MenuAction.GAME_OBJECT_FIFTH_OPTION
-		};
-		VrInteraction.addEntries(hit, def.getActions(), actions, objId, sceneX, sceneY, hit.entityName);
-		VrInteraction.addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_OBJECT, sceneX, sceneY, objId, -1);
 		return hit;
 	}
 
@@ -378,9 +338,6 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(def.getName(), "Item");
 		hit.sceneX = sceneX;
 		hit.sceneY = sceneY;
-
-		VrInteraction.addEntry(hit, "Take", hit.entityName, MenuAction.GROUND_ITEM_FIRST_OPTION, sceneX, sceneY, item.getId(), item.getId());
-		VrInteraction.addEntry(hit, "Examine", hit.entityName, MenuAction.EXAMINE_ITEM_GROUND, sceneX, sceneY, item.getId(), item.getId());
 		return hit;
 	}
 
