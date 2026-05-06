@@ -345,24 +345,42 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_DESKTOP_CLICK_MARKER_RADIUS = 10;
 	private static final int VR_DESKTOP_CLICK_MARKER_COLOR = 0xfff5d000;
 	private static final int VR_DESKTOP_CLICK_MARKER_RMB_COLOR = 0xffff3030;
+	private static final int VR_HAND_NONE = -1;
+	private static final int VR_HAND_LEFT = 0;
+	private static final int VR_HAND_RIGHT = 1;
 	private static final long VR_MENU_STALE_MS = 5000L;
 	private static final float VR_MENU_METERS_PER_PIXEL = VR_CONTEXT_HINT_METERS_PER_PIXEL;
 	static final float VR_MENU_WORLD_Y_OFFSET = -96f;
 	private static final float VR_MENU_OFFSET_XM = 0f;
 	private static final float VR_MENU_OFFSET_YM = 0.10f;
 	private static final float VR_MENU_CONTEXT_HINT_GAP_M = 0.035f;
-	private static final float VR_MENU_CLOSE_MARGIN_UV = 0.30f;
+	private static final float VR_MENU_CLOSE_MARGIN_UV = 2.50f;
+	private static final int VR_MENU_TITLE_HEIGHT_PX = 19;
+	private static final int VR_MENU_ROW_HEIGHT_PX = 15;
 	private static final float VR_HOVER_TARGET_SMOOTHING = 0.35f;
 	private volatile VrMenuOverlay vrMenuOverlay;
 	private volatile float[] vrPendingMenuAnchor;
 	private final VrMenuHit vrMenuHitScratch = new VrMenuHit();
-	private boolean vrMenuAcquired;
 	private String vrMenuInteractionKey;
+	// Only the controller that opened the menu drives menu hover/click/cancel.
+	private int vrMenuControllerHand = VR_HAND_NONE;
 	private boolean vrMenuPointerVisible;
+	// Set after programmatic Cancel so a still-open vanilla menu is not re-captured at fallback/player anchor.
+	private boolean vrMenuSuppressCaptureUntilClosed;
 	private int vrMenuPointerX;
 	private int vrMenuPointerY;
 	private boolean vrMenuPointerLmbDown;
 	private boolean vrMenuPointerRmbDown;
+	private long vrLastMenuRayDebugLogMs;
+	private boolean vrLastMenuPlaneHit;
+	private float vrLastMenuRayU;
+	private float vrLastMenuRayV;
+	private long vrLastMenuCaptureSuppressedLogMs;
+	// Per-hand edges are needed so the non-owner controller cannot steal menu actions.
+	private float prevLeftTrigger;
+	private float prevRightTrigger;
+	private float prevLeftSqueeze;
+	private float prevRightSqueeze;
 
 	private final RenderCallback vrActorUiCaptureCallback = new RenderCallback()
 	{
@@ -512,10 +530,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final float anchorZ;
 		final float widthMeters;
 		final float heightMeters;
+		final float offsetYM;
 		final long timeMs;
 
 		private VrMenuOverlay(int[] argbPixels, int width, int height, int canvasX, int canvasY,
-			float anchorX, float anchorY, float anchorZ, long timeMs)
+			float anchorX, float anchorY, float anchorZ, float offsetYM, long timeMs)
 		{
 			this.argbPixels = argbPixels;
 			this.width = width;
@@ -527,6 +546,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			this.anchorZ = anchorZ;
 			this.widthMeters = width * VR_MENU_METERS_PER_PIXEL;
 			this.heightMeters = height * VR_MENU_METERS_PER_PIXEL;
+			this.offsetYM = offsetYM;
 			this.timeMs = timeMs;
 		}
 	}
@@ -2102,24 +2122,34 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			if (!vrUiMousePressed && handleVrMenuMouse(lmb, rmb))
 			{
 				vrPendingHoverRay = null;
-				prevLmb = lmb;
-				prevRmb = rmb;
+				updateVrButtonState(lmb, rmb);
 				return;
 			}
 
 			if (handleVrUiMouse(lmb, rmb))
 			{
 				vrPendingHoverRay = null;
-				prevLmb = lmb;
-				prevRmb = rmb;
+				updateVrButtonState(lmb, rmb);
 				return;
 			}
 
 			// Prefer the hand that just pressed; fall back to any valid hit.
 			float[] activeHit = null;
-			if (xrInput.getRightTrigger() >= 0.7f || xrInput.getRightSqueeze() >= 0.7f)
+			boolean leftTriggerDown = xrInput.getLeftTrigger() >= 0.7f;
+			boolean rightTriggerDown = xrInput.getRightTrigger() >= 0.7f;
+			boolean leftSqueezeDown = xrInput.getLeftSqueeze() >= 0.7f;
+			boolean rightSqueezeDown = xrInput.getRightSqueeze() >= 0.7f;
+			boolean leftTriggerPressed = leftTriggerDown && prevLeftTrigger < 0.7f;
+			boolean rightTriggerPressed = rightTriggerDown && prevRightTrigger < 0.7f;
+			boolean leftSqueezePressed = leftSqueezeDown && prevLeftSqueeze < 0.7f;
+			boolean rightSqueezePressed = rightSqueezeDown && prevRightSqueeze < 0.7f;
+			if (rightTriggerPressed || rightSqueezePressed)
 				activeHit = vrRightRayHit;
-			if (activeHit == null && (xrInput.getLeftTrigger() >= 0.7f || xrInput.getLeftSqueeze() >= 0.7f))
+			if (activeHit == null && (leftTriggerPressed || leftSqueezePressed))
+				activeHit = vrLeftRayHit;
+			if (activeHit == null && (rightTriggerDown || rightSqueezeDown))
+				activeHit = vrRightRayHit;
+			if (activeHit == null && (leftTriggerDown || leftSqueezeDown))
 				activeHit = vrLeftRayHit;
 			if (activeHit == null)
 				activeHit = vrRightRayHit != null ? vrRightRayHit : vrLeftRayHit;
@@ -2128,11 +2158,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 			if (activeHit != null)
 			{
-				boolean isLmb = lmb >= 0.7f && prevLmb < 0.7f;
-				boolean isRmb = rmb >= 0.7f && prevRmb < 0.7f;
+				boolean isLmb = leftTriggerPressed || rightTriggerPressed;
+				boolean isRmb = leftSqueezePressed || rightSqueezePressed;
 				if (isLmb || isRmb)
 				{
 					int btn = isLmb ? MouseEvent.BUTTON1 : MouseEvent.BUTTON3;
+					int pressedHand = rightTriggerPressed || rightSqueezePressed ? VR_HAND_RIGHT : VR_HAND_LEFT;
+					if (isRmb)
+					{
+						vrMenuControllerHand = pressedHand;
+					}
 					vrPendingClickHit = activeHit.clone();
 					vrPendingClickButton = btn;
 					vrLastClickHit = activeHit.clone();
@@ -2140,8 +2175,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					vrLastClickTimeMs = System.currentTimeMillis();
 
 					// Compute OSRS-space ray from the active controller for client-thread raycast.
-					// Right controller takes priority; fall back to left if right is not active.
-					boolean useRight = xrInput.getRightTrigger() >= 0.7f || xrInput.getRightSqueeze() >= 0.7f;
+					boolean useRight = pressedHand == VR_HAND_RIGHT;
 					float spx, spy, spz, sdx, sdy, sdz;
 					if (useRight || !xrInput.isLeftActive())
 					{
@@ -2200,8 +2234,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 						rdx, rdy, rdz);
 				}
 			}
-			prevLmb = lmb;
-			prevRmb = rmb;
+			updateVrButtonState(lmb, rmb);
 		}
 	}
 
@@ -4231,7 +4264,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				menu.widthMeters,
 				menu.heightMeters,
 				VR_MENU_OFFSET_XM,
-				getVrMenuOffsetYM(menu),
+				menu.offsetYM,
 				menu.argbPixels,
 				menu.width,
 				menu.height);
@@ -4241,36 +4274,54 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private float getVrMenuOffsetYM(VrMenuOverlay menu)
 	{
+		return getVrMenuOffsetYM(menu.anchorX, menu.anchorY, menu.anchorZ, menu.heightMeters);
+	}
+
+	private float getVrMenuOffsetYM(float menuAnchorX, float menuAnchorY, float menuAnchorZ, float menuHeightMeters)
+	{
+		// If the context hint shares this anchor, stack the menu above it once and freeze that offset.
 		VrContextHintOverlay hint = vrContextHintOverlay;
 		if (hint == null || System.currentTimeMillis() - hint.timeMs > VR_CONTEXT_HINT_STALE_MS)
 		{
 			return VR_MENU_OFFSET_YM;
 		}
-		float dx = hint.anchorX - menu.anchorX;
-		float dy = hint.anchorY - menu.anchorY;
-		float dz = hint.anchorZ - menu.anchorZ;
+		float dx = hint.anchorX - menuAnchorX;
+		float dy = hint.anchorY - menuAnchorY;
+		float dz = hint.anchorZ - menuAnchorZ;
 		if (dx * dx + dy * dy + dz * dz > 64f * 64f)
 		{
 			return VR_MENU_OFFSET_YM;
 		}
 		float hintHalfHeightM = hint.height * VR_CONTEXT_HINT_METERS_PER_PIXEL * 0.5f;
-		float menuHalfHeightM = menu.heightMeters * 0.5f;
+		float menuHalfHeightM = menuHeightMeters * 0.5f;
 		return VR_CONTEXT_HINT_OFFSET_YM + hintHalfHeightM + VR_MENU_CONTEXT_HINT_GAP_M + menuHalfHeightM;
 	}
 
 	private void clearVrMenuOverlay()
 	{
 		vrMenuOverlay = null;
-		vrMenuAcquired = false;
 		vrMenuInteractionKey = null;
 		vrMenuPointerVisible = false;
 	}
 
 	private void captureVrMenuOverlayFromTopDraw()
 	{
+		// Vanilla menu pixels are reliable only after RuneLite's top 2D overlay pass.
 		if (!client.isMenuOpen())
 		{
+			vrMenuSuppressCaptureUntilClosed = false;
 			clearVrMenuOverlay();
+			return;
+		}
+		if (vrMenuSuppressCaptureUntilClosed)
+		{
+			long now = System.currentTimeMillis();
+			if (now - vrLastMenuCaptureSuppressedLogMs > 500L)
+			{
+				vrLastMenuCaptureSuppressedLogMs = now;
+				log.info("VR RMB menu capture suppressed while vanilla menu still open: menuRect=({}, {}) {}x{}",
+					client.getMenuX(), client.getMenuY(), client.getMenuWidth(), client.getMenuHeight());
+			}
 			return;
 		}
 
@@ -4287,10 +4338,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		int[] pixels = copyVrActorUiCrop(client.getBufferProvider(), crop);
 		forceOpaqueAlpha(pixels);
+		// A changed crop means vanilla rebuilt/repositioned the menu; drop the old pointer.
 		String interactionKey = crop.x + "," + crop.y + "," + crop.width + "," + crop.height;
 		if (!interactionKey.equals(vrMenuInteractionKey))
 		{
-			vrMenuAcquired = false;
 			vrMenuInteractionKey = interactionKey;
 			vrMenuPointerVisible = false;
 		}
@@ -4306,28 +4357,32 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float ax;
 		float ay;
 		float az;
+		float offsetYM;
 		// Keep the anchor stable for the lifetime of one menu so the billboard does not jitter.
 		if (pending != null)
 		{
 			ax = pending[0];
 			ay = pending[1];
 			az = pending[2];
+			offsetYM = getVrMenuOffsetYM(ax, ay, az, crop.height * VR_MENU_METERS_PER_PIXEL);
 		}
 		else if (existing != null)
 		{
 			ax = existing.anchorX;
 			ay = existing.anchorY;
 			az = existing.anchorZ;
+			offsetYM = existing.offsetYM;
 		}
 		else
 		{
 			ax = getVrAnchorWorldX();
 			ay = getVrAnchorWorldY() + VR_MENU_WORLD_Y_OFFSET;
 			az = getVrAnchorWorldZ();
+			offsetYM = getVrMenuOffsetYM(ax, ay, az, crop.height * VR_MENU_METERS_PER_PIXEL);
 		}
 
 		vrMenuOverlay = new VrMenuOverlay(pixels, crop.width, crop.height,
-			crop.x, crop.y, ax, ay, az, System.currentTimeMillis());
+			crop.x, crop.y, ax, ay, az, offsetYM, System.currentTimeMillis());
 	}
 
 	void logVrMenuEntries(String context)
@@ -5610,11 +5665,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	void setVrPendingMenuAnchor(float x, float y, float z)
 	{
+		// Consumed by the next top-draw menu capture after the RMB desktop click opens vanilla menu.
+		vrMenuSuppressCaptureUntilClosed = false;
 		vrPendingMenuAnchor = new float[]{x, y, z};
 	}
 
 	private boolean handleVrMenuMouse(float lmb, float rmb)
 	{
+		// Menu mode freezes normal world/UI hover and maps the owner controller ray into menu pixels.
 		VrMenuOverlay menu = vrMenuOverlay;
 		if (menu == null || xrInput == null || Float.isNaN(vrWorldAnchorY))
 		{
@@ -5625,15 +5683,30 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return false;
 		}
 
+		int hand = vrMenuControllerHand;
+		if (hand == VR_HAND_NONE)
+		{
+			// Fallback for menus opened before owner-hand tracking was available.
+			if (xrInput.getRightSqueeze() >= 0.7f || xrInput.getRightTrigger() >= 0.7f || xrInput.isRightActive())
+			{
+				hand = VR_HAND_RIGHT;
+			}
+			else if (xrInput.isLeftActive())
+			{
+				hand = VR_HAND_LEFT;
+			}
+			vrMenuControllerHand = hand;
+		}
+
 		boolean planeHit = false;
-		if (xrInput.isRightActive() && intersectVrMenuPlane(menu,
+		if (hand == VR_HAND_RIGHT && xrInput.isRightActive() && intersectVrMenuPlane(menu,
 			xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
 			xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ(),
 			vrMenuHitScratch))
 		{
 			planeHit = true;
 		}
-		else if (xrInput.isLeftActive() && intersectVrMenuPlane(menu,
+		else if (hand == VR_HAND_LEFT && xrInput.isLeftActive() && intersectVrMenuPlane(menu,
 			xrInput.getLeftPosX(), xrInput.getLeftPosY(), xrInput.getLeftPosZ(),
 			xrInput.getLeftDirX(), xrInput.getLeftDirY(), xrInput.getLeftDirZ(),
 			vrMenuHitScratch))
@@ -5644,11 +5717,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		boolean inside = planeHit
 			&& vrMenuHitScratch.u >= 0f && vrMenuHitScratch.u <= 1f
 			&& vrMenuHitScratch.v >= 0f && vrMenuHitScratch.v <= 1f;
-		boolean insideCloseMargin = planeHit
-			&& vrMenuHitScratch.u >= -VR_MENU_CLOSE_MARGIN_UV && vrMenuHitScratch.u <= 1f + VR_MENU_CLOSE_MARGIN_UV
-			&& vrMenuHitScratch.v >= -VR_MENU_CLOSE_MARGIN_UV && vrMenuHitScratch.v <= 1f + VR_MENU_CLOSE_MARGIN_UV;
+		boolean outsideCloseMargin = !planeHit
+			|| vrMenuHitScratch.u < -VR_MENU_CLOSE_MARGIN_UV || vrMenuHitScratch.u > 1f + VR_MENU_CLOSE_MARGIN_UV
+			|| vrMenuHitScratch.v < -VR_MENU_CLOSE_MARGIN_UV || vrMenuHitScratch.v > 1f + VR_MENU_CLOSE_MARGIN_UV;
+		if (planeHit)
+		{
+			vrLastMenuPlaneHit = true;
+			vrLastMenuRayU = vrMenuHitScratch.u;
+			vrLastMenuRayV = vrMenuHitScratch.v;
+		}
+		logVrMenuRayDebug(hand, planeHit, inside, outsideCloseMargin);
 
-		boolean rmbPressed = rmb >= 0.7f && prevRmb < 0.7f;
+		boolean lmbDown = hand == VR_HAND_RIGHT ? xrInput.getRightTrigger() >= 0.7f : xrInput.getLeftTrigger() >= 0.7f;
+		boolean rmbDown = hand == VR_HAND_RIGHT ? xrInput.getRightSqueeze() >= 0.7f : xrInput.getLeftSqueeze() >= 0.7f;
+		boolean lmbPressed = lmbDown && (hand == VR_HAND_RIGHT ? prevRightTrigger < 0.7f : prevLeftTrigger < 0.7f);
+		boolean rmbPressed = rmbDown && (hand == VR_HAND_RIGHT ? prevRightSqueeze < 0.7f : prevLeftSqueeze < 0.7f);
 		if (rmbPressed)
 		{
 			cancelVrMenu("RMB");
@@ -5657,16 +5740,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		if (!inside)
 		{
-			if (vrMenuAcquired && !insideCloseMargin)
+			// The ray may start outside; close only when raw UV leaves the [-2.5, 3.5] margin.
+			if (outsideCloseMargin)
 			{
-				cancelVrMenu("ray-leave");
+				cancelVrMenu("ray-leave"
+					+ (planeHit
+						? String.format(" u=%.3f v=%.3f", vrMenuHitScratch.u, vrMenuHitScratch.v)
+						: " no-plane-hit" + formatLastVrMenuUv()));
 			}
 			vrMenuPointerVisible = false;
 			clearVrUiPointerHover();
 			return true;
 		}
 
-		vrMenuAcquired = true;
 		int canvasX = menu.canvasX + Math.max(0, Math.min(menu.width - 1,
 			Math.round(vrMenuHitScratch.u * (menu.width - 1))));
 		int canvasY = menu.canvasY + Math.max(0, Math.min(menu.height - 1,
@@ -5676,24 +5762,94 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vrMenuPointerVisible = true;
 		vrMenuPointerX = canvasX - menu.canvasX;
 		vrMenuPointerY = canvasY - menu.canvasY;
-		vrMenuPointerLmbDown = lmb >= 0.7f;
-		vrMenuPointerRmbDown = rmb >= 0.7f;
+		vrMenuPointerLmbDown = lmbDown;
+		vrMenuPointerRmbDown = rmbDown;
 
-		boolean lmbPressed = lmb >= 0.7f && prevLmb < 0.7f;
 		if (lmbPressed)
 		{
+			String selected = describeVrMenuEntryAt(menu, canvasY);
 			dispatchCanvasMouseClick(canvasX, canvasY, MouseEvent.BUTTON1);
 			setVrDesktopClickMarker(canvasX, canvasY, MouseEvent.BUTTON1);
-			log.info("VR menu LMB dispatch: canvas=({}, {}) uv=({}, {})",
-				canvasX, canvasY,
+			log.info("VR menu LMB dispatch: selected={} canvas=({}, {}) uv=({}, {})",
+				selected, canvasX, canvasY,
 				String.format("%.3f", vrMenuHitScratch.u),
 				String.format("%.3f", vrMenuHitScratch.v));
 		}
 		return true;
 	}
 
+	private void logVrMenuRayDebug(int hand, boolean planeHit, boolean inside, boolean outsideCloseMargin)
+	{
+		long now = System.currentTimeMillis();
+		if (now - vrLastMenuRayDebugLogMs < 300L)
+		{
+			return;
+		}
+		vrLastMenuRayDebugLogMs = now;
+		log.info("VR menu ray: hand={} planeHit={} inside={} outsideCloseMargin={} u={} v={}",
+			hand == VR_HAND_RIGHT ? "right" : hand == VR_HAND_LEFT ? "left" : "none",
+			planeHit, inside, outsideCloseMargin,
+			planeHit ? String.format("%.3f", vrMenuHitScratch.u) : "n/a",
+			planeHit ? String.format("%.3f", vrMenuHitScratch.v) : "n/a");
+	}
+
+	private String formatLastVrMenuUv()
+	{
+		return vrLastMenuPlaneHit
+			? String.format(" lastU=%.3f lastV=%.3f", vrLastMenuRayU, vrLastMenuRayV)
+			: "";
+	}
+
+	private String describeVrMenuEntryAt(VrMenuOverlay menu, int canvasY)
+	{
+		MenuEntry entry = getVrMenuEntryAt(menu, canvasY);
+		if (entry == null)
+		{
+			return "<none>";
+		}
+		return entry.getOption() + " " + entry.getTarget()
+			+ " action=" + entry.getType()
+			+ " p0=" + entry.getParam0()
+			+ " p1=" + entry.getParam1()
+			+ " id=" + entry.getIdentifier()
+			+ " itemId=" + entry.getItemId();
+	}
+
+	private MenuEntry getVrMenuEntryAt(VrMenuOverlay menu, int canvasY)
+	{
+		int localY = canvasY - menu.canvasY;
+		if (localY < VR_MENU_TITLE_HEIGHT_PX)
+		{
+			return null;
+		}
+		MenuEntry[] entries = client.getMenuEntries();
+		if (entries == null || entries.length == 0)
+		{
+			return null;
+		}
+		int displayIndex = (localY - VR_MENU_TITLE_HEIGHT_PX) / VR_MENU_ROW_HEIGHT_PX;
+		int entryIndex = entries.length - 1 - displayIndex;
+		if (entryIndex < 0 || entryIndex >= entries.length)
+		{
+			return null;
+		}
+		return entries[entryIndex];
+	}
+
+	private void updateVrButtonState(float lmb, float rmb)
+	{
+		// Keep combined legacy edges plus per-hand edges in sync at each consumed frame.
+		prevLmb = lmb;
+		prevRmb = rmb;
+		prevLeftTrigger = xrInput.getLeftTrigger();
+		prevRightTrigger = xrInput.getRightTrigger();
+		prevLeftSqueeze = xrInput.getLeftSqueeze();
+		prevRightSqueeze = xrInput.getRightSqueeze();
+	}
+
 	private void cancelVrMenu(String reason)
 	{
+		// Select vanilla Cancel instead of clicking outside, because outside clicks can activate game objects.
 		MenuEntry cancel = findCancelMenuEntry();
 		if (cancel == null)
 		{
@@ -5703,6 +5859,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		client.menuAction(cancel.getParam0(), cancel.getParam1(), cancel.getType(),
 			cancel.getIdentifier(), cancel.getItemId(), cancel.getOption(), cancel.getTarget());
+		vrMenuSuppressCaptureUntilClosed = true;
 		clearVrMenuOverlay();
 		log.info("VR menu cancel: reason={}", reason);
 	}
@@ -5817,7 +5974,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Billboard center in stage coords (anchor + local right/up offsets in metres).
 		float cx = anchorStageX + rx * VR_MENU_OFFSET_XM;
-		float cy = anchorStageY + getVrMenuOffsetYM(menu);
+		float cy = anchorStageY + menu.offsetYM;
 		float cz = anchorStageZ + rz * VR_MENU_OFFSET_XM;
 
 		// VrBillboardRenderer keeps billboards vertical: right is horizontal and up is world-up.
