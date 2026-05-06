@@ -351,10 +351,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_MENU_OFFSET_XM = 0f;
 	private static final float VR_MENU_OFFSET_YM = 0.10f;
 	private static final float VR_MENU_CONTEXT_HINT_GAP_M = 0.035f;
+	private static final float VR_MENU_CLOSE_MARGIN_UV = 0.30f;
 	private static final float VR_HOVER_TARGET_SMOOTHING = 0.35f;
 	private volatile VrMenuOverlay vrMenuOverlay;
 	private volatile float[] vrPendingMenuAnchor;
 	private final VrMenuHit vrMenuHitScratch = new VrMenuHit();
+	private boolean vrMenuAcquired;
+	private String vrMenuInteractionKey;
+	private boolean vrMenuPointerVisible;
+	private int vrMenuPointerX;
+	private int vrMenuPointerY;
+	private boolean vrMenuPointerLmbDown;
+	private boolean vrMenuPointerRmbDown;
 
 	private final RenderCallback vrActorUiCaptureCallback = new RenderCallback()
 	{
@@ -2091,7 +2099,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					vrLeftRayHit != null, vrRightRayHit != null);
 			}
 
-			if (handleVrUiMouse(lmb, rmb))
+			if (!vrUiMousePressed && handleVrMenuMouse(lmb, rmb))
 			{
 				vrPendingHoverRay = null;
 				prevLmb = lmb;
@@ -2099,7 +2107,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				return;
 			}
 
-			if (handleVrMenuMouse(lmb, rmb))
+			if (handleVrUiMouse(lmb, rmb))
 			{
 				vrPendingHoverRay = null;
 				prevLmb = lmb;
@@ -2272,6 +2280,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			log.info("VR UI mouse release: button={} canvas=({}, {})", button, vrUiMouseX, vrUiMouseY);
 		}
 		return true;
+	}
+
+	private void clearVrUiPointerHover()
+	{
+		vrUiPointerVisible = false;
+		if (vrUiMouseInside)
+		{
+			dispatchVrUiMouse(MouseEvent.MOUSE_EXITED, vrUiMouseX, vrUiMouseY, MouseEvent.NOBUTTON, 0, 0);
+			vrUiMouseInside = false;
+		}
 	}
 
 	private void queueVrHoverRay(float[] activeHit)
@@ -4243,6 +4261,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private void clearVrMenuOverlay()
 	{
 		vrMenuOverlay = null;
+		vrMenuAcquired = false;
+		vrMenuInteractionKey = null;
+		vrMenuPointerVisible = false;
 	}
 
 	private void captureVrMenuOverlayFromTopDraw()
@@ -4266,6 +4287,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		int[] pixels = copyVrActorUiCrop(client.getBufferProvider(), crop);
 		forceOpaqueAlpha(pixels);
+		String interactionKey = crop.x + "," + crop.y + "," + crop.width + "," + crop.height;
+		if (!interactionKey.equals(vrMenuInteractionKey))
+		{
+			vrMenuAcquired = false;
+			vrMenuInteractionKey = interactionKey;
+			vrMenuPointerVisible = false;
+		}
+		if (vrMenuPointerVisible)
+		{
+			drawVrMenuPointer(pixels, crop.width, crop.height,
+				vrMenuPointerX, vrMenuPointerY, vrMenuPointerLmbDown, vrMenuPointerRmbDown);
+		}
 
 		VrMenuOverlay existing = vrMenuOverlay;
 		float[] pending = vrPendingMenuAnchor;
@@ -5592,32 +5625,59 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return false;
 		}
 
-		boolean hit = false;
-		if (xrInput.isRightActive() && raycastVrMenu(menu,
+		boolean planeHit = false;
+		if (xrInput.isRightActive() && intersectVrMenuPlane(menu,
 			xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
 			xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ(),
 			vrMenuHitScratch))
 		{
-			hit = true;
+			planeHit = true;
 		}
-		else if (xrInput.isLeftActive() && raycastVrMenu(menu,
+		else if (xrInput.isLeftActive() && intersectVrMenuPlane(menu,
 			xrInput.getLeftPosX(), xrInput.getLeftPosY(), xrInput.getLeftPosZ(),
 			xrInput.getLeftDirX(), xrInput.getLeftDirY(), xrInput.getLeftDirZ(),
 			vrMenuHitScratch))
 		{
-			hit = true;
+			planeHit = true;
 		}
 
-		if (!hit)
+		boolean inside = planeHit
+			&& vrMenuHitScratch.u >= 0f && vrMenuHitScratch.u <= 1f
+			&& vrMenuHitScratch.v >= 0f && vrMenuHitScratch.v <= 1f;
+		boolean insideCloseMargin = planeHit
+			&& vrMenuHitScratch.u >= -VR_MENU_CLOSE_MARGIN_UV && vrMenuHitScratch.u <= 1f + VR_MENU_CLOSE_MARGIN_UV
+			&& vrMenuHitScratch.v >= -VR_MENU_CLOSE_MARGIN_UV && vrMenuHitScratch.v <= 1f + VR_MENU_CLOSE_MARGIN_UV;
+
+		boolean rmbPressed = rmb >= 0.7f && prevRmb < 0.7f;
+		if (rmbPressed)
 		{
-			return false;
+			cancelVrMenu("RMB");
+			return true;
 		}
 
+		if (!inside)
+		{
+			if (vrMenuAcquired && !insideCloseMargin)
+			{
+				cancelVrMenu("ray-leave");
+			}
+			vrMenuPointerVisible = false;
+			clearVrUiPointerHover();
+			return true;
+		}
+
+		vrMenuAcquired = true;
 		int canvasX = menu.canvasX + Math.max(0, Math.min(menu.width - 1,
 			Math.round(vrMenuHitScratch.u * (menu.width - 1))));
 		int canvasY = menu.canvasY + Math.max(0, Math.min(menu.height - 1,
 			Math.round(vrMenuHitScratch.v * (menu.height - 1))));
 		primeCanvasMouseForWalk(canvasX, canvasY);
+		clearVrUiPointerHover();
+		vrMenuPointerVisible = true;
+		vrMenuPointerX = canvasX - menu.canvasX;
+		vrMenuPointerY = canvasY - menu.canvasY;
+		vrMenuPointerLmbDown = lmb >= 0.7f;
+		vrMenuPointerRmbDown = rmb >= 0.7f;
 
 		boolean lmbPressed = lmb >= 0.7f && prevLmb < 0.7f;
 		if (lmbPressed)
@@ -5632,7 +5692,70 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return true;
 	}
 
-	private boolean raycastVrMenu(VrMenuOverlay menu,
+	private void cancelVrMenu(String reason)
+	{
+		MenuEntry cancel = findCancelMenuEntry();
+		if (cancel == null)
+		{
+			log.info("VR menu cancel skipped ({}): no Cancel entry", reason);
+			return;
+		}
+
+		client.menuAction(cancel.getParam0(), cancel.getParam1(), cancel.getType(),
+			cancel.getIdentifier(), cancel.getItemId(), cancel.getOption(), cancel.getTarget());
+		clearVrMenuOverlay();
+		log.info("VR menu cancel: reason={}", reason);
+	}
+
+	private MenuEntry findCancelMenuEntry()
+	{
+		MenuEntry[] entries = client.getMenuEntries();
+		if (entries == null)
+		{
+			return null;
+		}
+		for (MenuEntry entry : entries)
+		{
+			if (entry != null && entry.getType() == MenuAction.CANCEL)
+			{
+				return entry;
+			}
+		}
+		return null;
+	}
+
+	private static void drawVrMenuPointer(int[] pixels, int width, int height, int x, int y, boolean lmbDown, boolean rmbDown)
+	{
+		int color = rmbDown ? 0xffff3028 : lmbDown ? 0xffffcc20 : 0xffffffff;
+		int shadow = 0xff000000;
+		drawVrMenuPointerLine(pixels, width, height, x - 4, y, x + 4, y, shadow);
+		drawVrMenuPointerLine(pixels, width, height, x, y - 4, x, y + 4, shadow);
+		drawVrMenuPointerLine(pixels, width, height, x - 3, y, x + 3, y, color);
+		drawVrMenuPointerLine(pixels, width, height, x, y - 3, x, y + 3, color);
+	}
+
+	private static void drawVrMenuPointerLine(int[] pixels, int width, int height, int x0, int y0, int x1, int y1, int color)
+	{
+		int dx = Integer.compare(x1, x0);
+		int dy = Integer.compare(y1, y0);
+		int x = x0;
+		int y = y0;
+		while (true)
+		{
+			if (x >= 0 && x < width && y >= 0 && y < height)
+			{
+				pixels[y * width + x] = color;
+			}
+			if (x == x1 && y == y1)
+			{
+				break;
+			}
+			x += dx;
+			y += dy;
+		}
+	}
+
+	private boolean intersectVrMenuPlane(VrMenuOverlay menu,
 		float ox, float oy, float oz,
 		float dx, float dy, float dz,
 		VrMenuHit out)
@@ -5697,8 +5820,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float cy = anchorStageY + getVrMenuOffsetYM(menu);
 		float cz = anchorStageZ + rz * VR_MENU_OFFSET_XM;
 
-		// Plane normal = facing toward eye (use fx,fy,fz from anchor).
-		float nx = fx, ny = fy, nz = fz;
+		// VrBillboardRenderer keeps billboards vertical: right is horizontal and up is world-up.
+		// Use that same vertical plane here; otherwise the ray hits a tilted plane that is not visible.
+		float nx = -rz, ny = 0f, nz = rx;
 		float denom = dx * nx + dy * ny + dz * nz;
 		if (Math.abs(denom) < 1e-6f)
 		{
@@ -5718,10 +5842,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		float halfW = menu.widthMeters * 0.5f;
 		float halfH = menu.heightMeters * 0.5f;
-		if (lx < -halfW || lx > halfW || ly < -halfH || ly > halfH)
-		{
-			return false;
-		}
 
 		// putQuadVertex uses xMul=-0.5 → vertex is +rx*(-widthM/2) i.e. localX is added with sign…
 		// But the renderer expands quad with xMul ∈ [-0.5, 0.5], so vertex stage_dx = rx*(offsetXM + xMul*widthM).
@@ -5732,8 +5852,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// So yMul=+0.5 → v=0 (top). ly increases with yMul (up=+y), so v=0 at top means v = 1 - (ly+halfH)/heightM.
 		float v = 1f - (ly + halfH) / menu.heightMeters;
 
-		out.u = Math.max(0f, Math.min(1f, u));
-		out.v = Math.max(0f, Math.min(1f, v));
+		out.u = u;
+		out.v = v;
 		out.t = t;
 		return true;
 	}

@@ -13,8 +13,8 @@ We are building a RuneLite VR GPU plugin: OpenXR stereo rendering for the 3D wor
 3. **3D scene geometry**
    The OSRS scene is rendered by `VrGpuPlugin` through `DrawCallbacks`, using OpenGL shaders, VAOs/VBOs, zones, dynamic models, and per-eye VR projection.
 
-4. **Canvas-cropped billboards**
-   Special 2D UI is cropped from the already-rendered canvas, not from `addEntity`. Current examples are context hints and right-click menus. These are then shown as world-anchored billboards.
+4. **World-anchored UI billboards**
+   Special 2D UI is shown as world-anchored billboards, not through `addEntity`. Context hints are self-rendered from the top live vanilla `MenuEntry`; right-click menus are cropped from the already-rendered vanilla canvas.
 
 ## Main VR Files
 
