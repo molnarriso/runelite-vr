@@ -270,6 +270,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private float[] vrLastClickRay;
 	/** Persistent ground-hit marker [x,y,z]. */
 	private float[] vrLastGroundHit;
+	/** Persistent first scene raycast hit [x,y,z] from the last VR click. */
+	private float[] vrLastSceneRaycastHit;
+	/** Live hover scene/ground hits resolved by VrInteraction on the client thread. */
+	private volatile float[] vrInteractionHoverSceneHit;
+	private volatile float[] vrInteractionHoverGroundHit;
+	private volatile long vrInteractionHoverDebugTimeMs;
 	/** Persistent reconstructed desktop screen-ray ground hit [x,y,z]. */
 	private float[] vrLastDesktopRayHit;
 	/** Persistent desktop-camera aim target [x,y,z] in GPU convention for diagnostics. */
@@ -355,6 +361,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_MENU_OFFSET_YM = 0.10f;
 	private static final float VR_MENU_CONTEXT_HINT_GAP_M = 0.035f;
 	private static final float VR_MENU_CLOSE_MARGIN_UV = 2.50f;
+	private static final int VR_MENU_CAPTURE_ZONE_COLOR = 0x55a0a0a0;
+	private static final int[] VR_MENU_CAPTURE_ZONE_PIXEL = new int[]{VR_MENU_CAPTURE_ZONE_COLOR};
 	private static final int VR_MENU_TITLE_HEIGHT_PX = 19;
 	private static final int VR_MENU_ROW_HEIGHT_PX = 15;
 	private static final float VR_HOVER_TARGET_SMOOTHING = 0.35f;
@@ -376,6 +384,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private float vrLastMenuRayU;
 	private float vrLastMenuRayV;
 	private long vrLastMenuCaptureSuppressedLogMs;
+	private int vrMenuOpenUvDebugFrames;
 	// Per-hand edges are needed so the non-owner controller cannot steal menu actions.
 	private float prevLeftTrigger;
 	private float prevRightTrigger;
@@ -1826,18 +1835,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			float oy2 = camY - (py - oy) / s;
 			float oz2 = camZ + (pz - oz) / s;
 
-			float[] hit = (ci == 0) ? leftHit : rightHit;
-			float ex, ey, ez;
-			if (hit != null)
-			{
-				ex = hit[0]; ey = hit[1]; ez = hit[2];
-			}
-			else
-			{
-				ex = camX - (px + dx * RAY_M) / s;
-				ey = camY - ((py + dy * RAY_M) - oy) / s;
-				ez = camZ + ((pz + dz * RAY_M) - oz) / s;
-			}
+			// Draw the visible ray from the same raw controller pose/direction used by menu UV hit-testing.
+			// Depth-buffer hits are only shown as separate endpoint markers because reconstruction can drift.
+			float ex = camX - (px + dx * RAY_M) / s;
+			float ey = camY - ((py + dy * RAY_M) - oy) / s;
+			float ez = camZ + ((pz + dz * RAY_M) - oz) / s;
 
 			debugRayFb.put(ox2).put(oy2).put(oz2).put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
 			debugRayFb.put(ex) .put(ey) .put(ez) .put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
@@ -1871,6 +1873,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				debugRayFb.put(gx + SMALL).put(gy).put(gz        ).put(1f).put(1f).put(0f).put(1f);
 				debugRayFb.put(gx        ).put(gy).put(gz - SMALL).put(1f).put(1f).put(0f).put(1f);
 				debugRayFb.put(gx        ).put(gy).put(gz + SMALL).put(1f).put(1f).put(0f).put(1f);
+			}
+
+			if (vrLastSceneRaycastHit != null)
+			{
+				// Pink = first semantic/object hit VrInteraction saw for the last click.
+				putDebugCross(vrLastSceneRaycastHit, BIG * 0.75f, 1f, 0.1f, 0.9f, 1f);
 			}
 
 			if (vrDesktopCameraAimTarget != null)
@@ -1956,8 +1964,31 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		}
 
+		if (System.currentTimeMillis() - vrInteractionHoverDebugTimeMs <= VR_CONTEXT_HINT_STALE_MS)
+		{
+			// Magenta = live first semantic/object hit; green = live intersectGround result.
+			putDebugCross(vrInteractionHoverSceneHit, 90f, 1f, 0f, 1f, 1f);
+			putDebugCross(vrInteractionHoverGroundHit, 70f, 0.2f, 1f, 0.2f, 1f);
+		}
+
 		debugRayFb.flip();
 		return debugRayFb.limit();
+	}
+
+	private void putDebugCross(float[] point, float size, float r, float g, float b, float a)
+	{
+		if (point == null)
+		{
+			return;
+		}
+
+		float x = point[0], y = point[1], z = point[2];
+		debugRayFb.put(x - size).put(y).put(z).put(r).put(g).put(b).put(a);
+		debugRayFb.put(x + size).put(y).put(z).put(r).put(g).put(b).put(a);
+		debugRayFb.put(x).put(y - size).put(z).put(r).put(g).put(b).put(a);
+		debugRayFb.put(x).put(y + size).put(z).put(r).put(g).put(b).put(a);
+		debugRayFb.put(x).put(y).put(z - size).put(r).put(g).put(b).put(a);
+		debugRayFb.put(x).put(y).put(z + size).put(r).put(g).put(b).put(a);
 	}
 
 	/**
@@ -2061,6 +2092,139 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return new float[]{osrsX, osrsY, osrsZ};
 	}
 
+	private void updateControllerRayInput()
+	{
+		if (xrInput == null || Float.isNaN(vrWorldAnchorY)) return;
+		if (!xrInput.isLeftActive() && !xrInput.isRightActive()) return;
+
+		// Sample against the freshly-rendered right-eye scene depth before the late UI pass.
+		vrLeftRayHit  = xrInput.isLeftActive()  ? sampleDepthAtRay(1,
+			xrInput.getLeftPosX(),  xrInput.getLeftPosY(),  xrInput.getLeftPosZ(),
+			xrInput.getLeftDirX(),  xrInput.getLeftDirY(),  xrInput.getLeftDirZ()) : null;
+		vrRightRayHit = xrInput.isRightActive() ? sampleDepthAtRay(1,
+			xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
+			xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ()) : null;
+
+		float lmb = Math.max(xrInput.getLeftTrigger(),  xrInput.getRightTrigger());
+		float rmb = Math.max(xrInput.getLeftSqueeze(),  xrInput.getRightSqueeze());
+
+		// Diagnostic: log when any button crosses 30%
+		if ((lmb > 0.3f && prevLmb <= 0.3f) || (rmb > 0.3f && prevRmb <= 0.3f))
+		{
+			log.info("VR input: lt={} rt={} ls={} rs={} leftHit={} rightHit={}",
+				xrInput.getLeftTrigger(), xrInput.getRightTrigger(),
+				xrInput.getLeftSqueeze(), xrInput.getRightSqueeze(),
+				vrLeftRayHit != null, vrRightRayHit != null);
+		}
+
+		if (!vrUiMousePressed && handleVrMenuMouse(lmb, rmb))
+		{
+			vrPendingHoverRay = null;
+			updateVrButtonState(lmb, rmb);
+			return;
+		}
+
+		if (handleVrUiMouse(lmb, rmb))
+		{
+			vrPendingHoverRay = null;
+			updateVrButtonState(lmb, rmb);
+			return;
+		}
+
+		// Prefer the hand that just pressed; fall back to any valid hit.
+		float[] activeHit = null;
+		boolean leftTriggerDown = xrInput.getLeftTrigger() >= 0.7f;
+		boolean rightTriggerDown = xrInput.getRightTrigger() >= 0.7f;
+		boolean leftSqueezeDown = xrInput.getLeftSqueeze() >= 0.7f;
+		boolean rightSqueezeDown = xrInput.getRightSqueeze() >= 0.7f;
+		boolean leftTriggerPressed = leftTriggerDown && prevLeftTrigger < 0.7f;
+		boolean rightTriggerPressed = rightTriggerDown && prevRightTrigger < 0.7f;
+		boolean leftSqueezePressed = leftSqueezeDown && prevLeftSqueeze < 0.7f;
+		boolean rightSqueezePressed = rightSqueezeDown && prevRightSqueeze < 0.7f;
+		if (rightTriggerPressed || rightSqueezePressed)
+			activeHit = vrRightRayHit;
+		if (activeHit == null && (leftTriggerPressed || leftSqueezePressed))
+			activeHit = vrLeftRayHit;
+		if (activeHit == null && (rightTriggerDown || rightSqueezeDown))
+			activeHit = vrRightRayHit;
+		if (activeHit == null && (leftTriggerDown || leftSqueezeDown))
+			activeHit = vrLeftRayHit;
+		if (activeHit == null)
+			activeHit = vrRightRayHit != null ? vrRightRayHit : vrLeftRayHit;
+
+		queueVrHoverRay(activeHit);
+
+		if (activeHit != null)
+		{
+			boolean isLmb = leftTriggerPressed || rightTriggerPressed;
+			boolean isRmb = leftSqueezePressed || rightSqueezePressed;
+			if (isLmb || isRmb)
+			{
+				int btn = isLmb ? MouseEvent.BUTTON1 : MouseEvent.BUTTON3;
+				int pressedHand = rightTriggerPressed || rightSqueezePressed ? VR_HAND_RIGHT : VR_HAND_LEFT;
+				if (isRmb)
+				{
+					vrMenuControllerHand = pressedHand;
+				}
+				vrPendingClickHit = activeHit.clone();
+				vrPendingClickButton = btn;
+				vrLastClickHit = activeHit.clone();
+				vrLastClickButton = btn;
+				vrLastClickTimeMs = System.currentTimeMillis();
+
+				// Compute OSRS-space ray from the active controller for client-thread raycast.
+				boolean useRight = pressedHand == VR_HAND_RIGHT;
+				float spx, spy, spz, sdx, sdy, sdz;
+				if (useRight || !xrInput.isLeftActive())
+				{
+					spx = xrInput.getRightPosX(); spy = xrInput.getRightPosY(); spz = xrInput.getRightPosZ();
+					sdx = xrInput.getRightDirX(); sdy = xrInput.getRightDirY(); sdz = xrInput.getRightDirZ();
+				}
+				else
+				{
+					spx = xrInput.getLeftPosX(); spy = xrInput.getLeftPosY(); spz = xrInput.getLeftPosZ();
+					sdx = xrInput.getLeftDirX(); sdy = xrInput.getLeftDirY(); sdz = xrInput.getLeftDirZ();
+				}
+				final float s = DEFAULT_WORLD_SCALE;
+				float anchorWorldX = getVrAnchorWorldX();
+				float anchorWorldY = getVrAnchorWorldY();
+				float anchorWorldZ = getVrAnchorWorldZ();
+				float rox = anchorWorldX - spx / s;
+				float roy = anchorWorldY - (spy - vrWorldAnchorY) / s;
+				float roz = anchorWorldZ + (spz - VR_STAGE_CHARACTER_OFFSET_Z) / s;
+				float rdx;
+				float rdy;
+				float rdz;
+				// First diagnostic fix: derive the click ray from the visual depth hit.
+				// This keeps the client-thread ray aligned with the ray the user actually sees.
+				rdx = activeHit[0] - rox;
+				rdy = activeHit[1] - roy;
+				rdz = activeHit[2] - roz;
+				float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+				if (len > 1e-6f)
+				{
+					rdx /= len;
+					rdy /= len;
+					rdz /= len;
+				}
+				else
+				{
+					rdx = -sdx;
+					rdy = -sdy;
+					rdz = sdz;
+				}
+				vrPendingClickRay = new float[]{rox, roy, roz, rdx, rdy, rdz};
+				vrLastClickRay = vrPendingClickRay.clone();
+				log.info("VR {} triggered: depth=({},{},{}) stageDir=({},{},{}) clickDir=({},{},{})",
+					isLmb ? "LMB" : "RMB",
+					activeHit[0], activeHit[1], activeHit[2],
+					-sdx, -sdy, sdz,
+					rdx, rdy, rdz);
+			}
+		}
+		updateVrButtonState(lmb, rmb);
+	}
+
 	/**
 	 * Draw controller aim rays for the given eye using the debug line shader.
 	 * Must be called with blend/cull/depth already disabled.
@@ -2069,17 +2233,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		if (xrInput == null || Float.isNaN(vrWorldAnchorY)) return;
 		if (!xrInput.isLeftActive() && !xrInput.isRightActive()) return;
-
-		// Sample depth buffer on eye=1 (right eye FBO bound, fresh scene depth).
-		if (eye == 1)
-		{
-			vrLeftRayHit  = xrInput.isLeftActive()  ? sampleDepthAtRay(1,
-				xrInput.getLeftPosX(),  xrInput.getLeftPosY(),  xrInput.getLeftPosZ(),
-				xrInput.getLeftDirX(),  xrInput.getLeftDirY(),  xrInput.getLeftDirZ()) : null;
-			vrRightRayHit = xrInput.isRightActive() ? sampleDepthAtRay(1,
-				xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
-				xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ()) : null;
-		}
 
 		int n = buildDebugRayVerts(vrLeftRayHit, vrRightRayHit);
 		if (n == 0) return;
@@ -2102,140 +2255,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glBindVertexArray(0);
 		glUseProgram(glProgram);
-
-		// Rising-edge click detection — runs once per frame on eye=1.
-		// Either trigger (LMB) or either squeeze (RMB) at the right-controller ray position.
-		if (eye == 1)
-		{
-			float lmb = Math.max(xrInput.getLeftTrigger(),  xrInput.getRightTrigger());
-			float rmb = Math.max(xrInput.getLeftSqueeze(),  xrInput.getRightSqueeze());
-
-			// Diagnostic: log when any button crosses 30%
-			if ((lmb > 0.3f && prevLmb <= 0.3f) || (rmb > 0.3f && prevRmb <= 0.3f))
-			{
-				log.info("VR input: lt={} rt={} ls={} rs={} leftHit={} rightHit={}",
-					xrInput.getLeftTrigger(), xrInput.getRightTrigger(),
-					xrInput.getLeftSqueeze(), xrInput.getRightSqueeze(),
-					vrLeftRayHit != null, vrRightRayHit != null);
-			}
-
-			if (!vrUiMousePressed && handleVrMenuMouse(lmb, rmb))
-			{
-				vrPendingHoverRay = null;
-				updateVrButtonState(lmb, rmb);
-				return;
-			}
-
-			if (handleVrUiMouse(lmb, rmb))
-			{
-				vrPendingHoverRay = null;
-				updateVrButtonState(lmb, rmb);
-				return;
-			}
-
-			// Prefer the hand that just pressed; fall back to any valid hit.
-			float[] activeHit = null;
-			boolean leftTriggerDown = xrInput.getLeftTrigger() >= 0.7f;
-			boolean rightTriggerDown = xrInput.getRightTrigger() >= 0.7f;
-			boolean leftSqueezeDown = xrInput.getLeftSqueeze() >= 0.7f;
-			boolean rightSqueezeDown = xrInput.getRightSqueeze() >= 0.7f;
-			boolean leftTriggerPressed = leftTriggerDown && prevLeftTrigger < 0.7f;
-			boolean rightTriggerPressed = rightTriggerDown && prevRightTrigger < 0.7f;
-			boolean leftSqueezePressed = leftSqueezeDown && prevLeftSqueeze < 0.7f;
-			boolean rightSqueezePressed = rightSqueezeDown && prevRightSqueeze < 0.7f;
-			if (rightTriggerPressed || rightSqueezePressed)
-				activeHit = vrRightRayHit;
-			if (activeHit == null && (leftTriggerPressed || leftSqueezePressed))
-				activeHit = vrLeftRayHit;
-			if (activeHit == null && (rightTriggerDown || rightSqueezeDown))
-				activeHit = vrRightRayHit;
-			if (activeHit == null && (leftTriggerDown || leftSqueezeDown))
-				activeHit = vrLeftRayHit;
-			if (activeHit == null)
-				activeHit = vrRightRayHit != null ? vrRightRayHit : vrLeftRayHit;
-
-			queueVrHoverRay(activeHit);
-
-			if (activeHit != null)
-			{
-				boolean isLmb = leftTriggerPressed || rightTriggerPressed;
-				boolean isRmb = leftSqueezePressed || rightSqueezePressed;
-				if (isLmb || isRmb)
-				{
-					int btn = isLmb ? MouseEvent.BUTTON1 : MouseEvent.BUTTON3;
-					int pressedHand = rightTriggerPressed || rightSqueezePressed ? VR_HAND_RIGHT : VR_HAND_LEFT;
-					if (isRmb)
-					{
-						vrMenuControllerHand = pressedHand;
-					}
-					vrPendingClickHit = activeHit.clone();
-					vrPendingClickButton = btn;
-					vrLastClickHit = activeHit.clone();
-					vrLastClickButton = btn;
-					vrLastClickTimeMs = System.currentTimeMillis();
-
-					// Compute OSRS-space ray from the active controller for client-thread raycast.
-					boolean useRight = pressedHand == VR_HAND_RIGHT;
-					float spx, spy, spz, sdx, sdy, sdz;
-					if (useRight || !xrInput.isLeftActive())
-					{
-						spx = xrInput.getRightPosX(); spy = xrInput.getRightPosY(); spz = xrInput.getRightPosZ();
-						sdx = xrInput.getRightDirX(); sdy = xrInput.getRightDirY(); sdz = xrInput.getRightDirZ();
-					}
-					else
-					{
-						spx = xrInput.getLeftPosX(); spy = xrInput.getLeftPosY(); spz = xrInput.getLeftPosZ();
-						sdx = xrInput.getLeftDirX(); sdy = xrInput.getLeftDirY(); sdz = xrInput.getLeftDirZ();
-					}
-					final float s = DEFAULT_WORLD_SCALE;
-					float anchorWorldX = getVrAnchorWorldX();
-					float anchorWorldY = getVrAnchorWorldY();
-					float anchorWorldZ = getVrAnchorWorldZ();
-					float rox = anchorWorldX - spx / s;
-					float roy = anchorWorldY - (spy - vrWorldAnchorY) / s;
-					float roz = anchorWorldZ + (spz - VR_STAGE_CHARACTER_OFFSET_Z) / s;
-					float rdx;
-					float rdy;
-					float rdz;
-					if (activeHit != null)
-					{
-						// First diagnostic fix: derive the click ray from the visual depth hit.
-						// This keeps the client-thread ray aligned with the ray the user actually sees.
-						rdx = activeHit[0] - rox;
-						rdy = activeHit[1] - roy;
-						rdz = activeHit[2] - roz;
-						float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
-						if (len > 1e-6f)
-						{
-							rdx /= len;
-							rdy /= len;
-							rdz /= len;
-						}
-						else
-						{
-							rdx = -sdx;
-							rdy = -sdy;
-							rdz = sdz;
-						}
-					}
-					else
-					{
-						// Y is flipped: OSRS Y increases downward, stage Y increases upward.
-						rdx = -sdx;
-						rdy = -sdy;
-						rdz = sdz;
-					}
-					vrPendingClickRay = new float[]{rox, roy, roz, rdx, rdy, rdz};
-					vrLastClickRay = vrPendingClickRay.clone();
-					log.info("VR {} triggered: depth=({},{},{}) stageDir=({},{},{}) clickDir=({},{},{})",
-						isLmb ? "LMB" : "RMB",
-						activeHit[0], activeHit[1], activeHit[2],
-						-sdx, -sdy, sdz,
-						rdx, rdy, rdz);
-				}
-			}
-			updateVrButtonState(lmb, rmb);
-		}
 	}
 
 	private boolean handleVrUiMouse(float lmb, float rmb)
@@ -2781,9 +2800,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		if (xrFrameStarted)
 		{
-			// Draw controller rays over left eye (state: blend/cull/depth already disabled).
-			drawDebugRays(0);
-
 			// Render a true desktop spectator pass from the vanilla/staged desktop camera
 			// instead of mirroring the left eye. This lets us validate staged WALK clicks
 			// against the same screen-space view the client consumes.
@@ -2805,9 +2821,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glDisable(GL_CULL_FACE);
 			glDisable(GL_DEPTH_TEST);
 
-			// Draw controller rays over right eye. The swapchain images stay acquired
-			// until draw(), where the late VR UI pass has access to the canvas texture.
-			drawDebugRays(1);
+			// Sample controller ray hits and process input before the late UI pass draws over the scene.
+			updateControllerRayInput();
 			vrRightEyeFbo = rightFbo;
 			currentEye = -1;
 
@@ -3403,6 +3418,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		vrHoverTarget = null;
 		vrHoverMarkerColor = new float[]{0.95f, 0.82f, 0.12f};
+		clearInteractionHoverDebug();
 	}
 
 	void setHoverTarget(float x, float y, float z, long timeMs)
@@ -3437,6 +3453,32 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	void setLastGroundHit(VrInteraction.GroundHit groundHit)
 	{
 		vrLastGroundHit = groundHit == null ? null : new float[]{groundHit.x, groundHit.y, groundHit.z};
+	}
+
+	void setLastSceneRaycastHit(VrInteraction.Hit hit, float ox, float oy, float oz, float dx, float dy, float dz)
+	{
+		vrLastSceneRaycastHit = hit == null ? null : pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
+	}
+
+	void setInteractionHoverDebug(VrInteraction.Hit hit, VrInteraction.GroundHit groundHit,
+		float ox, float oy, float oz, float dx, float dy, float dz, long timeMs)
+	{
+		// These markers show exactly what VrInteraction resolved on the client thread.
+		vrInteractionHoverSceneHit = hit == null ? null : pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
+		vrInteractionHoverGroundHit = groundHit == null ? null : new float[]{groundHit.x, groundHit.y, groundHit.z};
+		vrInteractionHoverDebugTimeMs = timeMs;
+	}
+
+	void clearInteractionHoverDebug()
+	{
+		vrInteractionHoverSceneHit = null;
+		vrInteractionHoverGroundHit = null;
+		vrInteractionHoverDebugTimeMs = 0L;
+	}
+
+	private static float[] pointOnRay(float ox, float oy, float oz, float dx, float dy, float dz, float t)
+	{
+		return new float[]{ox + dx * t, oy + dy * t, oz + dz * t};
 	}
 
 	void clearWalkDiagnosticsForDispatch(int sceneX, int sceneY)
@@ -3800,8 +3842,26 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		drawVrActorOverlays(0, vrLeftEyeFbo);
 		drawVrActorOverlays(1, vrRightEyeFbo);
+		drawVrControllerRays(0, vrLeftEyeFbo);
+		drawVrControllerRays(1, vrRightEyeFbo);
 
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+	}
+
+	private void drawVrControllerRays(int eye, int framebuffer)
+	{
+		if (!xrFrameStarted || xrContext == null || eyeSwapchains == null || framebuffer == -1)
+		{
+			return;
+		}
+
+		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+		glViewport(0, 0, eyeSwapchains[eye].getWidth(), eyeSwapchains[eye].getHeight());
+		glDisable(GL_BLEND);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
+		// Draw after VR UI/billboards so the controller ray remains visible on menu surfaces.
+		drawDebugRays(eye);
 	}
 
 	private void drawVrActorOverlays(int eye, int framebuffer)
@@ -4257,6 +4317,18 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		VrMenuOverlay menu = vrMenuOverlay;
 		if (menu != null && System.currentTimeMillis() - menu.timeMs <= VR_MENU_STALE_MS)
 		{
+			float captureScale = 1f + VR_MENU_CLOSE_MARGIN_UV * 2f;
+			vrBillboards.addImage(
+				menu.anchorX,
+				menu.anchorY,
+				menu.anchorZ,
+				menu.widthMeters * captureScale,
+				menu.heightMeters * captureScale,
+				VR_MENU_OFFSET_XM,
+				menu.offsetYM,
+				VR_MENU_CAPTURE_ZONE_PIXEL,
+				1,
+				1);
 			vrBillboards.addImage(
 				menu.anchorX,
 				menu.anchorY,
@@ -5667,6 +5739,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		// Consumed by the next top-draw menu capture after the RMB desktop click opens vanilla menu.
 		vrMenuSuppressCaptureUntilClosed = false;
+		vrMenuOpenUvDebugFrames = 5;
 		vrPendingMenuAnchor = new float[]{x, y, z};
 	}
 
@@ -5727,6 +5800,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrLastMenuRayV = vrMenuHitScratch.v;
 		}
 		logVrMenuRayDebug(hand, planeHit, inside, outsideCloseMargin);
+		logVrMenuOpenUvDebug(hand, planeHit, inside, outsideCloseMargin);
 
 		boolean lmbDown = hand == VR_HAND_RIGHT ? xrInput.getRightTrigger() >= 0.7f : xrInput.getLeftTrigger() >= 0.7f;
 		boolean rmbDown = hand == VR_HAND_RIGHT ? xrInput.getRightSqueeze() >= 0.7f : xrInput.getLeftSqueeze() >= 0.7f;
@@ -5791,6 +5865,26 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			planeHit, inside, outsideCloseMargin,
 			planeHit ? String.format("%.3f", vrMenuHitScratch.u) : "n/a",
 			planeHit ? String.format("%.3f", vrMenuHitScratch.v) : "n/a");
+	}
+
+	private void logVrMenuOpenUvDebug(int hand, boolean planeHit, boolean inside, boolean outsideCloseMargin)
+	{
+		if (vrMenuOpenUvDebugFrames <= 0)
+		{
+			return;
+		}
+		vrMenuOpenUvDebugFrames--;
+		VrMenuOverlay menu = vrMenuOverlay;
+		log.info("VR menu open UV frame {}: hand={} planeHit={} inside={} outsideCloseMargin={} u={} v={} menuRect=({}, {}) {}x{}",
+			5 - vrMenuOpenUvDebugFrames,
+			hand == VR_HAND_RIGHT ? "right" : hand == VR_HAND_LEFT ? "left" : "none",
+			planeHit, inside, outsideCloseMargin,
+			planeHit ? String.format("%.3f", vrMenuHitScratch.u) : "n/a",
+			planeHit ? String.format("%.3f", vrMenuHitScratch.v) : "n/a",
+			menu != null ? menu.canvasX : -1,
+			menu != null ? menu.canvasY : -1,
+			menu != null ? menu.width : -1,
+			menu != null ? menu.height : -1);
 	}
 
 	private String formatLastVrMenuUv()
@@ -6089,7 +6183,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		dirY /= len;
 		dirZ /= len;
 
-		VrInteraction.GroundHit desktopGroundHit = vrSceneRaycaster.intersectGround(originX, originY, originZ, dirX, dirY, dirZ, wv, null);
+		VrInteraction.GroundHit desktopGroundHit = vrSceneRaycaster.intersectGround(originX, originY, originZ, dirX, dirY, dirZ, wv);
 		if (desktopGroundHit == null)
 		{
 			return null;

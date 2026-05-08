@@ -182,7 +182,7 @@ final class VrSceneRaycaster
 		return hits;
 	}
 
-	VrInteraction.GroundHit intersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv, float[] fallbackHit)
+	VrInteraction.GroundHit intersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv)
 	{
 		VrInteraction.GroundHit best = null;
 		Tile[][][] tiles = wv.getScene().getTiles();
@@ -208,17 +208,6 @@ final class VrSceneRaycaster
 			}
 		}
 
-		if (best == null && fallbackHit != null)
-		{
-			VrInteraction.GroundHit fallback = new VrInteraction.GroundHit();
-			fallback.x = fallbackHit[0];
-			fallback.y = fallbackHit[1];
-			fallback.z = fallbackHit[2];
-			fallback.sceneX = clampScene((int) fallbackHit[0] >> 7, wv.getSizeX());
-			fallback.sceneY = clampScene((int) fallbackHit[2] >> 7, wv.getSizeY());
-			fallback.t = distanceAlongRay(ox, oy, oz, dx, dy, dz, fallback.x, fallback.y, fallback.z);
-			best = fallback;
-		}
 		return best;
 	}
 
