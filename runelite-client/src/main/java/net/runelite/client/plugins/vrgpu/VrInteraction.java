@@ -4,6 +4,8 @@
  */
 package net.runelite.client.plugins.vrgpu;
 
+import java.awt.Rectangle;
+import java.awt.Shape;
 import java.awt.event.MouseEvent;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
@@ -12,29 +14,23 @@ import net.runelite.api.Constants;
 import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
 import net.runelite.api.GroundObject;
+import net.runelite.api.ItemLayer;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
-import net.runelite.api.Model;
+import net.runelite.api.Node;
 import net.runelite.api.NPC;
-import net.runelite.api.Perspective;
 import net.runelite.api.Player;
-import net.runelite.api.Projection;
-import net.runelite.api.Renderable;
 import net.runelite.api.Scene;
 import net.runelite.api.Tile;
+import net.runelite.api.TileItem;
 import net.runelite.api.TileObject;
 import net.runelite.api.WallObject;
 import net.runelite.api.WorldView;
-import net.runelite.api.coords.LocalPoint;
 
 @Slf4j
 final class VrInteraction
 {
-	private static final boolean VR_CHECK_CLICKBOX_DEBUG = true;
-	private static final long VR_CHECK_CLICKBOX_DEBUG_INTERVAL_MS = 1000L;
-
 	private final VrGpuPlugin plugin;
-	private long lastCheckClickboxDebugMs;
 
 	VrInteraction(VrGpuPlugin plugin)
 	{
@@ -48,6 +44,11 @@ final class VrInteraction
 		String entityName;
 		int sceneX;
 		int sceneY;
+		NPC npc;
+		Player player;
+		TileObject tileObject;
+		ItemLayer itemLayer;
+		TileItem tileItem;
 	}
 
 	static final class GroundHit
@@ -83,7 +84,7 @@ final class VrInteraction
 		processHover();
 	}
 
-	void handleClick(int button, float[] clickRay, float[] clickHit)
+	void handleClick(int button, float[] clickRay)
 	{
 		Client client = plugin.getClient();
 		WorldView wv = client.getTopLevelWorldView();
@@ -97,22 +98,50 @@ final class VrInteraction
 
 		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv);
 		List<Hit> hits = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
-		logRay(button, hits, groundHit, ox, oy, oz, dx, dy, dz, clickHit);
+		Hit hit = hits.isEmpty() ? null : hits.get(0);
+		logRay(button, hits, groundHit, ox, oy, oz, dx, dy, dz);
 		plugin.setLastGroundHit(groundHit);
-		plugin.setLastSceneRaycastHit(hits.isEmpty() ? null : hits.get(0), ox, oy, oz, dx, dy, dz);
+		plugin.setLastSceneRaycastHit(hit, ox, oy, oz, dx, dy, dz);
 		plugin.updateClientWalkDiagnostics(wv);
+
+		if (hit == null)
+		{
+			log.info("VR {} ignored: no AABB entity hit", button == MouseEvent.BUTTON1 ? "LMB" : "RMB");
+			return;
+		}
+
+		if (!primeDesktopForHit(hit, ox, oy, oz, dx, dy, dz, true))
+		{
+			log.info("VR {} ignored: no stable desktop activation pixel for {} {}",
+				button == MouseEvent.BUTTON1 ? "LMB" : "RMB", hit.entityType, hit.entityName);
+			return;
+		}
+
+		MenuEntry liveEntry = getTopLiveMenuEntry();
+		if (!liveEntryMatchesHit(liveEntry, hit))
+		{
+			log.info("VR {} ignored: live menu verification failed for {} {}; top={} {} action={} p0={} p1={} id={}",
+				button == MouseEvent.BUTTON1 ? "LMB" : "RMB", hit.entityType, hit.entityName,
+				liveEntry == null ? "null" : liveEntry.getOption(),
+				liveEntry == null ? "" : liveEntry.getTarget(),
+				liveEntry == null ? null : liveEntry.getType(),
+				liveEntry == null ? 0 : liveEntry.getParam0(),
+				liveEntry == null ? 0 : liveEntry.getParam1(),
+				liveEntry == null ? 0 : liveEntry.getIdentifier());
+			return;
+		}
 
 		if (button == MouseEvent.BUTTON1)
 		{
-			dispatchTopLiveMenuEntry(groundHit, wv);
+			dispatchLiveMenuEntry(liveEntry, wv);
 		}
 		else if (button == MouseEvent.BUTTON3)
 		{
-			openLiveMenuAtCurrentMouse(groundHit);
+			openLiveMenuAtCurrentMouse(hit, ox, oy, oz, dx, dy, dz);
 		}
 	}
 
-	private void logRay(int button, List<Hit> hits, GroundHit groundHit, float ox, float oy, float oz, float dx, float dy, float dz, float[] clickHit)
+	private void logRay(int button, List<Hit> hits, GroundHit groundHit, float ox, float oy, float oz, float dx, float dy, float dz)
 	{
 		StringBuilder sb = new StringBuilder();
 		sb.append("VR ").append(button == MouseEvent.BUTTON1 ? "LMB" : "RMB")
@@ -135,17 +164,15 @@ final class VrInteraction
 		}
 
 		log.info("{}", sb);
-		log.info("VR click diag: rayOrigin=({},{},{}) rayDir=({},{},{}) depthHit={} groundHit={}",
+		log.info("VR click diag: rayOrigin=({},{},{}) rayDir=({},{},{}) groundHit={}",
 			String.format("%.1f", ox), String.format("%.1f", oy), String.format("%.1f", oz),
 			String.format("%.4f", dx), String.format("%.4f", dy), String.format("%.4f", dz),
-			clickHit == null ? "null" : String.format("(%.1f,%.1f,%.1f)", clickHit[0], clickHit[1], clickHit[2]),
 			groundHit == null ? "null" : String.format("(scene=%d,%d local=%.1f,%.1f,%.1f t=%.1f)",
 				groundHit.sceneX, groundHit.sceneY, groundHit.x, groundHit.y, groundHit.z, groundHit.t));
 	}
 
-	private void dispatchTopLiveMenuEntry(GroundHit groundHit, WorldView wv)
+	private void dispatchLiveMenuEntry(MenuEntry liveEntry, WorldView wv)
 	{
-		MenuEntry liveEntry = getTopLiveMenuEntry();
 		if (liveEntry == null || liveEntry.getType() == MenuAction.CANCEL)
 		{
 			return;
@@ -184,7 +211,7 @@ final class VrInteraction
 		}
 	}
 
-	private void openLiveMenuAtCurrentMouse(GroundHit groundHit)
+	private void openLiveMenuAtCurrentMouse(Hit hit, float ox, float oy, float oz, float dx, float dy, float dz)
 	{
 		net.runelite.api.Point mousePoint = plugin.getClient().getMouseCanvasPosition();
 		if (mousePoint == null)
@@ -192,10 +219,8 @@ final class VrInteraction
 			return;
 		}
 
-		if (groundHit != null)
-		{
-			plugin.setVrPendingMenuAnchor(groundHit.x, groundHit.y + VrGpuPlugin.VR_MENU_WORLD_Y_OFFSET, groundHit.z);
-		}
+		float[] anchor = pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
+		plugin.setVrPendingMenuAnchor(anchor[0], anchor[1] + VrGpuPlugin.VR_MENU_WORLD_Y_OFFSET, anchor[2]);
 		plugin.logVrMenuEntries("RMB before open");
 		plugin.dispatchCanvasMouseClick(mousePoint.getX(), mousePoint.getY(), MouseEvent.BUTTON3);
 		plugin.setVrDesktopClickMarker(mousePoint.getX(), mousePoint.getY(), MouseEvent.BUTTON3);
@@ -248,189 +273,115 @@ final class VrInteraction
 		Hit hit = !hits.isEmpty() ? hits.get(0) : null;
 		plugin.setInteractionHoverDebug(hit, groundHit, ox, oy, oz, dx, dy, dz, now);
 
-		float t;
-		int sceneX;
-		int sceneY;
-		if (hit != null)
-		{
-			t = hit.t;
-			sceneX = hit.sceneX;
-			sceneY = hit.sceneY;
-		}
-		else if (groundHit != null)
-		{
-			t = groundHit.t;
-			sceneX = groundHit.sceneX;
-			sceneY = groundHit.sceneY;
-		}
-		else
+		if (hit == null)
 		{
 			plugin.clearHoverTarget();
 			return;
 		}
 
-		float hitX = ox + dx * t;
-		float hitY = oy + dy * t;
-		float hitZ = oz + dz * t;
-		plugin.aimDesktopCameraAtLocal(hitX, hitY, hitZ, sceneX, sceneY, false);
-
-		net.runelite.api.Point canvasPoint = plugin.projectVrHoverCanvasPoint(wv, hitX, hitY, hitZ, groundHit);
-		if (canvasPoint == null)
+		if (!primeDesktopForHit(hit, ox, oy, oz, dx, dy, dz, false))
 		{
 			plugin.clearHoverTarget();
 			return;
 		}
-		int canvasX = Math.max(0, Math.min(client.getCanvasWidth() - 1, canvasPoint.getX()));
-		int canvasY = Math.max(0, Math.min(client.getCanvasHeight() - 1, canvasPoint.getY()));
-		plugin.primeCanvasMouseForWalk(canvasX, canvasY);
 
 		MenuEntry liveEntry = getTopLiveMenuEntry();
-		if (liveEntry != null)
+		if (!liveEntryMatchesHit(liveEntry, hit))
 		{
-			plugin.setHoverMarkerAction(liveEntry.getType(), liveEntry.getOption());
-			debugCheckClickbox(liveEntry, now);
-		}
-		plugin.setHoverTarget(hitX, hitY + VrGpuPlugin.VR_CONTEXT_HINT_WORLD_Y_OFFSET, hitZ, now);
-	}
-
-	private void debugCheckClickbox(MenuEntry entry, long now)
-	{
-		if (!VR_CHECK_CLICKBOX_DEBUG || now - lastCheckClickboxDebugMs < VR_CHECK_CLICKBOX_DEBUG_INTERVAL_MS)
-		{
+			plugin.clearHoverTarget();
 			return;
 		}
-		lastCheckClickboxDebugMs = now;
 
+		float[] p = pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
+		plugin.setHoverMarkerAction(liveEntry.getType(), liveEntry.getOption());
+		plugin.setHoverTarget(p[0], p[1] + VrGpuPlugin.VR_CONTEXT_HINT_WORLD_Y_OFFSET, p[2], now);
+	}
+
+	private boolean primeDesktopForHit(Hit hit, float ox, float oy, float oz, float dx, float dy, float dz, boolean verbose)
+	{
 		Client client = plugin.getClient();
-		WorldView wv = client.getWorldView(entry.getWorldViewId());
-		if (wv == null)
+		float[] p = pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
+		plugin.aimDesktopCameraAtLocal(p[0], p[1], p[2], hit.sceneX, hit.sceneY, verbose);
+
+		// The VR ray chooses entity identity; it does not provide the final desktop click pixel.
+		// AABB entry points are often edge cases, so use the entity's current desktop clickbox/hull and verify the live menu.
+		net.runelite.api.Point activation = activationPoint(hit);
+		if (activation == null)
 		{
-			return;
+			return false;
 		}
 
-		MenuAction action = entry.getType();
-		switch (action)
-		{
-			case WIDGET_TARGET_ON_GAME_OBJECT:
-			case GAME_OBJECT_FIRST_OPTION:
-			case GAME_OBJECT_SECOND_OPTION:
-			case GAME_OBJECT_THIRD_OPTION:
-			case GAME_OBJECT_FOURTH_OPTION:
-			case GAME_OBJECT_FIFTH_OPTION:
-			case EXAMINE_OBJECT:
-			{
-				TileObject object = findTileObject(wv, entry.getParam0(), entry.getParam1(), entry.getIdentifier());
-				if (object != null)
-				{
-					debugCheckClickboxObject(client, wv, entry, object);
-				}
-				break;
-			}
-			case WIDGET_TARGET_ON_NPC:
-			case NPC_FIRST_OPTION:
-			case NPC_SECOND_OPTION:
-			case NPC_THIRD_OPTION:
-			case NPC_FOURTH_OPTION:
-			case NPC_FIFTH_OPTION:
-			case EXAMINE_NPC:
-			{
-				NPC npc = entry.getNpc();
-				if (npc != null)
-				{
-					debugCheckClickboxActor(client, wv, entry, npc.getModel(), npc.getCurrentOrientation() & 2047,
-						npc.getLocalLocation(), syntheticEntityHash(wv, npc.getId(), 1, npc.getLocalLocation()));
-				}
-				break;
-			}
-			case WIDGET_TARGET_ON_PLAYER:
-			case PLAYER_FIRST_OPTION:
-			case PLAYER_SECOND_OPTION:
-			case PLAYER_THIRD_OPTION:
-			case PLAYER_FOURTH_OPTION:
-			case PLAYER_FIFTH_OPTION:
-			case PLAYER_SIXTH_OPTION:
-			case PLAYER_SEVENTH_OPTION:
-			case PLAYER_EIGHTH_OPTION:
-			{
-				Player player = entry.getPlayer();
-				if (player != null)
-				{
-					debugCheckClickboxActor(client, wv, entry, player.getModel(), player.getCurrentOrientation() & 2047,
-						player.getLocalLocation(), syntheticEntityHash(wv, player.getId(), 0, player.getLocalLocation()));
-				}
-				break;
-			}
-		}
+		int canvasX = Math.max(0, Math.min(client.getCanvasWidth() - 1, activation.getX()));
+		int canvasY = Math.max(0, Math.min(client.getCanvasHeight() - 1, activation.getY()));
+		plugin.setVrDesktopActivationMarker(canvasX, canvasY);
+		plugin.primeCanvasMouseForWalk(canvasX, canvasY);
+		return true;
 	}
 
-	private void debugCheckClickboxObject(Client client, WorldView wv, MenuEntry entry, TileObject object)
+	private net.runelite.api.Point activationPoint(Hit hit)
 	{
-		Projection projection = wv.getCanvasProjection();
-		long hash = object.getHash();
-		if (object instanceof GameObject)
+		Shape shape = null;
+		if (hit.npc != null)
 		{
-			GameObject gameObject = (GameObject) object;
-			debugCheckClickboxRenderable(client, projection, entry, "GameObject", gameObject.getRenderable(),
-				gameObject.getModelOrientation() & 2047, gameObject.getX(), gameObject.getZ(), gameObject.getY(), hash);
+			shape = hit.npc.getConvexHull();
 		}
-		else if (object instanceof WallObject)
+		else if (hit.player != null)
 		{
-			WallObject wallObject = (WallObject) object;
-			debugCheckClickboxRenderable(client, projection, entry, "WallObject.1", wallObject.getRenderable1(),
-				0, wallObject.getX(), wallObject.getZ(), wallObject.getY(), hash);
-			debugCheckClickboxRenderable(client, projection, entry, "WallObject.2", wallObject.getRenderable2(),
-				0, wallObject.getX(), wallObject.getZ(), wallObject.getY(), hash);
+			shape = hit.player.getConvexHull();
 		}
-		else if (object instanceof DecorativeObject)
+		else if (hit.tileObject != null)
 		{
-			DecorativeObject decorativeObject = (DecorativeObject) object;
-			debugCheckClickboxRenderable(client, projection, entry, "DecorativeObject.1", decorativeObject.getRenderable(),
-				0, decorativeObject.getX() + decorativeObject.getXOffset(), decorativeObject.getZ(),
-				decorativeObject.getY() + decorativeObject.getYOffset(), hash);
-			debugCheckClickboxRenderable(client, projection, entry, "DecorativeObject.2", decorativeObject.getRenderable2(),
-				0, decorativeObject.getX() + decorativeObject.getXOffset2(), decorativeObject.getZ(),
-				decorativeObject.getY() + decorativeObject.getYOffset2(), hash);
+			shape = hit.tileObject.getClickbox();
+			if (shape == null)
+			{
+				shape = hit.tileObject.getCanvasTilePoly();
+			}
 		}
-		else if (object instanceof GroundObject)
-		{
-			GroundObject groundObject = (GroundObject) object;
-			debugCheckClickboxRenderable(client, projection, entry, "GroundObject", groundObject.getRenderable(),
-				0, groundObject.getX(), groundObject.getZ(), groundObject.getY(), hash);
-		}
+		return centerOf(shape);
 	}
 
-	private void debugCheckClickboxRenderable(Client client, Projection projection, MenuEntry entry, String label,
-		Renderable renderable, int orientation, int x, int y, int z, long hash)
+	private static net.runelite.api.Point centerOf(Shape shape)
 	{
-		if (renderable == null)
+		if (shape == null)
 		{
-			return;
+			return null;
 		}
-		Model model = renderable.getModel();
-		if (model == null)
+		Rectangle bounds = shape.getBounds();
+		if (bounds.isEmpty())
 		{
-			return;
+			return null;
 		}
-
-		log.info("VR checkClickbox debug: {} option={} target={} action={} id={} hash={} orient={} pos=({},{},{}) modelVerts={} useAabb={}",
-			label, entry.getOption(), entry.getTarget(), entry.getType(), entry.getIdentifier(), hash,
-			orientation, x, y, z, model.getVerticesCount(), model.useBoundingBox());
-		client.checkClickbox(projection, model, orientation, x, y, z, hash);
+		return new net.runelite.api.Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
 	}
 
-	private void debugCheckClickboxActor(Client client, WorldView wv, MenuEntry entry, Model model,
-		int orientation, LocalPoint lp, long hash)
+	private boolean liveEntryMatchesHit(MenuEntry entry, Hit hit)
 	{
-		if (model == null || lp == null)
+		// Dispatch only live vanilla menu entries, and only after they resolve back to the VR-picked entity.
+		// This keeps RuneLite/OSRS menu ordering, plugins, and selected-item/spell state as the authority.
+		if (entry == null || entry.getType() == MenuAction.CANCEL)
 		{
-			return;
+			return false;
 		}
-
-		int y = Perspective.getTileHeight(client, lp, wv.getPlane());
-		log.info("VR checkClickbox debug: Actor option={} target={} action={} id={} syntheticHash={} orient={} pos=({},{},{}) modelVerts={} useAabb={}",
-			entry.getOption(), entry.getTarget(), entry.getType(), entry.getIdentifier(), hash,
-			orientation, lp.getX(), y, lp.getY(), model.getVerticesCount(), model.useBoundingBox());
-		client.checkClickbox(wv.getCanvasProjection(), model, orientation, lp.getX(), y, lp.getY(), hash);
+		if (hit.npc != null)
+		{
+			return entry.getNpc() == hit.npc;
+		}
+		if (hit.player != null)
+		{
+			return entry.getPlayer() == hit.player;
+		}
+		if (hit.tileItem != null)
+		{
+			WorldView wv = plugin.getClient().getWorldView(entry.getWorldViewId());
+			ItemLayer layer = wv == null ? null : findItemLayer(wv, entry.getParam0(), entry.getParam1());
+			return layer == hit.itemLayer && findItem(layer, entry.getIdentifier()) == hit.tileItem;
+		}
+		if (hit.tileObject != null)
+		{
+			WorldView wv = plugin.getClient().getWorldView(entry.getWorldViewId());
+			return wv != null && findTileObject(wv, entry.getParam0(), entry.getParam1(), entry.getIdentifier()) == hit.tileObject;
+		}
+		return false;
 	}
 
 	private TileObject findTileObject(WorldView wv, int x, int y, int id)
@@ -477,16 +428,46 @@ final class VrInteraction
 		return groundObject != null && groundObject.getId() == id ? groundObject : null;
 	}
 
-	private static long syntheticEntityHash(WorldView wv, int id, int type, LocalPoint lp)
+	private ItemLayer findItemLayer(WorldView wv, int x, int y)
 	{
-		if (lp == null)
+		int offset = wv.isTopLevel() ? (Constants.EXTENDED_SCENE_SIZE - Constants.SCENE_SIZE) / 2 : 0;
+		int ex = x + offset;
+		int ey = y + offset;
+		Scene scene = wv.getScene();
+		Tile[][][] tiles = scene.getExtendedTiles();
+		if (wv.getPlane() < 0 || wv.getPlane() >= tiles.length
+			|| ex < 0 || ey < 0 || tiles[wv.getPlane()] == null
+			|| ex >= tiles[wv.getPlane()].length || ey >= tiles[wv.getPlane()][ex].length)
 		{
-			return 0L;
+			return null;
 		}
-		long worldView = (long) wv.getId() & 4095L;
-		long sceneX = (lp.getX() >> 7) & 127L;
-		long sceneY = (lp.getY() >> 7) & 127L;
-		long plane = wv.getPlane() & 3L;
-		return worldView << 52 | ((long) id & 0xffffffffL) << 20 | ((long) type & 7L) << 16 | plane << 14 | sceneY << 7 | sceneX;
+
+		Tile tile = tiles[wv.getPlane()][ex][ey];
+		return tile == null ? null : tile.getItemLayer();
+	}
+
+	private static TileItem findItem(ItemLayer layer, int id)
+	{
+		if (layer == null)
+		{
+			return null;
+		}
+
+		Node current = layer.getTop();
+		while (current instanceof TileItem)
+		{
+			TileItem item = (TileItem) current;
+			current = current.getNext();
+			if (item.getId() == id)
+			{
+				return item;
+			}
+		}
+		return null;
+	}
+
+	private static float[] pointOnRay(float ox, float oy, float oz, float dx, float dy, float dz, float t)
+	{
+		return new float[]{ox + dx * t, oy + dy * t, oz + dz * t};
 	}
 }

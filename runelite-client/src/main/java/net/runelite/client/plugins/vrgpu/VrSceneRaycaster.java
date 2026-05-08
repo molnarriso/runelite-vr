@@ -11,6 +11,7 @@ import net.runelite.api.Client;
 import net.runelite.api.DecorativeObject;
 import net.runelite.api.GameObject;
 import net.runelite.api.GroundObject;
+import net.runelite.api.ItemLayer;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.Model;
 import net.runelite.api.NPC;
@@ -95,6 +96,7 @@ final class VrSceneRaycaster
 							clampScene(obj.getX() >> 7, wv.getSizeX()),
 							clampScene(obj.getY() >> 7, wv.getSizeY()),
 							obj.getId(),
+							obj,
 							new VrInteraction.RenderablePlacement(obj.getRenderable(), obj.getModelOrientation() & 2047, obj.getX(), obj.getZ(), obj.getY()));
 						if (hit != null)
 						{
@@ -110,6 +112,7 @@ final class VrSceneRaycaster
 							scX,
 							scY,
 							wall.getId(),
+							wall,
 							new VrInteraction.RenderablePlacement(wall.getRenderable1(), 0, wall.getX(), wall.getZ(), wall.getY()),
 							new VrInteraction.RenderablePlacement(wall.getRenderable2(), 0, wall.getX(), wall.getZ(), wall.getY()));
 						if (hit != null)
@@ -126,6 +129,7 @@ final class VrSceneRaycaster
 							scX,
 							scY,
 							deco.getId(),
+							deco,
 							new VrInteraction.RenderablePlacement(deco.getRenderable(), 0,
 								deco.getX() + deco.getXOffset(), deco.getZ(), deco.getY() + deco.getYOffset()),
 							new VrInteraction.RenderablePlacement(deco.getRenderable2(), 0,
@@ -144,6 +148,7 @@ final class VrSceneRaycaster
 							scX,
 							scY,
 							ground.getId(),
+							ground,
 							new VrInteraction.RenderablePlacement(ground.getRenderable(), 0, ground.getX(), ground.getZ(), ground.getY()));
 						if (hit != null)
 						{
@@ -167,7 +172,7 @@ final class VrSceneRaycaster
 						for (TileItem item : items)
 						{
 							if (item == null) continue;
-							VrInteraction.Hit hit = buildGroundItemHit(itemT, scX, scY, item);
+							VrInteraction.Hit hit = buildGroundItemHit(itemT, scX, scY, tile.getItemLayer(), item);
 							if (hit != null)
 							{
 								hits.add(hit);
@@ -220,7 +225,7 @@ final class VrSceneRaycaster
 			return null;
 		}
 
-		float t = rayTestModel(ox, oy, oz, dx, dy, dz, model, npc.getCurrentOrientation() & 2047,
+		float t = rayTestModelAabb(ox, oy, oz, dx, dy, dz, model, npc.getCurrentOrientation() & 2047,
 			lp.getX(), Perspective.getTileHeight(client, lp, plane), lp.getY());
 		if (t <= 0f)
 		{
@@ -233,6 +238,7 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(npc.getName(), "NPC");
 		hit.sceneX = lp.getX() >> 7;
 		hit.sceneY = lp.getY() >> 7;
+		hit.npc = npc;
 		return hit;
 	}
 
@@ -245,7 +251,7 @@ final class VrSceneRaycaster
 			return null;
 		}
 
-		float t = rayTestModel(ox, oy, oz, dx, dy, dz, model, player.getCurrentOrientation() & 2047,
+		float t = rayTestModelAabb(ox, oy, oz, dx, dy, dz, model, player.getCurrentOrientation() & 2047,
 			lp.getX(), Perspective.getTileHeight(client, lp, plane), lp.getY());
 		if (t <= 0f)
 		{
@@ -258,11 +264,13 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(player.getName(), "Player");
 		hit.sceneX = lp.getX() >> 7;
 		hit.sceneY = lp.getY() >> 7;
+		hit.player = player;
 		return hit;
 	}
 
 	private VrInteraction.Hit buildObjectHit(float ox, float oy, float oz, float dx, float dy, float dz,
-		String entityType, int sceneX, int sceneY, int objId, VrInteraction.RenderablePlacement... placements)
+		String entityType, int sceneX, int sceneY, int objId, net.runelite.api.TileObject object,
+		VrInteraction.RenderablePlacement... placements)
 	{
 		ObjectComposition def = client.getObjectDefinition(objId);
 		if (def == null)
@@ -292,7 +300,7 @@ final class VrSceneRaycaster
 				continue;
 			}
 
-			float t = rayTestModel(ox, oy, oz, dx, dy, dz, model, placement.orientation, placement.x, placement.y, placement.z);
+			float t = rayTestModelAabb(ox, oy, oz, dx, dy, dz, model, placement.orientation, placement.x, placement.y, placement.z);
 			if (t > 0f && t < bestT)
 			{
 				bestT = t;
@@ -310,10 +318,11 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(def.getName(), "Object");
 		hit.sceneX = sceneX;
 		hit.sceneY = sceneY;
+		hit.tileObject = object;
 		return hit;
 	}
 
-	private VrInteraction.Hit buildGroundItemHit(float t, int sceneX, int sceneY, TileItem item)
+	private VrInteraction.Hit buildGroundItemHit(float t, int sceneX, int sceneY, ItemLayer layer, TileItem item)
 	{
 		ItemComposition def = client.getItemDefinition(item.getId());
 		if (def == null)
@@ -327,6 +336,9 @@ final class VrSceneRaycaster
 		hit.entityName = safeName(def.getName(), "Item");
 		hit.sceneX = sceneX;
 		hit.sceneY = sceneY;
+		hit.tileObject = layer;
+		hit.itemLayer = layer;
+		hit.tileItem = item;
 		return hit;
 	}
 
@@ -437,7 +449,7 @@ final class VrSceneRaycaster
 		return vx * dx + vy * dy + vz * dz;
 	}
 
-	private static float rayTestModel(float ox, float oy, float oz,
+	private static float rayTestModelAabb(float ox, float oy, float oz,
 		float dx, float dy, float dz,
 		Model m, int orient, int entityX, int entityY, int entityZ)
 	{
@@ -445,65 +457,12 @@ final class VrSceneRaycaster
 		float cx = entityX + aabb.getCenterX();
 		float cy = entityY + aabb.getCenterY();
 		float cz = entityZ + aabb.getCenterZ();
+		// VR picking intentionally uses a padded model AABB as the identity target.
+		// The desktop client still supplies the final action; this only answers "what entity is the controller pointing at?"
 		float ex = aabb.getExtremeX() + 16f;
 		float ey = aabb.getExtremeY() + 16f;
 		float ez = aabb.getExtremeZ() + 16f;
-		if (rayBoxTest(ox, oy, oz, dx, dy, dz, cx - ex, cy - ey, cz - ez, cx + ex, cy + ey, cz + ez) < 0f)
-		{
-			return -1f;
-		}
-
-		float[] vx = m.getVerticesX();
-		float[] vy = m.getVerticesY();
-		float[] vz = m.getVerticesZ();
-		int[] fi1 = m.getFaceIndices1();
-		int[] fi2 = m.getFaceIndices2();
-		int[] fi3 = m.getFaceIndices3();
-		if (vx == null || vy == null || vz == null || fi1 == null || fi2 == null || fi3 == null)
-		{
-			return -1f;
-		}
-
-		int sin = Perspective.SINE[orient];
-		int cos = Perspective.COSINE[orient];
-		float minT = Float.MAX_VALUE;
-		for (int f = 0; f < m.getFaceCount(); f++)
-		{
-			int i0 = fi1[f];
-			int i1 = fi2[f];
-			int i2 = fi3[f];
-
-			float ax = vx[i0];
-			float ay = vy[i0];
-			float az = vz[i0];
-			float wax = entityX + (az * sin + ax * cos) / 65536f;
-			float way = entityY + ay;
-			float waz = entityZ + (az * cos - ax * sin) / 65536f;
-
-			float bx = vx[i1];
-			float by = vy[i1];
-			float bz = vz[i1];
-			float wbx = entityX + (bz * sin + bx * cos) / 65536f;
-			float wby = entityY + by;
-			float wbz = entityZ + (bz * cos - bx * sin) / 65536f;
-
-			float cx2 = vx[i2];
-			float cy2 = vy[i2];
-			float cz2 = vz[i2];
-			float wcx = entityX + (cz2 * sin + cx2 * cos) / 65536f;
-			float wcy = entityY + cy2;
-			float wcz = entityZ + (cz2 * cos - cx2 * sin) / 65536f;
-
-			float t = rayTriangleMT(ox, oy, oz, dx, dy, dz,
-				wax, way, waz,
-				wbx, wby, wbz,
-				wcx, wcy, wcz);
-			if (t > 0f && t < minT)
-			{
-				minT = t;
-			}
-		}
-		return minT < Float.MAX_VALUE ? minT : -1f;
+		return rayBoxTest(ox, oy, oz, dx, dy, dz, cx - ex, cy - ey, cz - ez, cx + ex, cy + ey, cz + ez);
 	}
 
 	/**

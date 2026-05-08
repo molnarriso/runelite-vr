@@ -256,14 +256,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Scratch buffer for per-frame debug vertices (7 floats per vertex). */
 	private java.nio.FloatBuffer debugRayFb;
 	private int controllerTriangleFloatCount;
-	/** Scratch buffers for depth-buffer picking (single pixel read). */
-	private java.nio.FloatBuffer depthReadBuf;
-	private java.nio.IntBuffer fboReadBuf;
 	/** Scratch buffer used when desktop-only re-sorting needs alpha faces but should discard opaque output. */
 	private java.nio.IntBuffer desktopSorterScratchOpaque;
-	/** Controller depth-buffer hits in OSRS world coords; null if no hit last frame. */
-	private float[] vrLeftRayHit;
-	private float[] vrRightRayHit;
+	/** Controller scene-interaction rays [ox,oy,oz,dx,dy,dz]; these are the exact rays queued to VrInteraction. */
+	private float[] vrLeftInteractionRay;
+	private float[] vrRightInteractionRay;
 	/** Persistent click-feedback marker: OSRS world position + button + timestamp. */
 	private float[] vrLastClickHit;
 	/** Persistent OSRS-space click ray [ox,oy,oz,dx,dy,dz] for diagnostics. */
@@ -295,8 +292,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Previous-frame combined LMB/RMB values for rising-edge detection. */
 	private float prevLmb; // max(leftTrigger, rightTrigger)
 	private float prevRmb; // max(leftSqueeze,  rightSqueeze)
-	/** Pending click produced on render thread, consumed on client thread. */
-	private volatile float[] vrPendingClickHit;
 	private volatile int vrPendingClickButton; // MouseEvent.BUTTON1 or BUTTON3
 	/** OSRS-space ray [ox,oy,oz,dx,dy,dz] set on render thread when a click is detected; consumed on client thread. */
 	private volatile float[] vrPendingClickRay;
@@ -351,6 +346,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_DESKTOP_CLICK_MARKER_RADIUS = 10;
 	private static final int VR_DESKTOP_CLICK_MARKER_COLOR = 0xfff5d000;
 	private static final int VR_DESKTOP_CLICK_MARKER_RMB_COLOR = 0xffff3030;
+	private static final long VR_DESKTOP_ACTIVATION_MARKER_STALE_MS = 2000L;
+	private static final int VR_DESKTOP_ACTIVATION_MARKER_COLOR = 0xffff00ff;
 	private static final int VR_HAND_NONE = -1;
 	private static final int VR_HAND_LEFT = 0;
 	private static final int VR_HAND_RIGHT = 1;
@@ -424,6 +421,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private volatile int[] vrDesktopClickMarkerPoint;
 	private volatile long vrDesktopClickMarkerMs;
 	private volatile int vrDesktopClickMarkerButton = MouseEvent.BUTTON1;
+	private volatile int[] vrDesktopActivationMarkerPoint;
+	private volatile long vrDesktopActivationMarkerMs;
 	private long vrLastUiCaptureDebugLogMs;
 	private long vrUiCaptureDebugFrame;
 	private int vrUiCaptureDebugImageIndex;
@@ -1727,8 +1726,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		debugVaoId = glGenVertexArrays();
 		debugVboId = glGenBuffers();
 		debugRayFb  = BufferUtils.createFloatBuffer(DEBUG_VERTEX_FLOAT_CAPACITY);
-		depthReadBuf = BufferUtils.createFloatBuffer(1);
-		fboReadBuf   = BufferUtils.createIntBuffer(1);
 		desktopSorterScratchOpaque = BufferUtils.createIntBuffer(FacePrioritySorter.MAX_FACE_COUNT * (VAO.VERT_SIZE >> 2) * 3);
 
 		glBindVertexArray(debugVaoId);
@@ -1752,7 +1749,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 * Per controller: ray line + crosshair at endpoint + tile outline on the ground.
 	 * Returns number of floats written.
 	 */
-	private int buildDebugRayVerts(float[] leftHit, float[] rightHit)
+	private int buildDebugRayVerts()
 	{
 		final float s = DEFAULT_WORLD_SCALE;
 		final float oy = vrWorldAnchorY;
@@ -1810,36 +1807,26 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 
 		float[] markerColor = vrHoverMarkerColor;
-		for (int ci = 0; ci < controllers.length; ci++)
+		if (System.currentTimeMillis() - vrInteractionHoverDebugTimeMs <= VR_CONTEXT_HINT_STALE_MS
+			&& vrInteractionHoverSceneHit != null)
 		{
-			float[] hit = (ci == 0) ? leftHit : rightHit;
-			if (hit == null)
-			{
-				continue;
-			}
+			// Small cube = current 3D cursor from the VR AABB/entity raycast.
+			// It is intentionally not the depth-buffer hit; the cursor must sit on the controller ray.
 			controllerTriangleFloatCount += VrControllerModel.putEndpointCube(debugRayFb,
-				hit[0], hit[1], hit[2], MARKER_SIZE,
-				markerColor[0], markerColor[1], markerColor[2]);
+				vrInteractionHoverSceneHit[0], vrInteractionHoverSceneHit[1], vrInteractionHoverSceneHit[2],
+				MARKER_SIZE, markerColor[0], markerColor[1], markerColor[2]);
 		}
 
 		for (int ci = 0; ci < controllers.length; ci++)
 		{
 			float[] c = controllers[ci];
 			if (c == null) continue;
-			float px = c[0], py = c[1], pz = c[2];
-			float dx = c[3], dy = c[4], dz = c[5];
-
-			// Convert stage-space (metres) to the same anchored OSRS world coordinates
-			// used by computeVrWorldProj() and the staged click ray path.
-			float ox2 = camX - px / s;
-			float oy2 = camY - (py - oy) / s;
-			float oz2 = camZ + (pz - oz) / s;
-
-			// Draw the visible ray from the same raw controller pose/direction used by menu UV hit-testing.
-			// Depth-buffer hits are only shown as separate endpoint markers because reconstruction can drift.
-			float ex = camX - (px + dx * RAY_M) / s;
-			float ey = camY - ((py + dy * RAY_M) - oy) / s;
-			float ez = camZ + ((pz + dz * RAY_M) - oz) / s;
+			float[] ray = ci == 1 ? vrRightInteractionRay : vrLeftInteractionRay;
+			if (ray == null) continue;
+			float ox2 = ray[0], oy2 = ray[1], oz2 = ray[2];
+			float ex = ox2 + ray[3] * (RAY_M / s);
+			float ey = oy2 + ray[4] * (RAY_M / s);
+			float ez = oz2 + ray[5] * (RAY_M / s);
 
 			debugRayFb.put(ox2).put(oy2).put(oz2).put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
 			debugRayFb.put(ex) .put(ey) .put(ez) .put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
@@ -1991,105 +1978,41 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		debugRayFb.put(x).put(y).put(z + size).put(r).put(g).put(b).put(a);
 	}
 
-	/**
-	 * Project the given stage-space ray into the eye's viewport, read the depth buffer at
-	 * that pixel, and reconstruct the OSRS world-space intersection point.
-	 *
-	 * @return float[3] OSRS world coords, or null if no geometry was hit (depth == 0).
-	 */
-	private float[] sampleDepthAtRay(int eye,
-		float rox, float roy, float roz,
-		float rdx, float rdy, float rdz)
+	private float[] controllerWorldRay(boolean rightHand)
 	{
-		// Project a point far along the ray to find the viewport direction.
-		final float FAR = 10f;
+		if (xrInput == null || Float.isNaN(vrWorldAnchorY))
+		{
+			return null;
+		}
+		if (rightHand ? !xrInput.isRightActive() : !xrInput.isLeftActive())
+		{
+			return null;
+		}
+
+		float px = rightHand ? xrInput.getRightPosX() : xrInput.getLeftPosX();
+		float py = rightHand ? xrInput.getRightPosY() : xrInput.getLeftPosY();
+		float pz = rightHand ? xrInput.getRightPosZ() : xrInput.getLeftPosZ();
+		float dx = rightHand ? xrInput.getRightDirX() : xrInput.getLeftDirX();
+		float dy = rightHand ? xrInput.getRightDirY() : xrInput.getLeftDirY();
+		float dz = rightHand ? xrInput.getRightDirZ() : xrInput.getLeftDirZ();
+
 		final float s = DEFAULT_WORLD_SCALE;
-		final float anchorY = vrWorldAnchorY;
-		final float anchorZ = VR_STAGE_CHARACTER_OFFSET_Z;
-		final float anchorWorldX = getVrAnchorWorldX();
-		final float anchorWorldY = getVrAnchorWorldY();
-		final float anchorWorldZ = getVrAnchorWorldZ();
+		float ox = getVrAnchorWorldX() - px / s;
+		float oy = getVrAnchorWorldY() - (py - vrWorldAnchorY) / s;
+		float oz = getVrAnchorWorldZ() + (pz - VR_STAGE_CHARACTER_OFFSET_Z) / s;
 
-		float testX = rox + rdx * FAR;
-		float testY = roy + rdy * FAR;
-		float testZ = roz + rdz * FAR;
+		// Canonical scene-interaction ray: raw XR controller direction mapped into OSRS coords.
+		// Do not bend it toward depth-buffer hits; the cursor must always lie on this visible ray.
+		float rdx = -dx;
+		float rdy = -dy;
+		float rdz = dz;
+		float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+		if (len <= 1e-6f)
+		{
+			return null;
+		}
 
-		// Stage space → OSRS world
-		float wx = anchorWorldX - testX / s;
-		float wy = anchorWorldY - (testY - anchorY) / s;
-		float wz = anchorWorldZ + (testZ - anchorZ) / s;
-
-		// OSRS world → clip space
-		float[] proj = computeVrWorldProj(eye);
-		float cx  = proj[0]*wx + proj[4]*wy + proj[8]*wz  + proj[12];
-		float cy  = proj[1]*wx + proj[5]*wy + proj[9]*wz  + proj[13];
-		float cw  = proj[3]*wx + proj[7]*wy + proj[11]*wz + proj[15];
-		if (cw <= 0) return null; // behind camera
-
-		float ndcX = cx / cw;
-		float ndcY = cy / cw;
-
-		int vpW = eyeSwapchains[eye].getWidth();
-		int vpH = eyeSwapchains[eye].getHeight();
-
-		// NDC → pixel (GL_LOWER_LEFT, GL_ZERO_TO_ONE: Y up from bottom)
-		int px = Math.round((ndcX + 1f) * 0.5f * vpW);
-		int py = Math.round((ndcY + 1f) * 0.5f * vpH);
-		px = Math.max(0, Math.min(vpW - 1, px));
-		py = Math.max(0, Math.min(vpH - 1, py));
-
-		// Read depth: bind the current draw FBO also as read so glReadPixels sees scene depth.
-		fboReadBuf.clear();
-		glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, fboReadBuf);
-		int eyeFbo = fboReadBuf.get(0);
-		glBindFramebuffer(GL_READ_FRAMEBUFFER, eyeFbo);
-
-		depthReadBuf.clear();
-		glReadPixels(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, depthReadBuf);
-		float depth = depthReadBuf.get(0);
-
-		if (depth < 0.001f) return null; // no geometry (background)
-
-		// Reconstruct eye-space position: depth = 2*near / (-z_eye)
-		final float near = 0.05f;
-		float zEye = -2f * near / depth;
-
-		// Get per-eye FOV params to unproject X and Y
-		XrView view = vrViews.get(eye);
-		XrFovf fov = view.fov();
-		float tanL = (float) Math.tan(fov.angleLeft());
-		float tanR = (float) Math.tan(fov.angleRight());
-		float tanU = (float) Math.tan(fov.angleUp());
-		float tanD = (float) Math.tan(fov.angleDown());
-		float a  = 2f / (tanR - tanL);
-		float b  = (tanR + tanL) / (tanR - tanL);
-		float c2 = 2f / (tanU - tanD);
-		float d  = (tanU + tanD) / (tanU - tanD);
-
-		// ndc_x = -a*xEye/zEye - b  →  xEye = -(ndcX + b) * zEye / a
-		float xEye = -(ndcX + b) * zEye / a;
-		float yEye = -(ndcY + d) * zEye / c2;
-
-		// Eye space → stage space: stagePos = R * eyePos + eyeOrigin
-		XrPosef pose = view.pose();
-		float qx = pose.orientation().x(), qy = pose.orientation().y();
-		float qz = pose.orientation().z(), qw = pose.orientation().w();
-		float epx = pose.position$().x(), epy = pose.position$().y(), epz = pose.position$().z();
-
-		float r00 = 1-2*(qy*qy+qz*qz), r01 = 2*(qx*qy-qw*qz), r02 = 2*(qx*qz+qw*qy);
-		float r10 = 2*(qx*qy+qw*qz), r11 = 1-2*(qx*qx+qz*qz), r12 = 2*(qy*qz-qw*qx);
-		float r20 = 2*(qx*qz-qw*qy), r21 = 2*(qy*qz+qw*qx), r22 = 1-2*(qx*qx+qy*qy);
-
-		float stX = r00*xEye + r01*yEye + r02*zEye + epx;
-		float stY = r10*xEye + r11*yEye + r12*zEye + epy;
-		float stZ = r20*xEye + r21*yEye + r22*zEye + epz;
-
-		// Stage space → OSRS world
-		float osrsX = anchorWorldX - stX / s;
-		float osrsY = anchorWorldY - (stY - anchorY) / s;
-		float osrsZ = anchorWorldZ + (stZ - anchorZ) / s;
-
-		return new float[]{osrsX, osrsY, osrsZ};
+		return new float[]{ox, oy, oz, rdx / len, rdy / len, rdz / len};
 	}
 
 	private void updateControllerRayInput()
@@ -2097,13 +2020,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (xrInput == null || Float.isNaN(vrWorldAnchorY)) return;
 		if (!xrInput.isLeftActive() && !xrInput.isRightActive()) return;
 
-		// Sample against the freshly-rendered right-eye scene depth before the late UI pass.
-		vrLeftRayHit  = xrInput.isLeftActive()  ? sampleDepthAtRay(1,
-			xrInput.getLeftPosX(),  xrInput.getLeftPosY(),  xrInput.getLeftPosZ(),
-			xrInput.getLeftDirX(),  xrInput.getLeftDirY(),  xrInput.getLeftDirZ()) : null;
-		vrRightRayHit = xrInput.isRightActive() ? sampleDepthAtRay(1,
-			xrInput.getRightPosX(), xrInput.getRightPosY(), xrInput.getRightPosZ(),
-			xrInput.getRightDirX(), xrInput.getRightDirY(), xrInput.getRightDirZ()) : null;
+		vrLeftInteractionRay = controllerWorldRay(false);
+		vrRightInteractionRay = controllerWorldRay(true);
 
 		float lmb = Math.max(xrInput.getLeftTrigger(),  xrInput.getRightTrigger());
 		float rmb = Math.max(xrInput.getLeftSqueeze(),  xrInput.getRightSqueeze());
@@ -2111,10 +2029,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// Diagnostic: log when any button crosses 30%
 		if ((lmb > 0.3f && prevLmb <= 0.3f) || (rmb > 0.3f && prevRmb <= 0.3f))
 		{
-			log.info("VR input: lt={} rt={} ls={} rs={} leftHit={} rightHit={}",
+			log.info("VR input: lt={} rt={} ls={} rs={} leftRay={} rightRay={}",
 				xrInput.getLeftTrigger(), xrInput.getRightTrigger(),
 				xrInput.getLeftSqueeze(), xrInput.getRightSqueeze(),
-				vrLeftRayHit != null, vrRightRayHit != null);
+				vrLeftInteractionRay != null, vrRightInteractionRay != null);
 		}
 
 		if (!vrUiMousePressed && handleVrMenuMouse(lmb, rmb))
@@ -2131,8 +2049,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		// Prefer the hand that just pressed; fall back to any valid hit.
-		float[] activeHit = null;
+		// Prefer the hand that just pressed; otherwise keep the active/down hand, then right hand.
 		boolean leftTriggerDown = xrInput.getLeftTrigger() >= 0.7f;
 		boolean rightTriggerDown = xrInput.getRightTrigger() >= 0.7f;
 		boolean leftSqueezeDown = xrInput.getLeftSqueeze() >= 0.7f;
@@ -2141,20 +2058,31 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		boolean rightTriggerPressed = rightTriggerDown && prevRightTrigger < 0.7f;
 		boolean leftSqueezePressed = leftSqueezeDown && prevLeftSqueeze < 0.7f;
 		boolean rightSqueezePressed = rightSqueezeDown && prevRightSqueeze < 0.7f;
+		boolean useRight = xrInput.isRightActive();
 		if (rightTriggerPressed || rightSqueezePressed)
-			activeHit = vrRightRayHit;
-		if (activeHit == null && (leftTriggerPressed || leftSqueezePressed))
-			activeHit = vrLeftRayHit;
-		if (activeHit == null && (rightTriggerDown || rightSqueezeDown))
-			activeHit = vrRightRayHit;
-		if (activeHit == null && (leftTriggerDown || leftSqueezeDown))
-			activeHit = vrLeftRayHit;
-		if (activeHit == null)
-			activeHit = vrRightRayHit != null ? vrRightRayHit : vrLeftRayHit;
+		{
+			useRight = true;
+		}
+		else if (leftTriggerPressed || leftSqueezePressed)
+		{
+			useRight = false;
+		}
+		else if (rightTriggerDown || rightSqueezeDown)
+		{
+			useRight = true;
+		}
+		else if (leftTriggerDown || leftSqueezeDown)
+		{
+			useRight = false;
+		}
+		else if (!xrInput.isRightActive() && xrInput.isLeftActive())
+		{
+			useRight = false;
+		}
 
-		queueVrHoverRay(activeHit);
+		float[] hoverRay = queueVrHoverRay(useRight);
 
-		if (activeHit != null)
+		if (hoverRay != null)
 		{
 			boolean isLmb = leftTriggerPressed || rightTriggerPressed;
 			boolean isRmb = leftSqueezePressed || rightSqueezePressed;
@@ -2162,64 +2090,27 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			{
 				int btn = isLmb ? MouseEvent.BUTTON1 : MouseEvent.BUTTON3;
 				int pressedHand = rightTriggerPressed || rightSqueezePressed ? VR_HAND_RIGHT : VR_HAND_LEFT;
+				boolean clickRight = pressedHand == VR_HAND_RIGHT;
+				float[] clickRay = clickRight ? vrRightInteractionRay : vrLeftInteractionRay;
+				if (clickRay == null)
+				{
+					updateVrButtonState(lmb, rmb);
+					return;
+				}
 				if (isRmb)
 				{
 					vrMenuControllerHand = pressedHand;
 				}
-				vrPendingClickHit = activeHit.clone();
 				vrPendingClickButton = btn;
-				vrLastClickHit = activeHit.clone();
+				vrLastClickHit = clickRay.clone();
 				vrLastClickButton = btn;
 				vrLastClickTimeMs = System.currentTimeMillis();
 
-				// Compute OSRS-space ray from the active controller for client-thread raycast.
-				boolean useRight = pressedHand == VR_HAND_RIGHT;
-				float spx, spy, spz, sdx, sdy, sdz;
-				if (useRight || !xrInput.isLeftActive())
-				{
-					spx = xrInput.getRightPosX(); spy = xrInput.getRightPosY(); spz = xrInput.getRightPosZ();
-					sdx = xrInput.getRightDirX(); sdy = xrInput.getRightDirY(); sdz = xrInput.getRightDirZ();
-				}
-				else
-				{
-					spx = xrInput.getLeftPosX(); spy = xrInput.getLeftPosY(); spz = xrInput.getLeftPosZ();
-					sdx = xrInput.getLeftDirX(); sdy = xrInput.getLeftDirY(); sdz = xrInput.getLeftDirZ();
-				}
-				final float s = DEFAULT_WORLD_SCALE;
-				float anchorWorldX = getVrAnchorWorldX();
-				float anchorWorldY = getVrAnchorWorldY();
-				float anchorWorldZ = getVrAnchorWorldZ();
-				float rox = anchorWorldX - spx / s;
-				float roy = anchorWorldY - (spy - vrWorldAnchorY) / s;
-				float roz = anchorWorldZ + (spz - VR_STAGE_CHARACTER_OFFSET_Z) / s;
-				float rdx;
-				float rdy;
-				float rdz;
-				// First diagnostic fix: derive the click ray from the visual depth hit.
-				// This keeps the client-thread ray aligned with the ray the user actually sees.
-				rdx = activeHit[0] - rox;
-				rdy = activeHit[1] - roy;
-				rdz = activeHit[2] - roz;
-				float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
-				if (len > 1e-6f)
-				{
-					rdx /= len;
-					rdy /= len;
-					rdz /= len;
-				}
-				else
-				{
-					rdx = -sdx;
-					rdy = -sdy;
-					rdz = sdz;
-				}
-				vrPendingClickRay = new float[]{rox, roy, roz, rdx, rdy, rdz};
+				vrPendingClickRay = clickRay.clone();
 				vrLastClickRay = vrPendingClickRay.clone();
-				log.info("VR {} triggered: depth=({},{},{}) stageDir=({},{},{}) clickDir=({},{},{})",
+				log.info("VR {} triggered: clickDir=({},{},{})",
 					isLmb ? "LMB" : "RMB",
-					activeHit[0], activeHit[1], activeHit[2],
-					-sdx, -sdy, sdz,
-					rdx, rdy, rdz);
+					clickRay[3], clickRay[4], clickRay[5]);
 			}
 		}
 		updateVrButtonState(lmb, rmb);
@@ -2234,7 +2125,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (xrInput == null || Float.isNaN(vrWorldAnchorY)) return;
 		if (!xrInput.isLeftActive() && !xrInput.isRightActive()) return;
 
-		int n = buildDebugRayVerts(vrLeftRayHit, vrRightRayHit);
+		int n = buildDebugRayVerts();
 		if (n == 0) return;
 
 		glBindVertexArray(debugVaoId);
@@ -2344,66 +2235,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
-	private void queueVrHoverRay(float[] activeHit)
+	private float[] queueVrHoverRay(boolean rightHand)
 	{
-		if (xrInput == null || activeHit == null || Float.isNaN(vrWorldAnchorY))
+		float[] ray = rightHand ? vrRightInteractionRay : vrLeftInteractionRay;
+		if (ray == null)
 		{
 			vrPendingHoverRay = null;
-			return;
-		}
-
-		boolean useRight = activeHit == vrRightRayHit || (vrRightRayHit != null && xrInput.isRightActive());
-		float spx;
-		float spy;
-		float spz;
-		float sdx;
-		float sdy;
-		float sdz;
-		if (useRight || !xrInput.isLeftActive())
-		{
-			spx = xrInput.getRightPosX();
-			spy = xrInput.getRightPosY();
-			spz = xrInput.getRightPosZ();
-			sdx = xrInput.getRightDirX();
-			sdy = xrInput.getRightDirY();
-			sdz = xrInput.getRightDirZ();
-		}
-		else
-		{
-			spx = xrInput.getLeftPosX();
-			spy = xrInput.getLeftPosY();
-			spz = xrInput.getLeftPosZ();
-			sdx = xrInput.getLeftDirX();
-			sdy = xrInput.getLeftDirY();
-			sdz = xrInput.getLeftDirZ();
-		}
-
-		final float s = DEFAULT_WORLD_SCALE;
-		float rox = getVrAnchorWorldX() - spx / s;
-		float roy = getVrAnchorWorldY() - (spy - vrWorldAnchorY) / s;
-		float roz = getVrAnchorWorldZ() + (spz - VR_STAGE_CHARACTER_OFFSET_Z) / s;
-		float rdx = activeHit[0] - rox;
-		float rdy = activeHit[1] - roy;
-		float rdz = activeHit[2] - roz;
-		float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
-		if (len > 1e-6f)
-		{
-			rdx /= len;
-			rdy /= len;
-			rdz /= len;
-		}
-		else
-		{
-			rdx = -sdx;
-			rdy = -sdy;
-			rdz = sdz;
+			return null;
 		}
 
 		vrPendingHoverRay = new float[]{
-			rox, roy, roz,
-			rdx, rdy, rdz,
-			activeHit[0], activeHit[1], activeHit[2]
+			ray[0], ray[1], ray[2],
+			ray[3], ray[4], ray[5],
+			Float.NaN, Float.NaN, Float.NaN
 		};
+		return ray;
 	}
 
 	private boolean getVrUiHit(int canvasWidth, int canvasHeight, VrUi.PanelHit out)
@@ -3365,9 +3211,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			vrPendingClickRay = null;
 			int button = vrPendingClickButton;
-			float[] clickHit = vrPendingClickHit; // depth-buffer position for WALK fallback
-			vrPendingClickHit = null;
-			vrInteraction.handleClick(button, clickRay, clickHit);
+			vrInteraction.handleClick(button, clickRay);
 		}
 
 		WorldView wv = client.getTopLevelWorldView();
@@ -3601,6 +3445,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int height = bufferProvider.getHeight();
 		if (includeClickMarker)
 		{
+			drawVrDesktopActivationMarker(pixels, width, height);
 			drawVrDesktopClickMarker(pixels, width, height);
 		}
 
@@ -3635,6 +3480,37 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		log.info("VR desktop click marker: canvas=({}, {}) requested=({}, {}) button={}", clampedX, clampedY, x, y, button);
 	}
 
+	void setVrDesktopActivationMarker(int x, int y)
+	{
+		int canvasWidth = client.getCanvasWidth();
+		int canvasHeight = client.getCanvasHeight();
+		if (canvasWidth <= 0 || canvasHeight <= 0)
+		{
+			return;
+		}
+		int clampedX = Math.max(0, Math.min(canvasWidth - 1, x));
+		int clampedY = Math.max(0, Math.min(canvasHeight - 1, y));
+		vrDesktopActivationMarkerPoint = new int[]{clampedX, clampedY};
+		vrDesktopActivationMarkerMs = System.currentTimeMillis();
+		log.info("VR desktop activation marker: canvas=({}, {}) requested=({}, {})", clampedX, clampedY, x, y);
+	}
+
+	private void drawVrDesktopActivationMarker(int[] pixels, int width, int height)
+	{
+		int[] marker = vrDesktopActivationMarkerPoint;
+		if (marker == null || pixels == null || width <= 0 || height <= 0)
+		{
+			return;
+		}
+		if (System.currentTimeMillis() - vrDesktopActivationMarkerMs > VR_DESKTOP_ACTIVATION_MARKER_STALE_MS)
+		{
+			return;
+		}
+
+		drawCanvasCross(pixels, width, height, marker[0], marker[1],
+			VR_DESKTOP_CLICK_MARKER_RADIUS, VR_DESKTOP_ACTIVATION_MARKER_COLOR);
+	}
+
 	private void drawVrDesktopClickMarker(int[] pixels, int width, int height)
 	{
 		int[] marker = vrDesktopClickMarkerPoint;
@@ -3647,12 +3523,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		int x = marker[0];
-		int y = marker[1];
 		int color = vrDesktopClickMarkerButton == MouseEvent.BUTTON3
 			? VR_DESKTOP_CLICK_MARKER_RMB_COLOR
 			: VR_DESKTOP_CLICK_MARKER_COLOR;
-		for (int i = -VR_DESKTOP_CLICK_MARKER_RADIUS; i <= VR_DESKTOP_CLICK_MARKER_RADIUS; i++)
+		drawCanvasCross(pixels, width, height, marker[0], marker[1],
+			VR_DESKTOP_CLICK_MARKER_RADIUS, color);
+	}
+
+	private static void drawCanvasCross(int[] pixels, int width, int height, int x, int y, int radius, int color)
+	{
+		for (int i = -radius; i <= radius; i++)
 		{
 			if (x + i >= 0 && x + i < width && y + i >= 0 && y + i < height)
 			{
