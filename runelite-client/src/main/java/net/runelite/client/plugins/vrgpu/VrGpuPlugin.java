@@ -3477,7 +3477,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vrDesktopClickMarkerPoint = new int[]{clampedX, clampedY};
 		vrDesktopClickMarkerMs = System.currentTimeMillis();
 		vrDesktopClickMarkerButton = button;
-		log.info("VR desktop click marker: canvas=({}, {}) requested=({}, {}) button={}", clampedX, clampedY, x, y, button);
 	}
 
 	void setVrDesktopActivationMarker(int x, int y)
@@ -3492,7 +3491,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		int clampedY = Math.max(0, Math.min(canvasHeight - 1, y));
 		vrDesktopActivationMarkerPoint = new int[]{clampedX, clampedY};
 		vrDesktopActivationMarkerMs = System.currentTimeMillis();
-		log.info("VR desktop activation marker: canvas=({}, {}) requested=({}, {})", clampedX, clampedY, x, y);
 	}
 
 	private void drawVrDesktopActivationMarker(int[] pixels, int width, int height)
@@ -4267,20 +4265,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		if (vrMenuSuppressCaptureUntilClosed)
 		{
-			long now = System.currentTimeMillis();
-			if (now - vrLastMenuCaptureSuppressedLogMs > 500L)
-			{
-				vrLastMenuCaptureSuppressedLogMs = now;
-				log.info("VR RMB menu capture suppressed while vanilla menu still open: menuRect=({}, {}) {}x{}",
-					client.getMenuX(), client.getMenuY(), client.getMenuWidth(), client.getMenuHeight());
-			}
 			return;
 		}
 
-		int menuX = client.getMenuX();
-		int menuY = client.getMenuY();
-		int menuW = client.getMenuWidth();
-		int menuH = client.getMenuHeight();
+		net.runelite.api.Menu vanillaMenu = client.getMenu();
+		int menuX = vanillaMenu.getMenuX();
+		int menuY = vanillaMenu.getMenuY();
+		int menuW = vanillaMenu.getMenuWidth();
+		int menuH = vanillaMenu.getMenuHeight();
 		Rectangle crop = clampVrActorUiCrop(menuX, menuY, menuW, menuH);
 		if (crop == null)
 		{
@@ -4339,7 +4331,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	void logVrMenuEntries(String context)
 	{
-		MenuEntry[] entries = client.getMenuEntries();
+		MenuEntry[] entries = client.getMenu().getMenuEntries();
 		StringBuilder sb = new StringBuilder();
 		sb.append("VR ").append(context).append(" live menu entries (")
 			.append(entries == null ? 0 : entries.length).append(")");
@@ -4465,7 +4457,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private MenuEntry getVrContextHintMenuEntry()
 	{
-		MenuEntry[] menuEntries = client.getMenuEntries();
+		MenuEntry[] menuEntries = client.getMenu().getMenuEntries();
 		if (menuEntries == null || menuEntries.length == 0)
 		{
 			return null;
@@ -5523,14 +5515,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		vrDesktopCameraAimTarget = new float[]{x, y, z};
 		vrDesktopCameraAimAngles = new int[]{desiredYaw, desiredPitch};
-		if (verbose)
-		{
-			log.info("VR desktop camera aim: targetScene=({}, {}) targetLocalGpu=({},{},{}) desiredYaw={} desiredPitch={} currentYaw={} currentPitch={}",
-				sceneX, sceneY,
-				String.format("%.1f", x), String.format("%.1f", y), String.format("%.1f", z),
-				desiredYaw, desiredPitch,
-				client.getCameraYaw(), client.getCameraPitch());
-		}
 	}
 
 	private void applyDesktopCameraMaxZoomOut()
@@ -5734,17 +5718,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private void logVrMenuRayDebug(int hand, boolean planeHit, boolean inside, boolean outsideCloseMargin)
 	{
-		long now = System.currentTimeMillis();
-		if (now - vrLastMenuRayDebugLogMs < 300L)
-		{
-			return;
-		}
-		vrLastMenuRayDebugLogMs = now;
-		log.info("VR menu ray: hand={} planeHit={} inside={} outsideCloseMargin={} u={} v={}",
-			hand == VR_HAND_RIGHT ? "right" : hand == VR_HAND_LEFT ? "left" : "none",
-			planeHit, inside, outsideCloseMargin,
-			planeHit ? String.format("%.3f", vrMenuHitScratch.u) : "n/a",
-			planeHit ? String.format("%.3f", vrMenuHitScratch.v) : "n/a");
 	}
 
 	private void logVrMenuOpenUvDebug(int hand, boolean planeHit, boolean inside, boolean outsideCloseMargin)
@@ -5754,17 +5727,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 		vrMenuOpenUvDebugFrames--;
-		VrMenuOverlay menu = vrMenuOverlay;
-		log.info("VR menu open UV frame {}: hand={} planeHit={} inside={} outsideCloseMargin={} u={} v={} menuRect=({}, {}) {}x{}",
-			5 - vrMenuOpenUvDebugFrames,
-			hand == VR_HAND_RIGHT ? "right" : hand == VR_HAND_LEFT ? "left" : "none",
-			planeHit, inside, outsideCloseMargin,
-			planeHit ? String.format("%.3f", vrMenuHitScratch.u) : "n/a",
-			planeHit ? String.format("%.3f", vrMenuHitScratch.v) : "n/a",
-			menu != null ? menu.canvasX : -1,
-			menu != null ? menu.canvasY : -1,
-			menu != null ? menu.width : -1,
-			menu != null ? menu.height : -1);
 	}
 
 	private String formatLastVrMenuUv()
@@ -5796,7 +5758,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			return null;
 		}
-		MenuEntry[] entries = client.getMenuEntries();
+		MenuEntry[] entries = client.getMenu().getMenuEntries();
 		if (entries == null || entries.length == 0)
 		{
 			return null;
@@ -5840,7 +5802,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private MenuEntry findCancelMenuEntry()
 	{
-		MenuEntry[] entries = client.getMenuEntries();
+		MenuEntry[] entries = client.getMenu().getMenuEntries();
 		if (entries == null)
 		{
 			return null;
