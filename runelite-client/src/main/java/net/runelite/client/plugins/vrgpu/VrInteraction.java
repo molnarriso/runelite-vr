@@ -5,7 +5,6 @@
 package net.runelite.client.plugins.vrgpu;
 
 import java.awt.event.MouseEvent;
-import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.Constants;
@@ -97,9 +96,7 @@ final class VrInteraction
 		float dx = clickRay[3], dy = clickRay[4], dz = clickRay[5];
 
 		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv);
-		List<Hit> hits = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
-		Hit hit = hits.isEmpty() ? null : hits.get(0);
-		logRay(button, hits, groundHit, ox, oy, oz, dx, dy, dz);
+		Hit hit = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit, false);
 		plugin.setLastGroundHit(groundHit);
 		plugin.setLastSceneRaycastHit(hit, ox, oy, oz, dx, dy, dz);
 		plugin.updateClientWalkDiagnostics(wv);
@@ -156,11 +153,11 @@ final class VrInteraction
 
 		// LMB: walk the menu in priority order, dispatch the first entry that concerns our hit.
 		MenuEntry click = findClickEntry(hit, sceneX, sceneY);
+		String hitDesc = hit == null ? "ground=(" + sceneX + "," + sceneY + ")"
+			: hit.entityType + " " + hit.entityName + " scene=(" + sceneX + "," + sceneY + ")";
 		if (click == null)
 		{
 			MenuEntry top = getTopLiveMenuEntry();
-			String hitDesc = hit == null ? "ground=(" + sceneX + "," + sceneY + ")"
-				: hit.entityType + " " + hit.entityName;
 			log.info("VR LMB verify FAIL for {}; no entry concerns the hit (top={} {} action={})",
 				hitDesc,
 				top == null ? "null" : top.getOption(),
@@ -169,34 +166,38 @@ final class VrInteraction
 			if (hit != null) logHitActionsAndLiveMenu(hit);
 			return;
 		}
-		log.info("VR LMB verify OK: {} {} ({}) p0={} p1={}",
+		log.info("VR LMB verify OK for {}: picked {} {} ({}) p0={} p1={} id={}",
+			hitDesc,
 			click.getOption(), click.getTarget(), click.getType(),
-			click.getParam0(), click.getParam1());
+			click.getParam0(), click.getParam1(), click.getIdentifier());
+		logLiveMenu("LMB");
 		dispatchLiveMenuEntry(click, wv);
 	}
 
-	private void logRay(int button, List<Hit> hits, GroundHit groundHit, float ox, float oy, float oz, float dx, float dy, float dz)
+	private void logLiveMenu(String label)
 	{
-		StringBuilder sb = new StringBuilder();
-		sb.append("VR ").append(button == MouseEvent.BUTTON1 ? "LMB" : "RMB")
-			.append(" ray (").append(hits.size()).append(" spatial hits)");
-
-		if (groundHit != null)
+		MenuEntry[] entries = plugin.getClient().getMenu().getMenuEntries();
+		if (entries == null || entries.length == 0)
 		{
-			sb.append(" ground=(").append(groundHit.sceneX).append(",").append(groundHit.sceneY)
-				.append(") t=").append(String.format("%.1f", groundHit.t))
-				.append(" local=(").append(String.format("%.1f", groundHit.x)).append(',')
-				.append(String.format("%.1f", groundHit.y)).append(',')
-				.append(String.format("%.1f", groundHit.z)).append(')');
+			log.info("VR {} live menu: empty", label);
+			return;
 		}
-		sb.append('\n');
-
-		for (Hit hit : hits)
+		StringBuilder sb = new StringBuilder("VR ").append(label).append(" live menu (")
+			.append(entries.length).append("):");
+		for (int i = entries.length - 1; i >= 0; i--)
 		{
-			sb.append(String.format("  %s %s [scene=%d,%d t=%.1f]\n",
-				hit.entityType, hit.entityName, hit.sceneX, hit.sceneY, hit.t));
-		}
+			MenuEntry e = entries[i];
+			sb.append("\n  ").append(entries.length - i).append(". ")
+				.append(e.getOption()).append(' ').append(e.getTarget())
+				.append(" action=").append(e.getType())
+				.append(" p0=").append(e.getParam0())
+				.append(" p1=").append(e.getParam1())
+				.append(" id=").append(e.getIdentifier())
+				.append(" itemId=").append(e.getItemId())
+				.append(" itemOP=").append(e.getItemOp())
+				.append(" LeftClickForce=").append(e.isForceLeftClick());
 
+		}
 		log.info("{}", sb);
 	}
 
@@ -626,8 +627,7 @@ final class VrInteraction
 		float dy = hoverRay[4];
 		float dz = hoverRay[5];
 		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv);
-		List<Hit> hits = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit);
-		Hit hit = !hits.isEmpty() ? hits.get(0) : null;
+		Hit hit = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit, false);
 		plugin.setInteractionHoverDebug(hit, groundHit, ox, oy, oz, dx, dy, dz, now);
 
 		// Same first-intersection rule as click: pick whichever the VR ray actually hit first.

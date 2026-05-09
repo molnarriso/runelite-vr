@@ -6,6 +6,7 @@ package net.runelite.client.plugins.vrgpu;
 
 import java.util.ArrayList;
 import java.util.List;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.AABB;
 import net.runelite.api.Client;
 import net.runelite.api.DecorativeObject;
@@ -31,6 +32,7 @@ import net.runelite.api.coords.LocalPoint;
  * plus ground tiles for Walk-here resolution. Pure spatial logic — no GL state, no plugin coupling.
  * All public methods must be called on the client thread.
  */
+@Slf4j
 final class VrSceneRaycaster
 {
 	private final Client client;
@@ -41,11 +43,11 @@ final class VrSceneRaycaster
 	}
 
 	/**
-	 * Cast a ray through the scene, collecting all intersected entities sorted by distance.
-	 * Tests actors and tile entities against actual model geometry, plus ground tiles for Walk here.
+	 * Cast a ray through the scene and return the closest intersected entity, if any.
+	 * Tests actors and tile entities against actual model geometry.
 	 */
-	List<VrInteraction.Hit> raycastScene(float ox, float oy, float oz,
-		float dx, float dy, float dz, WorldView wv, VrInteraction.GroundHit groundHit)
+	VrInteraction.Hit raycastScene(float ox, float oy, float oz,
+		float dx, float dy, float dz, WorldView wv, VrInteraction.GroundHit groundHit, boolean logRaycast)
 	{
 		List<VrInteraction.Hit> hits = new ArrayList<>();
 		int plane = wv.getPlane();
@@ -97,6 +99,7 @@ final class VrSceneRaycaster
 							clampScene(obj.getY() >> 7, wv.getSizeY()),
 							obj.getId(),
 							obj,
+							logRaycast,
 							new VrInteraction.RenderablePlacement(obj.getRenderable(), obj.getModelOrientation() & 2047, obj.getX(), obj.getZ(), obj.getY()));
 						if (hit != null)
 						{
@@ -113,6 +116,7 @@ final class VrSceneRaycaster
 							scY,
 							wall.getId(),
 							wall,
+							logRaycast,
 							new VrInteraction.RenderablePlacement(wall.getRenderable1(), 0, wall.getX(), wall.getZ(), wall.getY()),
 							new VrInteraction.RenderablePlacement(wall.getRenderable2(), 0, wall.getX(), wall.getZ(), wall.getY()));
 						if (hit != null)
@@ -130,6 +134,7 @@ final class VrSceneRaycaster
 							scY,
 							deco.getId(),
 							deco,
+							logRaycast,
 							new VrInteraction.RenderablePlacement(deco.getRenderable(), 0,
 								deco.getX() + deco.getXOffset(), deco.getZ(), deco.getY() + deco.getYOffset()),
 							new VrInteraction.RenderablePlacement(deco.getRenderable2(), 0,
@@ -149,6 +154,7 @@ final class VrSceneRaycaster
 							scY,
 							ground.getId(),
 							ground,
+							logRaycast,
 							new VrInteraction.RenderablePlacement(ground.getRenderable(), 0, ground.getX(), ground.getZ(), ground.getY()));
 						if (hit != null)
 						{
@@ -184,7 +190,35 @@ final class VrSceneRaycaster
 		}
 
 		hits.sort((a, b) -> Float.compare(a.t, b.t));
-		return hits;
+		if (logRaycast)
+		{
+			logRaycast(hits, groundHit);
+		}
+		return hits.isEmpty() ? null : hits.get(0);
+	}
+
+	private void logRaycast(List<VrInteraction.Hit> hits, VrInteraction.GroundHit groundHit)
+	{
+		StringBuilder sb = new StringBuilder("VR raycast (")
+			.append(hits.size()).append(" spatial hits)");
+
+		if (groundHit != null)
+		{
+			sb.append(" ground=(").append(groundHit.sceneX).append(",").append(groundHit.sceneY)
+				.append(") t=").append(String.format("%.1f", groundHit.t))
+				.append(" local=(").append(String.format("%.1f", groundHit.x)).append(',')
+				.append(String.format("%.1f", groundHit.y)).append(',')
+				.append(String.format("%.1f", groundHit.z)).append(')');
+		}
+		sb.append('\n');
+
+		for (VrInteraction.Hit hit : hits)
+		{
+			sb.append(String.format("  %s %s [scene=%d,%d t=%.1f]\n",
+				hit.entityType, hit.entityName, hit.sceneX, hit.sceneY, hit.t));
+		}
+
+		log.info("{}", sb);
 	}
 
 	VrInteraction.GroundHit intersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv)
@@ -270,11 +304,16 @@ final class VrSceneRaycaster
 
 	private VrInteraction.Hit buildObjectHit(float ox, float oy, float oz, float dx, float dy, float dz,
 		String entityType, int sceneX, int sceneY, int objId, net.runelite.api.TileObject object,
-		VrInteraction.RenderablePlacement... placements)
+		boolean logMiss, VrInteraction.RenderablePlacement... placements)
 	{
 		ObjectComposition def = client.getObjectDefinition(objId);
 		if (def == null)
 		{
+			if (logMiss)
+			{
+				log.info("VR raycast object miss: {} id={} scene=({},{}), object definition is null",
+					entityType, objId, sceneX, sceneY);
+			}
 			return null;
 		}
 		if (def.getImpostorIds() != null)
@@ -287,18 +326,25 @@ final class VrSceneRaycaster
 		}
 
 		float bestT = Float.MAX_VALUE;
+		int renderablePlacements = 0;
+		int modelPlacements = 0;
 		for (VrInteraction.RenderablePlacement placement : placements)
 		{
 			if (placement == null || placement.renderable == null)
 			{
 				continue;
 			}
+			renderablePlacements++;
 
-			Model model = placement.renderable.getModel();
+			// Mirror RuneLite's outline renderer: a Renderable can already be the Model.
+			Model model = placement.renderable instanceof Model
+				? (Model) placement.renderable
+				: placement.renderable.getModel();
 			if (model == null)
 			{
 				continue;
 			}
+			modelPlacements++;
 
 			float t = rayTestModelAabb(ox, oy, oz, dx, dy, dz, model, placement.orientation, placement.x, placement.y, placement.z);
 			if (t > 0f && t < bestT)
@@ -309,6 +355,24 @@ final class VrSceneRaycaster
 
 		if (bestT == Float.MAX_VALUE)
 		{
+			if (logMiss)
+			{
+				String reason;
+				if (renderablePlacements == 0)
+				{
+					reason = "no renderable placements";
+				}
+				else if (modelPlacements == 0)
+				{
+					reason = "no renderable models";
+				}
+				else
+				{
+					reason = "ray missed all model AABBs";
+				}
+				log.info("VR raycast object miss: {} id={} name={} scene=({},{}), {}",
+					entityType, objId, safeName(def.getName(), "Object"), sceneX, sceneY, reason);
+			}
 			return null;
 		}
 
