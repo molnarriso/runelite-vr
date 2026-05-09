@@ -628,7 +628,7 @@ final class VrInteraction
 		float dz = hoverRay[5];
 		GroundHit groundHit = plugin.getSceneRaycaster().intersectGround(ox, oy, oz, dx, dy, dz, wv);
 		Hit hit = plugin.getSceneRaycaster().raycastScene(ox, oy, oz, dx, dy, dz, wv, groundHit, false);
-		plugin.setInteractionHoverDebug(hit, groundHit, ox, oy, oz, dx, dy, dz, now);
+		plugin.setInteractionHoverRaycastOutputs(hit, groundHit, ox, oy, oz, dx, dy, dz, now);
 
 		// Same first-intersection rule as click: pick whichever the VR ray actually hit first.
 		float px, py, pz;

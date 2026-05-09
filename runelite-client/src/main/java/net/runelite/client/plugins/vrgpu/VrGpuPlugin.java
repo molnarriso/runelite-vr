@@ -269,12 +269,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private float[] vrLastGroundHit;
 	/** Persistent first scene raycast hit [x,y,z] from the last VR click. */
 	private float[] vrLastSceneRaycastHit;
-	/** Live hover scene/ground hits resolved by VrInteraction on the client thread. */
+	/** Live hover raycast outputs resolved by VrInteraction on the client thread. */
 	private volatile float[] vrInteractionHoverSceneHit;
 	private volatile float[] vrInteractionHoverGroundHit;
 	private volatile long vrInteractionHoverDebugTimeMs;
-	/** Persistent reconstructed desktop screen-ray ground hit [x,y,z]. */
-	private float[] vrLastDesktopRayHit;
 	/** Persistent desktop-camera aim target [x,y,z] in GPU convention for diagnostics. */
 	private float[] vrDesktopCameraAimTarget;
 	/** Last requested desktop camera yaw/pitch targets for diagnostics. */
@@ -1911,16 +1909,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				debugRayFb.put(tx).put(ty).put(tz).put(0.1f).put(0.9f).put(1f).put(0.9f);
 			}
 
-			if (vrLastDesktopRayHit != null)
-			{
-				float hx = vrLastDesktopRayHit[0], hy = vrLastDesktopRayHit[1], hz = vrLastDesktopRayHit[2];
-				// White cross = where the reconstructed desktop screen ray hits the ground.
-				debugRayFb.put(hx - BIG).put(hy).put(hz      ).put(1f).put(1f).put(1f).put(1f);
-				debugRayFb.put(hx + BIG).put(hy).put(hz      ).put(1f).put(1f).put(1f).put(1f);
-				debugRayFb.put(hx      ).put(hy).put(hz - BIG).put(1f).put(1f).put(1f).put(1f);
-				debugRayFb.put(hx      ).put(hy).put(hz + BIG).put(1f).put(1f).put(1f).put(1f);
-			}
-
 			if (vrLastDispatchSceneTile != null)
 			{
 				float dtx = vrLastDispatchSceneTile[0] * TILE;
@@ -1953,7 +1941,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		if (System.currentTimeMillis() - vrInteractionHoverDebugTimeMs <= VR_CONTEXT_HINT_STALE_MS)
 		{
-			// Magenta = live first semantic/object hit; green = live intersectGround result.
+			// Magenta = raycastScene result; green = intersectGround result.
 			putDebugCross(vrInteractionHoverSceneHit, 90f, 1f, 0f, 1f, 1f);
 			putDebugCross(vrInteractionHoverGroundHit, 70f, 0.2f, 1f, 0.2f, 1f);
 		}
@@ -3304,10 +3292,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vrLastSceneRaycastHit = hit == null ? null : pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
 	}
 
-	void setInteractionHoverDebug(VrInteraction.Hit hit, VrInteraction.GroundHit groundHit,
+	void setInteractionHoverRaycastOutputs(VrInteraction.Hit hit, VrInteraction.GroundHit groundHit,
 		float ox, float oy, float oz, float dx, float dy, float dz, long timeMs)
 	{
-		// These markers show exactly what VrInteraction resolved on the client thread.
+		// Store the already-computed processHover() raycastScene/intersectGround outputs.
+		// Rendering only visualizes these points; it must not issue another scene raycast.
 		vrInteractionHoverSceneHit = hit == null ? null : pointOnRay(ox, oy, oz, dx, dy, dz, hit.t);
 		vrInteractionHoverGroundHit = groundHit == null ? null : new float[]{groundHit.x, groundHit.y, groundHit.z};
 		vrInteractionHoverDebugTimeMs = timeMs;
@@ -3331,11 +3320,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vrLastClientSelectedSceneTile = null;
 		vrLastClientDestination = null;
 		vrLastDispatchSceneTile = new int[]{sceneX, sceneY};
-	}
-
-	void setLastDesktopRayHit(float[] hit)
-	{
-		vrLastDesktopRayHit = hit;
 	}
 
 	void setPendingWalkCanvasPoint(int x, int y)
@@ -5980,58 +5964,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			0,
 			false,
 			MouseEvent.NOBUTTON));
-	}
-
-	float[] reconstructDesktopScreenRayGroundHit(int canvasX, int canvasY, WorldView wv)
-	{
-		final float viewportXMiddle = client.getViewportWidth() / 2f;
-		final float viewportYMiddle = client.getViewportHeight() / 2f;
-		final float viewportXOffset = client.getViewportXOffset();
-		final float viewportYOffset = client.getViewportYOffset();
-		final float zoom3d = client.getScale();
-
-		float sx = canvasX - viewportXOffset - viewportXMiddle;
-		float sy = canvasY - viewportYOffset - viewportYMiddle;
-
-		double cameraPitch = client.getCameraFpPitch();
-		double cameraYaw = client.getCameraFpYaw();
-		float pitchSin = (float) Math.sin(cameraPitch);
-		float pitchCos = (float) Math.cos(cameraPitch);
-		float yawSin = (float) Math.sin(cameraYaw);
-		float yawCos = (float) Math.cos(cameraYaw);
-
-		float x1 = sx;
-		float y2 = sy;
-		float z1 = zoom3d;
-
-		// Invert the projection and camera rotation used by Perspective.localToCanvasGpu.
-		float y1 = y2 * pitchSin + z1 * pitchCos;
-		float fz = y2 * pitchCos - z1 * pitchSin;
-		float fx = x1 * yawCos - y1 * yawSin;
-		float fy = y1 * yawCos + x1 * yawSin;
-
-		float originX = (float) client.getCameraFpX();
-		float originY = (float) client.getCameraFpZ();
-		float originZ = (float) client.getCameraFpY();
-		float dirX = fx;
-		float dirY = fz;
-		float dirZ = fy;
-		float len = (float) Math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
-		if (len < 1e-6f)
-		{
-			return null;
-		}
-		dirX /= len;
-		dirY /= len;
-		dirZ /= len;
-
-		VrInteraction.GroundHit desktopGroundHit = vrSceneRaycaster.intersectGround(originX, originY, originZ, dirX, dirY, dirZ, wv);
-		if (desktopGroundHit == null)
-		{
-			return null;
-		}
-
-		return new float[]{desktopGroundHit.x, desktopGroundHit.y, desktopGroundHit.z};
 	}
 
 	void updateClientWalkDiagnostics(WorldView wv)
