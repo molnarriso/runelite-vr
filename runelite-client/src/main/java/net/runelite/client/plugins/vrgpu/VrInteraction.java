@@ -139,14 +139,13 @@ final class VrInteraction
 		int canvasX = Math.max(0, Math.min(client.getCanvasWidth() - 1, projected.getX()));
 		int canvasY = Math.max(0, Math.min(client.getCanvasHeight() - 1, projected.getY()));
 		plugin.setVrDesktopActivationMarker(canvasX, canvasY);
-		plugin.primeCanvasMouseForWalk(canvasX, canvasY);
+		plugin.primeCanvasMouse(canvasX, canvasY);
 
 		if (button == MouseEvent.BUTTON3)
 		{
 			plugin.setVrPendingMenuAnchor(px, py + VrGpuPlugin.VR_MENU_WORLD_Y_OFFSET, pz);
 			plugin.logVrMenuEntries("RMB before open");
 			plugin.dispatchCanvasMouseClick(canvasX, canvasY, MouseEvent.BUTTON3);
-			plugin.setVrDesktopClickMarker(canvasX, canvasY, MouseEvent.BUTTON3);
 			log.info("VR RMB dispatch: open menu at canvas=({},{})", canvasX, canvasY);
 			return;
 		}
@@ -661,7 +660,7 @@ final class VrInteraction
 		int canvasX = Math.max(0, Math.min(client.getCanvasWidth() - 1, projected.getX()));
 		int canvasY = Math.max(0, Math.min(client.getCanvasHeight() - 1, projected.getY()));
 		plugin.setVrDesktopActivationMarker(canvasX, canvasY);
-		plugin.primeCanvasMouseForWalk(canvasX, canvasY);
+		plugin.primeCanvasMouse(canvasX, canvasY);
 
 		// Hint mirrors the LMB dispatch picker so the label can't disagree with what fires.
 		MenuEntry hint = findClickEntry(hit, sceneX, sceneY);

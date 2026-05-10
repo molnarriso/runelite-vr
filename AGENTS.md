@@ -19,11 +19,23 @@ We are building a RuneLite VR GPU plugin: OpenXR stereo rendering for the 3D wor
 ## Main VR Files
 
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrGpuPlugin.java`: plugin entry point, DrawCallbacks, scene rendering, UI capture, VR frame flow.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrController.java`: per-hand controller snapshot, button hysteresis, edge detection, and OSRS-space ray derivation.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllers.java`: owns both controllers, primary-hand selection, and context-menu owner state.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrUi.java`: flat canvas UI panel and pointer rendering.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrBillboardRenderer.java`: actor/context/menu billboard textures.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrInteraction.java`: controller interaction and click handling.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSceneRaycaster.java`: VR ray picking against scene/world objects.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/openxr/`: OpenXR context, swapchains, and input.
+
+## VR Interaction Rules
+
+- `VrControllers.primary()` is the source of truth for the active pointer hand. It defaults to right, flips to the hand that dispatched a click, and is overridden by the latched context-menu owner while a vanilla menu is open.
+- Both controller rays should render whenever VR is active. Rendering is independent of primary-hand state.
+- Trigger and squeeze use hysteresis in `VrController`: press at `0.7`, release at `0.5`. Do not reintroduce raw threshold checks at call sites.
+- Context-menu open/close lifecycle follows `client.isMenuOpen()` edges. Remember the previous value, react to true/false transitions, and avoid separate sentinel menu-open state.
+- `clearVrMenuOverlay()` only clears captured VR overlay pixels/pointer state. Do not use it to declare the vanilla menu closed or to clear controller menu ownership; `syncVrMenuOpenState()` handles that from `client.isMenuOpen()`.
+- Ray-leave menu cancel should select the visible vanilla `Cancel` row with a synthetic canvas click. Guard duplicate cancel dispatches while waiting for the `client.isMenuOpen()` false edge, because a second click can become a world action.
+- `dispatchCanvasMouseClick(...)` is the synthetic click path and should mark the VR desktop click internally. Direct `client.menuAction(...)` paths need explicit marker handling if they should be hidden from normal desktop-click diagnostics.
 
 ## Useful RuneLite sources
 
