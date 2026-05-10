@@ -207,7 +207,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_STAGE_CHARACTER_OFFSET_Z = -0.5f;
 	private static final float VR_ZOOM_BASE = 1.0f;
 	private static final float VR_ZOOM_MIN = 0.5f;
-	private static final float VR_ZOOM_MAX = 10.0f;
+	private static final float VR_ZOOM_MAX = 5.0f;
 	private static final float VR_ZOOM_SPEED_PER_SECOND = 3.0f;
 	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
 
