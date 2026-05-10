@@ -17,8 +17,19 @@ final class VrController
 		RIGHT
 	}
 
+	enum StickAction
+	{
+		CENTERED,
+		UP,
+		DOWN,
+		LEFT,
+		RIGHT
+	}
+
 	private static final float BUTTON_PRESS_THRESHOLD = 0.7f;
 	private static final float BUTTON_RELEASE_THRESHOLD = 0.5f;
+	private static final float STICK_ACTION_THRESHOLD = 0.65f;
+	private static final float STICK_DEAD_ZONE = 0.30f;
 
 	public final Hand hand;
 	private final XrInput xrInput;
@@ -28,9 +39,11 @@ final class VrController
 	public float dirX, dirY, dirZ;
 	public float oriX, oriY, oriZ, oriW;
 	public float trigger, squeeze;
+	public float thumbstickX, thumbstickY;
 	// Resolved button state uses hysteresis so analog values near the threshold do not flicker.
 	public boolean triggerDown;
 	public boolean squeezeDown;
+	public StickAction stickAction = StickAction.CENTERED;
 	public float[] osrsRay;
 	private boolean prevTriggerDown;
 	private boolean prevSqueezeDown;
@@ -69,6 +82,8 @@ final class VrController
 			oriW = xrInput.getLeftOriW();
 			trigger = xrInput.getLeftTrigger();
 			squeeze = xrInput.getLeftSqueeze();
+			thumbstickX = xrInput.getLeftThumbstickX();
+			thumbstickY = xrInput.getLeftThumbstickY();
 		}
 		else
 		{
@@ -85,10 +100,13 @@ final class VrController
 			oriW = xrInput.getRightOriW();
 			trigger = xrInput.getRightTrigger();
 			squeeze = xrInput.getRightSqueeze();
+			thumbstickX = xrInput.getRightThumbstickX();
+			thumbstickY = xrInput.getRightThumbstickY();
 		}
 
 		triggerDown = applyHysteresis(triggerDown, trigger);
 		squeezeDown = applyHysteresis(squeezeDown, squeeze);
+		stickAction = resolveStickAction(stickAction, thumbstickX, thumbstickY);
 	}
 
 	void computeOsrsRay(float worldScale, float stageOffsetY, float stageOffsetZ,
@@ -133,5 +151,29 @@ final class VrController
 			return value >= BUTTON_RELEASE_THRESHOLD;
 		}
 		return value >= BUTTON_PRESS_THRESHOLD;
+	}
+
+	private static StickAction resolveStickAction(StickAction current, float x, float y)
+	{
+		if (Math.abs(x) <= STICK_DEAD_ZONE && Math.abs(y) <= STICK_DEAD_ZONE)
+		{
+			return StickAction.CENTERED;
+		}
+		if (current != StickAction.CENTERED)
+		{
+			return current;
+		}
+
+		float absX = Math.abs(x);
+		float absY = Math.abs(y);
+		if (absX < STICK_ACTION_THRESHOLD && absY < STICK_ACTION_THRESHOLD)
+		{
+			return StickAction.CENTERED;
+		}
+		if (absY >= absX)
+		{
+			return y > 0f ? StickAction.UP : StickAction.DOWN;
+		}
+		return x > 0f ? StickAction.RIGHT : StickAction.LEFT;
 	}
 }

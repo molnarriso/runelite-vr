@@ -35,6 +35,7 @@ import org.lwjgl.openxr.XrActionSpaceCreateInfo;
 import org.lwjgl.openxr.XrActionStateFloat;
 import org.lwjgl.openxr.XrActionStateGetInfo;
 import org.lwjgl.openxr.XrActionStatePose;
+import org.lwjgl.openxr.XrActionStateVector2f;
 import org.lwjgl.openxr.XrActionSuggestedBinding;
 import org.lwjgl.openxr.XrActionsSyncInfo;
 import org.lwjgl.openxr.XrActiveActionSet;
@@ -67,6 +68,7 @@ public class XrInput
 	private XrAction aimAction;
 	private XrAction triggerAction;
 	private XrAction squeezeAction;
+	private XrAction thumbstickAction;
 	private XrSpace leftAimSpace;
 	private XrSpace rightAimSpace;
 	private long pathHandLeft;
@@ -86,6 +88,11 @@ public class XrInput
 	@Getter private float leftSqueeze;
 	/** Right squeeze/grip value 0..1. */
 	@Getter private float rightSqueeze;
+
+	/** Left thumbstick/joystick axes, -1..1. */
+	@Getter private float leftThumbstickX, leftThumbstickY;
+	/** Right thumbstick/joystick axes, -1..1. */
+	@Getter private float rightThumbstickX, rightThumbstickY;
 
 	/** Left controller aim origin in stage space (metres). */
 	@Getter private float leftPosX, leftPosY, leftPosZ;
@@ -176,6 +183,18 @@ public class XrInput
 				pp));
 			squeezeAction = new XrAction(pp.get(0), actionSet);
 
+			// Thumbstick / joystick action (both hands) — used by VR camera controls.
+			checkXr("xrCreateAction thumbstick", xrCreateAction(actionSet,
+				XrActionCreateInfo.calloc(stack)
+					.type(XR_TYPE_ACTION_CREATE_INFO)
+					.actionName(stack.UTF8("thumbstick"))
+					.actionType(XR_ACTION_TYPE_VECTOR2F_INPUT)
+					.localizedActionName(stack.UTF8("Thumbstick"))
+					.countSubactionPaths(2)
+					.subactionPaths(subPaths),
+				pp));
+			thumbstickAction = new XrAction(pp.get(0), actionSet);
+
 			suggestBindings(stack);
 
 			// Attach action sets — must happen before xrBeginSession
@@ -245,6 +264,8 @@ public class XrInput
 			rightTrigger = sampleFloat(stack, session, triggerAction, pathHandRight);
 			leftSqueeze  = sampleFloat(stack, session, squeezeAction, pathHandLeft);
 			rightSqueeze = sampleFloat(stack, session, squeezeAction, pathHandRight);
+			sampleVector2(stack, session, thumbstickAction, pathHandLeft, true);
+			sampleVector2(stack, session, thumbstickAction, pathHandRight, false);
 		}
 	}
 
@@ -256,6 +277,7 @@ public class XrInput
 		if (aimAction != null) { xrDestroyAction(aimAction); aimAction = null; }
 		if (triggerAction != null) { xrDestroyAction(triggerAction); triggerAction = null; }
 		if (squeezeAction != null) { xrDestroyAction(squeezeAction); squeezeAction = null; }
+		if (thumbstickAction != null) { xrDestroyAction(thumbstickAction); thumbstickAction = null; }
 		if (actionSet != null) { xrDestroyActionSet(actionSet); actionSet = null; }
 	}
 
@@ -277,21 +299,23 @@ public class XrInput
 		long sqzRc = path(lb, "/user/hand/right/input/squeeze/click");
 		long selL  = path(lb, "/user/hand/left/input/select/click");
 		long selR  = path(lb, "/user/hand/right/input/select/click");
+		long stickL = path(lb, "/user/hand/left/input/thumbstick");
+		long stickR = path(lb, "/user/hand/right/input/thumbstick");
 
 		// Oculus / Meta Touch
 		suggestProfile(stack, lb, "/interaction_profiles/oculus/touch_controller",
-			new long[]{aimL, aimR, trigL, trigR, sqzL, sqzR},
-			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction});
+			new long[]{aimL, aimR, trigL, trigR, sqzL, sqzR, stickL, stickR},
+			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction, thumbstickAction, thumbstickAction});
 
 		// Valve Index
 		suggestProfile(stack, lb, "/interaction_profiles/valve/index_controller",
-			new long[]{aimL, aimR, trigL, trigR, sqzL, sqzR},
-			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction});
+			new long[]{aimL, aimR, trigL, trigR, sqzL, sqzR, stickL, stickR},
+			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction, thumbstickAction, thumbstickAction});
 
 		// Windows Mixed Reality (squeeze is boolean click)
 		suggestProfile(stack, lb, "/interaction_profiles/microsoft/motion_controller",
-			new long[]{aimL, aimR, trigL, trigR, sqzLc, sqzRc},
-			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction});
+			new long[]{aimL, aimR, trigL, trigR, sqzLc, sqzRc, stickL, stickR},
+			new XrAction[]{aimAction, aimAction, triggerAction, triggerAction, squeezeAction, squeezeAction, thumbstickAction, thumbstickAction});
 
 		// KHR Simple (fallback — no squeeze; trigger=select/click, no right-click)
 		suggestProfile(stack, lb, "/interaction_profiles/khr/simple_controller",
@@ -403,6 +427,31 @@ public class XrInput
 				.subactionPath(subPath),
 			state);
 		return state.isActive() ? state.currentState() : 0f;
+	}
+
+	private void sampleVector2(MemoryStack stack, XrSession session, XrAction action, long subPath, boolean isLeft)
+	{
+		XrActionStateVector2f state = XrActionStateVector2f.calloc(stack)
+			.type(XR_TYPE_ACTION_STATE_VECTOR2F);
+		xrGetActionStateVector2f(session,
+			XrActionStateGetInfo.calloc(stack)
+				.type(XR_TYPE_ACTION_STATE_GET_INFO)
+				.action(action)
+				.subactionPath(subPath),
+			state);
+
+		float x = state.isActive() ? state.currentState().x() : 0f;
+		float y = state.isActive() ? state.currentState().y() : 0f;
+		if (isLeft)
+		{
+			leftThumbstickX = x;
+			leftThumbstickY = y;
+		}
+		else
+		{
+			rightThumbstickX = x;
+			rightThumbstickY = y;
+		}
 	}
 
 	private void checkXr(String call, int result)

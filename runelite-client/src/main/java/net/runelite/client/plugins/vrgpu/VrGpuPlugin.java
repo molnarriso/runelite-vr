@@ -203,8 +203,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 * 1 tile = 128 units ≈ 0.1 m → 0.1 / 128 ≈ 0.000781.
 	 */
 	private static final float DEFAULT_WORLD_SCALE = 0.000781f;
-	private static final float VR_STAGE_CHARACTER_OFFSET_Y = -1.0f;
+	private static final float VR_STAGE_CHARACTER_OFFSET_Y = -1.5f;
 	private static final float VR_STAGE_CHARACTER_OFFSET_Z = -0.5f;
+	private static final float VR_ZOOM_BASE = 1.0f;
+	private static final float VR_ZOOM_MIN = 0.5f;
+	private static final float VR_ZOOM_MAX = 10.0f;
+	private static final float VR_ZOOM_SPEED_PER_SECOND = 3.0f;
 	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
 
 	/**
@@ -213,6 +217,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 * NaN until that first frame runs.
 	 */
 	private float vrWorldAnchorY = Float.NaN;
+	private float vrZoom = VR_ZOOM_BASE;
+	private long vrLastZoomUpdateMs;
 
 	/** Which eye is currently being rendered: 0 = left, 1 = right, -1 = no VR. */
 	private int currentEye = -1;
@@ -345,7 +351,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_MENU_OFFSET_XM = 0f;
 	private static final float VR_MENU_OFFSET_YM = 0.10f;
 	private static final float VR_MENU_CONTEXT_HINT_GAP_M = 0.035f;
-	private static final float VR_MENU_CLOSE_MARGIN_UV = 2.50f;
+	private static final float VR_MENU_CLOSE_MARGIN_U = 0.50f;
+	private static final float VR_MENU_CLOSE_MARGIN_V = 2.50f;
 	private static final int VR_MENU_CAPTURE_ZONE_COLOR = 0x55a0a0a0;
 	private static final int[] VR_MENU_CAPTURE_ZONE_PIXEL = new int[]{VR_MENU_CAPTURE_ZONE_COLOR};
 	private static final int VR_MENU_TITLE_HEIGHT_PX = 19;
@@ -1573,11 +1580,22 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			xrContext = null;
 		}
 		vrWorldAnchorY = Float.NaN;
+		vrLastZoomUpdateMs = 0L;
 	}
 
 	// -------------------------------------------------------------------------
 	// VR helper methods (T3.2)
 	// -------------------------------------------------------------------------
+
+	private float getVrWorldScale()
+	{
+		return DEFAULT_WORLD_SCALE * vrZoom;
+	}
+
+	private float getVrStageCharacterOffsetZ()
+	{
+		return VR_STAGE_CHARACTER_OFFSET_Z * ((VR_ZOOM_MAX - vrZoom) / (VR_ZOOM_MAX - VR_ZOOM_BASE));
+	}
 
 	/**
 	 * Compute the worldProj matrix for the given eye from the located XrView.
@@ -1601,7 +1619,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// whole image appears mirrored left-right in the HMD.
 		float worldOffsetX = 0;
 		float worldOffsetY = vrWorldAnchorY;
-		float worldOffsetZ = VR_STAGE_CHARACTER_OFFSET_Z;
+		float worldScale = getVrWorldScale();
+		float worldOffsetZ = getVrStageCharacterOffsetZ();
 		float anchorWorldX = getVrAnchorWorldX();
 		float anchorWorldY = getVrAnchorWorldY();
 		float anchorWorldZ = getVrAnchorWorldZ();
@@ -1610,7 +1629,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float[] proj = buildVrProjection(view.fov(), 0.05f);
 		Mat4.mul(proj, buildInvEyePose(view.pose()));
 		Mat4.mul(proj, Mat4.translate(worldOffsetX, worldOffsetY, worldOffsetZ));
-		Mat4.mul(proj, Mat4.scale(-DEFAULT_WORLD_SCALE, -DEFAULT_WORLD_SCALE, DEFAULT_WORLD_SCALE));
+		Mat4.mul(proj, Mat4.scale(-worldScale, -worldScale, worldScale));
 		Mat4.mul(proj, Mat4.translate(-anchorWorldX, -anchorWorldY, -anchorWorldZ));
 		return proj;
 	}
@@ -1731,9 +1750,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private int buildDebugRayVerts()
 	{
-		final float s = DEFAULT_WORLD_SCALE;
+		final float s = getVrWorldScale();
 		final float oy = vrWorldAnchorY;
-		final float oz = VR_STAGE_CHARACTER_OFFSET_Z;
+		final float oz = getVrStageCharacterOffsetZ();
 		final float camX = getVrAnchorWorldX();
 		final float camY = getVrAnchorWorldY();
 		final float camZ = getVrAnchorWorldZ();
@@ -1929,8 +1948,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Controller state is sampled once, then all consumers read the same frame snapshot.
 		controllers.update();
+		updateVrZoomFromJoystick();
 		controllers.computeOsrsRays(
-			DEFAULT_WORLD_SCALE, vrWorldAnchorY, VR_STAGE_CHARACTER_OFFSET_Z,
+			getVrWorldScale(), vrWorldAnchorY, getVrStageCharacterOffsetZ(),
 			getVrAnchorWorldX(), getVrAnchorWorldY(), getVrAnchorWorldZ());
 
 		if (!controllers.left().active && !controllers.right().active)
@@ -2100,6 +2120,42 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
+	private void updateVrZoomFromJoystick()
+	{
+		long now = System.currentTimeMillis();
+		if (vrLastZoomUpdateMs == 0L)
+		{
+			vrLastZoomUpdateMs = now;
+			return;
+		}
+
+		float dt = Math.min(0.1f, (now - vrLastZoomUpdateMs) / 1000f);
+		vrLastZoomUpdateMs = now;
+
+		VrController controller = controllers.primary();
+		if (controller == null || !controller.active)
+		{
+			return;
+		}
+
+		float direction;
+		if (controller.stickAction == VrController.StickAction.UP)
+		{
+			direction = 1f;
+		}
+		else if (controller.stickAction == VrController.StickAction.DOWN)
+		{
+			direction = -1f;
+		}
+		else
+		{
+			return;
+		}
+
+		vrZoom = Math.max(VR_ZOOM_MIN, Math.min(VR_ZOOM_MAX,
+			vrZoom + direction * VR_ZOOM_SPEED_PER_SECOND * dt));
+	}
+
 	private float[] queueVrHoverRay(VrController controller)
 	{
 		float[] ray = controller.osrsRay;
@@ -2180,7 +2236,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 *       winding test that decides which faces are front-facing.</li>
 	 *   <li>Sort faces by depth ({@code p[2] - zero}).</li>
 	 * </ol>
-	 * Returns {@code [clipX, clipY, clipW / DEFAULT_WORLD_SCALE]}:
+	 * Returns {@code [clipX, clipY, clipW / worldScale]}:
 	 * <ul>
 	 *   <li>clipX/clipY come from the VR eye perspective transform.</li>
 	 *   <li>X and Y are both flipped in the OSRS→VR world transform, preserving winding
@@ -2229,9 +2285,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final float c = 2f / (tanU - tanD);
 		final float d = (tanU + tanD) / (tanU - tanD);
 
-		final float s = DEFAULT_WORLD_SCALE;
+		final float s = getVrWorldScale();
 		final float oy = vrWorldAnchorY;
-		final float oz = VR_STAGE_CHARACTER_OFFSET_Z;
+		final float oz = getVrStageCharacterOffsetZ();
 		final float camX = getVrAnchorWorldX();
 		final float camY = getVrAnchorWorldY();
 		final float camZ = getVrAnchorWorldZ();
@@ -2445,10 +2501,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glUniform1i(uniDrawDistance, drawDistance * Perspective.LOCAL_TILE_SIZE);
 		glUniform1i(uniExpandedMapLoadingChunks, client.getExpandedMapLoading());
 		glUniform1f(uniColorblindIntensity, config.colorBlindIntensity());
-		// VR clip_w is in metres; desktop clip_w is in OSRS units (~1/DEFAULT_WORLD_SCALE larger).
-		// Scaling the bias by DEFAULT_WORLD_SCALE in VR keeps the NDC depth offset identical
+		// VR clip_w is in metres; desktop clip_w is in OSRS units (~1/worldScale larger).
+		// Scaling the bias by worldScale in VR keeps the NDC depth offset identical
 		// to desktop mode, preventing decal faces from clipping through walls and NPCs.
-		glUniform1f(uniBiasScale, xrFrameStarted ? DEFAULT_WORLD_SCALE : 1.0f);
+		glUniform1f(uniBiasScale, xrFrameStarted ? getVrWorldScale() : 1.0f);
 
 		// Brightness happens to also be stored in the texture provider, so we use that
 		TextureProvider textureProvider = client.getTextureProvider();
@@ -3623,9 +3679,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			centerEyeX,
 			centerEyeY,
 			centerEyeZ,
-			DEFAULT_WORLD_SCALE,
+			getVrWorldScale(),
 			vrWorldAnchorY,
-			VR_STAGE_CHARACTER_OFFSET_Z,
+			getVrStageCharacterOffsetZ(),
 			getVrAnchorWorldX(),
 			getVrAnchorWorldY(),
 			getVrAnchorWorldZ());
@@ -4054,13 +4110,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		VrMenuOverlay menu = vrMenuOverlay;
 		if (menu != null && System.currentTimeMillis() - menu.timeMs <= VR_MENU_STALE_MS)
 		{
-			float captureScale = 1f + VR_MENU_CLOSE_MARGIN_UV * 2f;
+			float captureScaleU = 1f + VR_MENU_CLOSE_MARGIN_U * 2f;
+			float captureScaleV = 1f + VR_MENU_CLOSE_MARGIN_V * 2f;
 			vrBillboards.addImage(
 				menu.anchorX,
 				menu.anchorY,
 				menu.anchorZ,
-				menu.widthMeters * captureScale,
-				menu.heightMeters * captureScale,
+				menu.widthMeters * captureScaleU,
+				menu.heightMeters * captureScaleV,
 				VR_MENU_OFFSET_XM,
 				menu.offsetYM,
 				VR_MENU_CAPTURE_ZONE_PIXEL,
@@ -5522,8 +5579,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			&& vrMenuHitScratch.u >= 0f && vrMenuHitScratch.u <= 1f
 			&& vrMenuHitScratch.v >= 0f && vrMenuHitScratch.v <= 1f;
 		boolean outsideCloseMargin = !planeHit
-			|| vrMenuHitScratch.u < -VR_MENU_CLOSE_MARGIN_UV || vrMenuHitScratch.u > 1f + VR_MENU_CLOSE_MARGIN_UV
-			|| vrMenuHitScratch.v < -VR_MENU_CLOSE_MARGIN_UV || vrMenuHitScratch.v > 1f + VR_MENU_CLOSE_MARGIN_UV;
+			|| vrMenuHitScratch.u < -VR_MENU_CLOSE_MARGIN_U || vrMenuHitScratch.u > 1f + VR_MENU_CLOSE_MARGIN_U
+			|| vrMenuHitScratch.v < -VR_MENU_CLOSE_MARGIN_V || vrMenuHitScratch.v > 1f + VR_MENU_CLOSE_MARGIN_V;
 		if (planeHit)
 		{
 			vrLastMenuPlaneHit = true;
@@ -5718,7 +5775,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float dx, float dy, float dz,
 		VrMenuHit out)
 	{
-		final float s = DEFAULT_WORLD_SCALE;
+		final float s = getVrWorldScale();
 		final float anchorWorldX = getVrAnchorWorldX();
 		final float anchorWorldY = getVrAnchorWorldY();
 		final float anchorWorldZ = getVrAnchorWorldZ();
@@ -5726,7 +5783,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// Anchor in stage coords (matches VrBillboardRenderer).
 		float anchorStageX = -(menu.anchorX - anchorWorldX) * s;
 		float anchorStageY = -(menu.anchorY - anchorWorldY) * s + vrWorldAnchorY;
-		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + VR_STAGE_CHARACTER_OFFSET_Z;
+		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + getVrStageCharacterOffsetZ();
 
 		// Compute eye→anchor right vector in xz plane (matches drawBillboard).
 		org.lwjgl.openxr.XrView.Buffer views = xrContext != null ? xrContext.getViews() : null;
