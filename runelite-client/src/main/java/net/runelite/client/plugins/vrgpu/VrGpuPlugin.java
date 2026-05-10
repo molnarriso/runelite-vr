@@ -5580,7 +5580,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			&& vrMenuHitScratch.v >= 0f && vrMenuHitScratch.v <= 1f;
 		boolean outsideCloseMargin = !planeHit
 			|| vrMenuHitScratch.u < -VR_MENU_CLOSE_MARGIN_U || vrMenuHitScratch.u > 1f + VR_MENU_CLOSE_MARGIN_U
-			|| vrMenuHitScratch.v < -VR_MENU_CLOSE_MARGIN_V || vrMenuHitScratch.v > 1f + VR_MENU_CLOSE_MARGIN_V;
+			|| vrMenuHitScratch.v < -VR_MENU_CLOSE_MARGIN_V /*|| vrMenuHitScratch.v > 1f + VR_MENU_CLOSE_MARGIN_V*/;
 		if (planeHit)
 		{
 			vrLastMenuPlaneHit = true;
