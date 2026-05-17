@@ -19,6 +19,7 @@ import net.runelite.api.NPC;
 import net.runelite.api.ObjectComposition;
 import net.runelite.api.Perspective;
 import net.runelite.api.Player;
+import net.runelite.api.Scene;
 import net.runelite.api.SceneTileModel;
 import net.runelite.api.SceneTilePaint;
 import net.runelite.api.Tile;
@@ -76,14 +77,14 @@ final class VrSceneRaycaster
 			}
 		}
 
-		Tile[][][] sceneTiles = wv.getScene().getTiles();
-		if (plane >= 0 && plane < sceneTiles.length && sceneTiles[plane] != null)
+		Tile[][] sceneTiles = getPlaneTiles(wv);
+		if (sceneTiles != null)
 		{
 			for (int scX = 0; scX < wv.getSizeX(); scX++)
 			{
 				for (int scY = 0; scY < wv.getSizeY(); scY++)
 				{
-					Tile tile = sceneTiles[plane][scX][scY];
+					Tile tile = getTile(sceneTiles, scX, scY);
 					if (tile == null) continue;
 
 					for (GameObject obj : tile.getGameObjects())
@@ -224,15 +225,15 @@ final class VrSceneRaycaster
 	VrInteraction.GroundHit intersectGround(float ox, float oy, float oz, float dx, float dy, float dz, WorldView wv)
 	{
 		VrInteraction.GroundHit best = null;
-		Tile[][][] tiles = wv.getScene().getTiles();
 		int plane = wv.getPlane();
-		if (plane >= 0 && plane < tiles.length && tiles[plane] != null)
+		Tile[][] tiles = getPlaneTiles(wv);
+		if (tiles != null)
 		{
 			for (int sceneX = 0; sceneX < wv.getSizeX(); sceneX++)
 			{
 				for (int sceneY = 0; sceneY < wv.getSizeY(); sceneY++)
 				{
-					Tile tile = tiles[plane][sceneX][sceneY];
+					Tile tile = getTile(tiles, sceneX, sceneY);
 					if (tile == null)
 					{
 						continue;
@@ -248,6 +249,40 @@ final class VrSceneRaycaster
 		}
 
 		return best;
+	}
+
+	private static Tile[][] getPlaneTiles(WorldView wv)
+	{
+		if (wv == null)
+		{
+			return null;
+		}
+
+		Scene scene = wv.getScene();
+		if (scene == null)
+		{
+			return null;
+		}
+
+		Tile[][][] tiles = scene.getTiles();
+		int plane = wv.getPlane();
+		if (tiles == null || plane < 0 || plane >= tiles.length)
+		{
+			return null;
+		}
+
+		return tiles[plane];
+	}
+
+	private static Tile getTile(Tile[][] tiles, int sceneX, int sceneY)
+	{
+		if (sceneX < 0 || sceneX >= tiles.length || tiles[sceneX] == null
+			|| sceneY < 0 || sceneY >= tiles[sceneX].length)
+		{
+			return null;
+		}
+
+		return tiles[sceneX][sceneY];
 	}
 
 	private VrInteraction.Hit buildNpcHit(float ox, float oy, float oz, float dx, float dy, float dz, int plane, NPC npc)

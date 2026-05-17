@@ -125,8 +125,6 @@ import static org.lwjgl.opengl.GL45C.glClipControl;
 import org.lwjgl.opengl.GLCapabilities;
 import org.lwjgl.opengl.GLUtil;
 import org.lwjgl.opengl.WGL;
-import org.lwjgl.openxr.XrFovf;
-import org.lwjgl.openxr.XrPosef;
 import org.lwjgl.openxr.XrView;
 import org.lwjgl.system.Callback;
 import org.lwjgl.system.Configuration;
@@ -208,6 +206,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_ZOOM_MAX = 5.0f;
 	private static final float VR_ZOOM_SPEED_PER_SECOND = 3.0f;
 	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
+	private static final boolean VR_SPECTATOR_MODE = false;
+	/**
+	 * 0 = no smoothing, values near 1 keep more of the previous XR camera pose each frame.
+	 */
+	private static final float VR_SPECTATOR_CAMERA_SMOOTHING = 0.88f;
 
 	/**
 	 * Stage-space Y of the world anchor (where the OSRS camera maps to).
@@ -245,6 +248,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private int glDebugProgram;
 	private int uniDebugWorldProj;
 	private final VrUi vrUi = new VrUi();
+	private final VrCamera vrCamera = new VrCamera();
 	private final VrInteraction vrInteraction = new VrInteraction(this);
 	private final VrBillboardRenderer vrBillboards = new VrBillboardRenderer();
 	private VrSceneRaycaster vrSceneRaycaster;
@@ -1556,6 +1560,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		vrWorldAnchorY = Float.NaN;
 		vrLastZoomUpdateMs = 0L;
+		vrCamera.reset();
 	}
 
 	// -------------------------------------------------------------------------
@@ -1591,123 +1596,23 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrWorldAnchorY, initialEyeY, String.format("%+.1f", VR_STAGE_CHARACTER_OFFSET_Y));
 	}
 
-	/**
-	 * Compute the worldProj matrix for the given eye from the located XrView.
-	 * <p>
-	 * The chain is: VrProjection(fov) × InvEyePose × Scale(worldScale) × Translate(-cam)
-	 * <p>
-	 * This maps OSRS local-unit world coordinates to OpenXR clip space using
-	 * the OSRS hyperbolic depth convention (clip_w = -z_eye, clearDepth=0, GL_GREATER).
-	 *
-	 * @param eye 0 = left, 1 = right
-	 */
 	private float[] computeVrWorldProj(int eye)
 	{
 		XrView view = getXrViews().get(eye);
-
-		// Character anchor: the local player is kept at a fixed room-space location.
-		// vrWorldAnchorY is sampled from the initial eye height on the first VR frame.
-		// X=0 (stage centre), Z=-0.5m (0.5 m in front of the head at recenter/start).
-		// OSRS Y increases downward, so the Y scale is negated to flip it upright.
-		// VR also needs an X flip to match the headset view handedness; without it the
-		// whole image appears mirrored left-right in the HMD.
-		float worldOffsetX = 0;
-		float worldOffsetY = vrWorldAnchorY;
-		float worldScale = getVrWorldScale();
-		float worldOffsetZ = getVrStageCharacterOffsetZ();
-		float anchorWorldX = getVrAnchorWorldX();
-		float anchorWorldY = getVrAnchorWorldY();
-		float anchorWorldZ = getVrAnchorWorldZ();
-
-		// Chain: Proj × InvEyePose × Translate(worldOffset) × Scale(-s,-s,s) × Translate(-cam)
-		float[] proj = buildVrProjection(view.fov(), 0.05f);
-		Mat4.mul(proj, buildInvEyePose(view.pose()));
-		Mat4.mul(proj, Mat4.translate(worldOffsetX, worldOffsetY, worldOffsetZ));
-		Mat4.mul(proj, Mat4.scale(-worldScale, -worldScale, worldScale));
-		Mat4.mul(proj, Mat4.translate(-anchorWorldX, -anchorWorldY, -anchorWorldZ));
-		return proj;
+		VrCamera.Pose pose = getVrCameraPose(eye, view);
+		return computeVrWorldProj(view, pose);
 	}
 
-	/**
-	 * Build an asymmetric perspective projection matrix compatible with the OSRS depth
-	 * convention.
-	 * <p>
-	 * Input: OpenXR eye space (X right, Y up, Z backward; z &lt; 0 for front objects).
-	 * Output: clip space where clip_w = -z (positive for front objects), enabling
-	 * GL_GREATER depth with clearDepth=0.
-	 *
-	 * @param fov  XrFovf with angleLeft/Right/Up/Down in radians
-	 * @param near near plane distance in meters (e.g. 0.05)
-	 */
-	private static float[] buildVrProjection(XrFovf fov, float near)
+	private float[] computeVrWorldProj(XrView view, VrCamera.Pose pose)
 	{
-		float tanL = (float) Math.tan(fov.angleLeft());   // negative
-		float tanR = (float) Math.tan(fov.angleRight());  // positive
-		float tanU = (float) Math.tan(fov.angleUp());     // positive
-		float tanD = (float) Math.tan(fov.angleDown());   // negative
-
-		float a = 2.0f / (tanR - tanL);                          // x scale
-		float b = (tanR + tanL) / (tanR - tanL);                 // x asymmetric offset
-		float c = 2.0f / (tanU - tanD);                          // y scale
-		float d = (tanU + tanD) / (tanU - tanD);                 // y asymmetric offset
-		float n2 = 2.0f * near;                                  // 2*near for clip_z
-
-		// Column-major 4×4 (columns stored contiguously).
-		// clip = M * [x, y, z, 1]:
-		//   clip_x = a*x + b*z     → ndc_x in [-1,1] across angleLeft..angleRight
-		//   clip_y = c*y + d*z     → ndc_y in [-1,1] across angleDown..angleUp  (Y-up)
-		//   clip_z = 2n            → constant; gives hyperbolic depth ndc_z = 2n/(-z)
-		//   clip_w = -z            → positive for front objects (z < 0 in OpenXR)
-		return new float[]{
-			a,  0,  0,  0,   // col 0
-			0,  c,  0,  0,   // col 1
-			b,  d,  0, -1,   // col 2
-			0,  0, n2,  0,   // col 3
-		};
+		return vrCamera.computeVrWorldProj(view, pose,
+			vrWorldAnchorY, getVrWorldScale(), getVrStageCharacterOffsetZ(),
+			getVrAnchorWorldX(), getVrAnchorWorldY(), getVrAnchorWorldZ());
 	}
 
-	/**
-	 * Build the inverse-pose view matrix from an XrPosef.
-	 * <p>
-	 * InvPose = R^T × Translate(-position), stored column-major for OpenGL.
-	 *
-	 * @param pose eye pose in stage space
-	 */
-	private static float[] buildInvEyePose(XrPosef pose)
+	private VrCamera.Pose getVrCameraPose(int eye, XrView view)
 	{
-		// Quaternion components
-		float qx = pose.orientation().x();
-		float qy = pose.orientation().y();
-		float qz = pose.orientation().z();
-		float qw = pose.orientation().w();
-		// Eye position
-		float px = pose.position$().x();
-		float py = pose.position$().y();
-		float pz = pose.position$().z();
-
-		// Build rotation matrix R from unit quaternion
-		float r00 = 1 - 2 * (qy * qy + qz * qz);
-		float r01 = 2 * (qx * qy + qw * qz);
-		float r02 = 2 * (qx * qz - qw * qy);
-		float r10 = 2 * (qx * qy - qw * qz);
-		float r11 = 1 - 2 * (qx * qx + qz * qz);
-		float r12 = 2 * (qy * qz + qw * qx);
-		float r20 = 2 * (qx * qz + qw * qy);
-		float r21 = 2 * (qy * qz - qw * qx);
-		float r22 = 1 - 2 * (qx * qx + qy * qy);
-
-		// t = -(R^T * p).  With code's r_ab = R^T[a][b], row a of R^T = (r_a0, r_a1, r_a2).
-		float tx = -(r00 * px + r01 * py + r02 * pz);
-		float ty = -(r10 * px + r11 * py + r12 * pz);
-		float tz = -(r20 * px + r21 * py + r22 * pz);
-
-		// Column-major R^T: col j = (R^T[0][j], R^T[1][j], R^T[2][j]) = (r0j, r1j, r2j).
-		return new float[]{
-			r00, r10, r20, 0,   // col 0
-			r01, r11, r21, 0,   // col 1
-			r02, r12, r22, 0,   // col 2
-			tx,  ty,  tz,  1,   // col 3
-		};
+		return vrCamera.eyePose(eye, view.pose(), VR_SPECTATOR_MODE, VR_SPECTATOR_CAMERA_SMOOTHING);
 	}
 
 	// -------------------------------------------------------------------------
@@ -2239,129 +2144,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 *       to convert back to OSRS units so that the {@code > 50} clip threshold holds.</li>
 	 * </ul>
 	 */
-	private Projection buildVrSorterProjection(int eye)
+	private Projection buildVrSorterProjection(XrView view, VrCamera.Pose pose)
 	{
-		XrView view = getXrViews().get(eye);
-		XrPosef pose = view.pose();
-		XrFovf fov = view.fov();
-
-		float qx = pose.orientation().x();
-		float qy = pose.orientation().y();
-		float qz = pose.orientation().z();
-		float qw = pose.orientation().w();
-		float px = pose.position$().x();
-		float py = pose.position$().y();
-		float pz = pose.position$().z();
-
-		// R^T rows (view rotation matrix, same derivation as buildInvEyePose)
-		final float r00 = 1 - 2 * (qy * qy + qz * qz);
-		final float r01 = 2 * (qx * qy + qw * qz);
-		final float r02 = 2 * (qx * qz - qw * qy);
-		final float r10 = 2 * (qx * qy - qw * qz);
-		final float r11 = 1 - 2 * (qx * qx + qz * qz);
-		final float r12 = 2 * (qy * qz + qw * qx);
-		final float r20 = 2 * (qx * qz + qw * qy);
-		final float r21 = 2 * (qy * qz - qw * qx);
-		final float r22 = 1 - 2 * (qx * qx + qy * qy);
-
-		// Translation t = -R^T * eyePos
-		final float tx = -(r00 * px + r01 * py + r02 * pz);
-		final float ty = -(r10 * px + r11 * py + r12 * pz);
-		final float tz = -(r20 * px + r21 * py + r22 * pz);
-
-		// Asymmetric perspective scale/offset from FOV angles
-		float tanL = (float) Math.tan(fov.angleLeft());
-		float tanR = (float) Math.tan(fov.angleRight());
-		float tanU = (float) Math.tan(fov.angleUp());
-		float tanD = (float) Math.tan(fov.angleDown());
-		final float a = 2f / (tanR - tanL);
-		final float b = (tanR + tanL) / (tanR - tanL);
-		final float c = 2f / (tanU - tanD);
-		final float d = (tanU + tanD) / (tanU - tanD);
-
-		final float s = getVrWorldScale();
-		final float oy = vrWorldAnchorY;
-		final float oz = getVrStageCharacterOffsetZ();
-		final float camX = getVrAnchorWorldX();
-		final float camY = getVrAnchorWorldY();
-		final float camZ = getVrAnchorWorldZ();
-
-		return new Projection()
-		{
-			@Override
-			public float[] project(float wx, float wy, float wz)
-			{
-				return project(wx, wy, wz, new float[3]);
-			}
-
-			@Override
-			public float[] project(float wx, float wy, float wz, float[] out)
-			{
-				// Translate by -camera, scale (OSRS→VR metres, X/Y flips), add world offset
-				float vx = -(wx - camX) * s;
-				float vy = -(wy - camY) * s + oy;
-				float vz = (wz - camZ) * s + oz;
-
-				// View rotation R^T + translation → eye space
-				float ex = r00 * vx + r01 * vy + r02 * vz + tx;
-				float ey = r10 * vx + r11 * vy + r12 * vz + ty;
-				float ez = r20 * vx + r21 * vy + r22 * vz + tz;
-
-				// Perspective: clip_w = -ez (positive for front objects, camera looks -Z)
-				float clipW = -ez;
-				// The VR world projection flips X to correct the headset image handedness.
-				// FacePrioritySorter does its own 2D winding test on projected X/Y to decide
-				// which one-sided temp/model faces are front-facing before they are uploaded.
-				// Without mirroring clip_x here too, that winding test sees the opposite
-				// orientation and uploads the wrong faces, which makes players/NPCs appear
-				// partially or almost completely culled in VR.
-				out[0] = -(a * ex + b * ez); // clip_x
-				out[1] = c * ey + d * ez;  // clip_y: Y-up, consistent with worldProjection
-				out[2] = clipW / s;        // depth in OSRS units (so >50 clip test holds)
-				return out;
-			}
-		};
+		return vrCamera.buildVrSorterProjection(view, pose,
+			vrWorldAnchorY, getVrWorldScale(), getVrStageCharacterOffsetZ(),
+			getVrAnchorWorldX(), getVrAnchorWorldY(), getVrAnchorWorldZ());
 	}
 
 	private Projection buildDesktopSorterProjection()
 	{
-		final float cameraYaw = getSafeDesktopCameraYawRad();
-		final float cameraPitch = getSafeDesktopCameraPitchRad();
-		final float pitchSin = (float) Math.sin(cameraPitch);
-		final float pitchCos = (float) Math.cos(cameraPitch);
-		final float yawSin = (float) Math.sin(cameraYaw);
-		final float yawCos = (float) Math.cos(cameraYaw);
-		final float cameraX = (float) client.getCameraFpX();
-		final float cameraY = (float) client.getCameraFpZ();
-		final float cameraZ = (float) client.getCameraFpY();
-
-		return new Projection()
-		{
-			@Override
-			public float[] project(float wx, float wy, float wz)
-			{
-				return project(wx, wy, wz, new float[3]);
-			}
-
-			@Override
-			public float[] project(float wx, float wy, float wz, float[] out)
-			{
-				// Match Perspective.localToCanvasGpu(), but with the plugin's x,height,z axis order.
-				final float fx = wx - cameraX;
-				final float fy = wz - cameraZ;
-				final float fz = wy - cameraY;
-
-				final float x1 = fx * yawCos + fy * yawSin;
-				final float y1 = fy * yawCos - fx * yawSin;
-				final float y2 = fz * pitchCos - y1 * pitchSin;
-				final float z1 = y1 * pitchCos + fz * pitchSin;
-
-				out[0] = x1;
-				out[1] = y2;
-				out[2] = z1;
-				return out;
-			}
-		};
+		return VrCamera.buildDesktopSorterProjection(
+			getSafeDesktopCameraYawRad(),
+			getSafeDesktopCameraPitchRad(),
+			(float) client.getCameraFpX(),
+			(float) client.getCameraFpZ(),
+			(float) client.getCameraFpY());
 	}
 
 	// -------------------------------------------------------------------------
@@ -2437,6 +2234,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		final int viewportHeight = client.getViewportHeight();
 		final int viewportWidth = client.getViewportWidth();
+		VrCamera.Pose leftEyePose = null;
 
 		if (openXrFrame != null && openXrFrame.isRendering())
 		{
@@ -2451,9 +2249,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			desktopReplay.resetCounts();
 
 			ensureVrWorldAnchorY();
-
-			// Build sorter projection after vrWorldAnchorY is guaranteed non-NaN.
-			vrSorterProjection = buildVrSorterProjection(0);
+			XrView leftEye = getXrViews().get(0);
+			leftEyePose = getVrCameraPose(0, leftEye);
+			vrSorterProjection = buildVrSorterProjection(leftEye, leftEyePose);
 
 		}
 		else
@@ -2503,7 +2301,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		if (openXrFrame != null && openXrFrame.isRendering())
 		{
 			// VR: per-eye perspective from HMD pose + world anchor (T3.2)
-			projectionMatrix = computeVrWorldProj(0);
+			projectionMatrix = computeVrWorldProj(getXrViews().get(0), leftEyePose);
 		}
 		else
 		{
@@ -2712,20 +2510,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private float[] computeDesktopWorldProj()
 	{
-		float desktopCameraPitch = getSafeDesktopCameraPitchRad();
-		float desktopCameraYaw = getSafeDesktopCameraYawRad();
-		float desktopCameraX = (float) client.getCameraFpX();
-		float desktopCameraY = (float) client.getCameraFpZ();
-		float desktopCameraZ = (float) client.getCameraFpY();
-
-		float[] projectionMatrix = Mat4.scale(client.getScale(), client.getScale(), 1);
-		Mat4.mul(projectionMatrix, Mat4.projection(client.getViewportWidth(), client.getViewportHeight(), 50));
-		Mat4.mul(projectionMatrix, Mat4.rotateX(desktopCameraPitch));
-		Mat4.mul(projectionMatrix, Mat4.rotateY(desktopCameraYaw));
-		// cameraFp uses API convention: X=east, Y=north, Z=height.
-		// Scene/world rendering matrices use GPU convention: X=east, Y=height, Z=north.
-		Mat4.mul(projectionMatrix, Mat4.translate(-desktopCameraX, -desktopCameraY, -desktopCameraZ));
-		return projectionMatrix;
+		return VrCamera.computeDesktopWorldProj(
+			client.getScale(),
+			client.getViewportWidth(),
+			client.getViewportHeight(),
+			getSafeDesktopCameraYawRad(),
+			getSafeDesktopCameraPitchRad(),
+			(float) client.getCameraFpX(),
+			(float) client.getCameraFpZ(),
+			(float) client.getCameraFpY());
 	}
 
 	private void uploadMainCameraUniforms(float cameraYaw, float cameraPitch, float cameraX, float cameraY, float cameraZ)
@@ -2753,11 +2546,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		DesktopViewport vp = getDesktopViewport();
 		float desktopCameraYawRad = getSafeDesktopCameraYawRad();
 		float desktopCameraPitchRad = getSafeDesktopCameraPitchRad();
-		int desktopCameraYawJau = radiansToJau(desktopCameraYawRad);
-		int desktopCameraPitchJau = radiansToJau(desktopCameraPitchRad);
-		int desktopCameraX = (int) client.getCameraFpX();
-		int desktopCameraY = (int) client.getCameraFpZ();
-		int desktopCameraZ = (int) client.getCameraFpY();
 
 		uploadMainCameraUniforms(
 			desktopCameraYawRad,
@@ -2769,8 +2557,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glUseProgram(glProgram);
 		setupScenePass(fboScene, vp.x, vp.y, vp.width, vp.height, true, computeDesktopWorldProj(), sky, GL_BACK);
 
-		replayScene(vrScene, desktopReplay, desktopCameraYawJau, desktopCameraPitchJau,
-			desktopCameraX, desktopCameraZ, true, true, false);
+		replayScene(vrScene, desktopReplay, radiansToJau(desktopCameraYawRad), radiansToJau(desktopCameraPitchRad),
+			(int) client.getCameraFpX(), (int) client.getCameraFpY(), true, true, false);
 
 		glDisable(GL_BLEND);
 		glDisable(GL_CULL_FACE);
@@ -2782,22 +2570,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private float getSafeDesktopCameraYawRad()
 	{
-		double yaw = client.getCameraFpYaw();
-		if (yaw < 0)
-		{
-			yaw = client.getCameraYaw() * Perspective.UNIT;
-		}
-		return (float) yaw;
+		return VrCamera.safeDesktopCameraYawRad(client);
 	}
 
 	private float getSafeDesktopCameraPitchRad()
 	{
-		double pitch = client.getCameraFpPitch();
-		if (pitch < 0)
-		{
-			pitch = client.getCameraPitch() * Perspective.UNIT;
-		}
-		return (float) pitch;
+		return VrCamera.safeDesktopCameraPitchRad(client);
 	}
 
 	private void blitSceneFbo()
@@ -5427,13 +5205,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private static int radiansToJau(double radians)
 	{
-		int angle = (int) Math.round(radians / Perspective.UNIT);
-		angle %= 2048;
-		if (angle < 0)
-		{
-			angle += 2048;
-		}
-		return angle;
+		return VrCamera.radiansToJau(radians);
 	}
 
 	net.runelite.api.Point projectStagedWalkCanvasPoint(float[] pending, WorldView wv)
