@@ -382,6 +382,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private boolean vrLastMenuPlaneHit;
 	private float vrLastMenuRayU;
 	private float vrLastMenuRayV;
+	private boolean vrPendingCanvasMenuOpen;
+	private boolean vrCanvasMenuOpen;
 
 	private final RenderCallback vrActorUiCaptureCallback = new RenderCallback()
 	{
@@ -2163,6 +2165,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			int button = vrUiMouseButton;
 			dispatchVrUiMouse(MouseEvent.MOUSE_RELEASED, vrUiMouseX, vrUiMouseY, button, 0, 1);
+			if (button == MouseEvent.BUTTON3)
+			{
+				vrPendingCanvasMenuOpen = true;
+			}
 			dispatchVrUiMouse(MouseEvent.MOUSE_CLICKED, vrUiMouseX, vrUiMouseY, button, 0, 1);
 			vrUiMousePressed = false;
 			vrUiMouseButton = MouseEvent.NOBUTTON;
@@ -4201,6 +4207,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			vrMenuAwaitingVanillaClose = false;
 			vrPendingMenuAnchor = null;
+			vrPendingCanvasMenuOpen = false;
+			vrCanvasMenuOpen = false;
 			clearVrMenuOverlay();
 		}
 		return menuOpen;
@@ -4215,6 +4223,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		if (vrMenuAwaitingVanillaClose)
 		{
+			return;
+		}
+		if (isVrCanvasMenuOpen())
+		{
+			clearVrMenuOverlay();
 			return;
 		}
 
@@ -4288,6 +4301,24 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		vrMenuOverlay = new VrMenuOverlay(pixels, crop.width, crop.height,
 			crop.x, crop.y, ax, ay, az, offsetYM, System.currentTimeMillis());
+	}
+
+	private boolean isVrCanvasMenuOpen()
+	{
+		if (vrPendingMenuAnchor != null)
+		{
+			vrPendingCanvasMenuOpen = false;
+			vrCanvasMenuOpen = false;
+			return false;
+		}
+		if (!vrPendingCanvasMenuOpen && !vrCanvasMenuOpen)
+		{
+			return false;
+		}
+
+		vrPendingCanvasMenuOpen = false;
+		vrCanvasMenuOpen = true;
+		return true;
 	}
 
 	void logVrMenuEntries(String context)
