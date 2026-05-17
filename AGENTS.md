@@ -16,16 +16,30 @@ We are building a RuneLite VR GPU plugin: OpenXR stereo rendering for the 3D wor
 4. **World-anchored UI billboards**
    Special 2D UI is shown as world-anchored billboards, not through `addEntity`. Context hints are self-rendered from the top live vanilla `MenuEntry`; right-click menus are cropped from the already-rendered vanilla canvas.
 
+5. **Spectator capture window**
+   Optional spectator mode renders a separate desktop capture view. The HMD stereo path uses live OpenXR poses; only the spectator pass uses a smoothed camera. The spectator render target keeps the native eye projection/aspect to avoid distortion, then the desktop window applies a 16:9 crop and optional crop margins for capture.
+
 ## Main VR Files
 
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrGpuPlugin.java`: plugin entry point, DrawCallbacks, scene rendering, UI capture, VR frame flow.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrCamera.java`: VR camera pose/projection helpers, live HMD pose access, smoothed spectator pose, desktop camera helpers, and projection builders.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrController.java`: per-hand controller snapshot, button hysteresis, edge detection, and OSRS-space ray derivation.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllers.java`: owns both controllers, primary-hand selection, and context-menu owner state.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllerModel.java`: controller mesh/debug ray vertex generation. Stage-space and OSRS-world-space rendering share one mesh generator and differ only by final coordinate transform.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrUi.java`: flat canvas UI panel and pointer rendering.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrBillboardRenderer.java`: actor/context/menu billboard textures.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSpectatorWindow.java`: Swing desktop window for spectator capture; reads the spectator FBO, applies aspect/crop settings, and presents the capture image.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrInteraction.java`: controller interaction and click handling.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSceneRaycaster.java`: VR ray picking against scene/world objects.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/openxr/`: OpenXR context, frame lifecycle, swapchains, and input. `OpenXrFrame` owns the active frame state, view location, eye FBO acquire/release, eye clears, and submit decisions so XR eye targets are frame infrastructure, not a side effect of scene rendering.
+
+## VR Render / Camera Rules
+
+- `VrCamera` is the central place for eye pose and projection construction. Avoid ad-hoc `XrView.pose()` math in render helpers; pass projections/camera data into helpers instead.
+- HMD rendering should use live OpenXR poses for comfort and low latency. Do not smooth the headset path for capture quality.
+- Spectator capture may use a separate smoothed camera and a separate FBO/window, but should reuse the same scene replay and overlay target pipeline as the HMD eyes wherever possible.
+- Everything visible in VR should also be visible in the spectator target: canvas panel, billboards, controller models/rays, and menu/context UI. Menu/splash states without a 3D scene should still render the VR canvas panel and stage-space controller/ray layer.
+- Do not create separate bespoke spectator overlay drawing paths unless a layer truly cannot share the target renderer.
 
 ## VR Interaction Rules
 

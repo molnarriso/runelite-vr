@@ -27,9 +27,6 @@ package net.runelite.client.plugins.vrgpu;
 import java.nio.FloatBuffer;
 import net.runelite.client.plugins.vrgpu.template.Template;
 import org.lwjgl.BufferUtils;
-import org.lwjgl.openxr.XrFovf;
-import org.lwjgl.openxr.XrPosef;
-import org.lwjgl.openxr.XrView;
 import static org.lwjgl.opengl.GL33C.*;
 
 final class VrUi
@@ -150,19 +147,19 @@ final class VrUi
 		int framebuffer,
 		int viewportWidth,
 		int viewportHeight,
-		XrView.Buffer views,
-		int eye,
+		float[] worldProj,
 		int interfaceTexture,
 		int canvasWidth,
 		int canvasHeight,
 		int overlayColor)
 	{
-		if (program == 0 || views == null || canvasWidth <= 0 || canvasHeight <= 0)
+		if (program == 0 || worldProj == null || canvasWidth <= 0 || canvasHeight <= 0)
 		{
 			return;
 		}
 
-		updatePanelVertices(views, canvasWidth, canvasHeight);
+		// Caller owns the projection so the same panel path works for HMD and spectator targets.
+		updatePanelVertices(canvasWidth, canvasHeight);
 
 		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 		glViewport(0, 0, viewportWidth, viewportHeight);
@@ -173,7 +170,6 @@ final class VrUi
 		glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
 
 		glUseProgram(program);
-		float[] worldProj = buildProjection(views.get(eye).fov(), views.get(eye).pose());
 		glUniformMatrix4fv(uniWorldProj, false, worldProj);
 		glUniform1i(uniTex, 0);
 		glUniform1i(uniUseTexture, 1);
@@ -273,7 +269,7 @@ final class VrUi
 		glUniform1i(uniUseTexture, 1);
 	}
 
-	private void updatePanelVertices(XrView.Buffer views, int canvasWidth, int canvasHeight)
+	private void updatePanelVertices(int canvasWidth, int canvasHeight)
 	{
 		float aspect = canvasWidth / (float) canvasHeight;
 		float halfW = PANEL_WIDTH_M * 0.5f;
@@ -296,65 +292,5 @@ final class VrUi
 		glBindBuffer(GL_ARRAY_BUFFER, vbo);
 		glBufferSubData(GL_ARRAY_BUFFER, 0, vertexBuffer);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
-	}
-
-	private static float[] buildProjection(XrFovf fov, XrPosef pose)
-	{
-		float[] proj = buildVrProjection(fov, 0.05f);
-		Mat4.mul(proj, buildInvEyePose(pose));
-		return proj;
-	}
-
-	private static float[] buildVrProjection(XrFovf fov, float near)
-	{
-		float tanL = (float) Math.tan(fov.angleLeft());
-		float tanR = (float) Math.tan(fov.angleRight());
-		float tanU = (float) Math.tan(fov.angleUp());
-		float tanD = (float) Math.tan(fov.angleDown());
-
-		float a = 2.0f / (tanR - tanL);
-		float b = (tanR + tanL) / (tanR - tanL);
-		float c = 2.0f / (tanU - tanD);
-		float d = (tanU + tanD) / (tanU - tanD);
-		float n2 = 2.0f * near;
-
-		return new float[]{
-			a,  0,  0,  0,
-			0,  c,  0,  0,
-			b,  d,  0, -1,
-			0,  0, n2,  0,
-		};
-	}
-
-	private static float[] buildInvEyePose(XrPosef pose)
-	{
-		float qx = pose.orientation().x();
-		float qy = pose.orientation().y();
-		float qz = pose.orientation().z();
-		float qw = pose.orientation().w();
-		float px = pose.position$().x();
-		float py = pose.position$().y();
-		float pz = pose.position$().z();
-
-		float r00 = 1 - 2 * (qy * qy + qz * qz);
-		float r01 = 2 * (qx * qy + qw * qz);
-		float r02 = 2 * (qx * qz - qw * qy);
-		float r10 = 2 * (qx * qy - qw * qz);
-		float r11 = 1 - 2 * (qx * qx + qz * qz);
-		float r12 = 2 * (qy * qz + qw * qx);
-		float r20 = 2 * (qx * qz + qw * qy);
-		float r21 = 2 * (qy * qz - qw * qx);
-		float r22 = 1 - 2 * (qx * qx + qy * qy);
-
-		float tx = -(r00 * px + r01 * py + r02 * pz);
-		float ty = -(r10 * px + r11 * py + r12 * pz);
-		float tz = -(r20 * px + r21 * py + r22 * pz);
-
-		return new float[]{
-			r00, r10, r20, 0,
-			r01, r11, r21, 0,
-			r02, r12, r22, 0,
-			tx,  ty,  tz,  1,
-		};
 	}
 }

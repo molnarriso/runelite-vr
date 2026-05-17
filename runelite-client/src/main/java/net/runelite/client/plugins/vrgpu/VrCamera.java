@@ -41,15 +41,16 @@ final class VrCamera
 		Arrays.fill(spectatorEyePoses, null);
 	}
 
-	Pose eyePose(int eye, XrPosef livePose, boolean spectatorMode, float smoothing)
+	Pose livePose(XrPosef livePose)
 	{
-		Pose live = Pose.from(livePose);
-		if (!spectatorMode)
-		{
-			reset();
-			return live;
-		}
+		// HMD rendering must always use the current OpenXR pose directly.
+		return Pose.from(livePose);
+	}
 
+	Pose smoothedEyePose(int eye, XrPosef livePose, float smoothing)
+	{
+		// Spectator-only temporal smoothing; this stored pose never feeds input or HMD rendering.
+		Pose live = Pose.from(livePose);
 		Pose smoothed = spectatorEyePoses[eye];
 		if (smoothed == null)
 		{
@@ -66,11 +67,19 @@ final class VrCamera
 		float worldAnchorY, float worldScale, float stageCharacterOffsetZ,
 		float anchorWorldX, float anchorWorldY, float anchorWorldZ)
 	{
-		float[] proj = buildVrProjection(view.fov(), 0.05f);
-		Mat4.mul(proj, buildInvEyePose(pose));
+		// Stage-space eye projection first, then the shared OSRS-world anchor transform.
+		float[] proj = computeStageProjection(view, pose);
 		Mat4.mul(proj, Mat4.translate(0f, worldAnchorY, stageCharacterOffsetZ));
 		Mat4.mul(proj, Mat4.scale(-worldScale, -worldScale, worldScale));
 		Mat4.mul(proj, Mat4.translate(-anchorWorldX, -anchorWorldY, -anchorWorldZ));
+		return proj;
+	}
+
+	float[] computeStageProjection(XrView view, Pose pose)
+	{
+		// Used for UI-only frames where there is no world replay, such as splash/menu.
+		float[] proj = buildVrProjection(view.fov(), 0.05f);
+		Mat4.mul(proj, buildInvEyePose(pose));
 		return proj;
 	}
 
@@ -131,6 +140,7 @@ final class VrCamera
 		float worldAnchorY, float worldScale, float stageCharacterOffsetZ,
 		float anchorWorldX, float anchorWorldY, float anchorWorldZ)
 	{
+		// Mirrors computeVrWorldProj for billboard sorting without allocating a full matrix per point.
 		XrFovf fov = view.fov();
 
 		float qx = pose.qx;

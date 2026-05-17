@@ -206,11 +206,17 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_ZOOM_MAX = 5.0f;
 	private static final float VR_ZOOM_SPEED_PER_SECOND = 3.0f;
 	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
-	private static final boolean VR_SPECTATOR_MODE = false;
-	/**
-	 * 0 = no smoothing, values near 1 keep more of the previous XR camera pose each frame.
-	 */
-	private static final float VR_SPECTATOR_CAMERA_SMOOTHING = 0.88f;
+	// Capture mode only: HMD rendering stays on live OpenXR poses, while the spectator pass can smooth.
+	private static final boolean VR_SPECTATOR_MODE = true;
+	private static final float VR_SPECTATOR_CAMERA_SMOOTHING = 0.8f;
+	// Keep the spectator render FBO at native eye aspect; crop only when presenting the desktop window.
+	private static final float VR_SPECTATOR_ASPECT_RATIO = 16f / 9f;
+	private static final float VR_SPECTATOR_CROP_LEFT = 0.03f;
+	private static final float VR_SPECTATOR_CROP_RIGHT = 0.03f;
+	private static final float VR_SPECTATOR_CROP_TOP = 0.02f;
+	private static final float VR_SPECTATOR_CROP_BOTTOM = 0.02f;
+	private static final int VR_SPECTATOR_WINDOW_WIDTH = 1920;
+	private static final int VR_SPECTATOR_WINDOW_HEIGHT = 1080;
 
 	/**
 	 * Stage-space Y of the world anchor (where the OSRS camera maps to).
@@ -243,12 +249,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 * camera direction rather than the fixed OSRS 2D camera direction.
 	 */
 	private Projection vrSorterProjection;
+	// Smoothed spectator camera for the current capture frame.
+	private VrCamera.Pose vrSpectatorPose;
+	// Null during splash/menu frames before a 3D scene replay exists; UI/controllers still render through stage projection.
+	private float[] vrSpectatorWorldProj;
 
 	// --- Debug ray visualisation ---
 	private int glDebugProgram;
 	private int uniDebugWorldProj;
 	private final VrUi vrUi = new VrUi();
 	private final VrCamera vrCamera = new VrCamera();
+	// Separate state so spectator smoothing never feeds back into the headset path.
+	private final VrCamera vrSpectatorCamera = new VrCamera();
+	private final VrSpectatorWindow vrSpectatorWindow = new VrSpectatorWindow();
 	private final VrInteraction vrInteraction = new VrInteraction(this);
 	private final VrBillboardRenderer vrBillboards = new VrBillboardRenderer();
 	private VrSceneRaycaster vrSceneRaycaster;
@@ -587,6 +600,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private boolean sceneFboValid;
 	private int rboColorBuffer;
 	private int rboDepthBuffer;
+	private int fboVrSpectator = -1;
+	private int rboVrSpectatorColor;
+	private int rboVrSpectatorDepth;
+	private int vrSpectatorWidth;
+	private int vrSpectatorHeight;
 
 	private int textureArrayId;
 
@@ -897,6 +915,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		renderCallbackManager.unregister(vrActorUiCaptureCallback);
 		overlayManager.remove(vrMenuCaptureOverlay);
+		vrSpectatorWindow.close();
 		clientThread.invoke(() ->
 		{
 			client.setGpuFlags(0);
@@ -1225,7 +1244,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				replay.opaque.vaos.get(i).reset();
 			}
 		}
-		replay.opaqueCount = 0;
+		if (resetAfterDraw)
+		{
+			replay.opaqueCount = 0;
+		}
 	}
 
 	private void replayCapturedSortedOpaque(ReplayBuffers replay, boolean resetAfterDraw)
@@ -1252,7 +1274,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			}
 		}
 		glColorMask(true, true, true, true);
-		replay.sortedOpaqueCount = 0;
+		if (resetAfterDraw)
+		{
+			replay.sortedOpaqueCount = 0;
+		}
 	}
 
 	private void replayScene(Scene scene, ReplayBuffers replay, int alphaCameraYaw, int alphaCameraPitch,
@@ -1538,6 +1563,66 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			glDeleteRenderbuffers(rboDepthBuffer);
 			rboDepthBuffer = 0;
 		}
+
+		shutdownVrSpectatorFbo();
+	}
+
+	private void ensureVrSpectatorFbo(int width, int height)
+	{
+		if (fboVrSpectator != -1 && vrSpectatorWidth == width && vrSpectatorHeight == height)
+		{
+			return;
+		}
+
+		// The spectator scene is rendered as a normal eye image first, then cropped/scaled by VrSpectatorWindow.
+		shutdownVrSpectatorFbo();
+		vrSpectatorWidth = width;
+		vrSpectatorHeight = height;
+
+		fboVrSpectator = glGenFramebuffers();
+		glBindFramebuffer(GL_FRAMEBUFFER, fboVrSpectator);
+
+		rboVrSpectatorColor = glGenRenderbuffers();
+		glBindRenderbuffer(GL_RENDERBUFFER, rboVrSpectatorColor);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, width, height);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rboVrSpectatorColor);
+
+		rboVrSpectatorDepth = glGenRenderbuffers();
+		glBindRenderbuffer(GL_RENDERBUFFER, rboVrSpectatorDepth);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, width, height);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rboVrSpectatorDepth);
+
+		int status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		if (status != GL_FRAMEBUFFER_COMPLETE)
+		{
+			throw new RuntimeException("VR spectator FBO is incomplete. status: " + status);
+		}
+
+		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	}
+
+	private void shutdownVrSpectatorFbo()
+	{
+		if (fboVrSpectator != -1)
+		{
+			glDeleteFramebuffers(fboVrSpectator);
+			fboVrSpectator = -1;
+		}
+		if (rboVrSpectatorColor != 0)
+		{
+			glDeleteRenderbuffers(rboVrSpectatorColor);
+			rboVrSpectatorColor = 0;
+		}
+		if (rboVrSpectatorDepth != 0)
+		{
+			glDeleteRenderbuffers(rboVrSpectatorDepth);
+			rboVrSpectatorDepth = 0;
+		}
+		vrSpectatorWidth = 0;
+		vrSpectatorHeight = 0;
+		vrSpectatorPose = null;
+		vrSpectatorWorldProj = null;
 	}
 
 	private void destroyXr()
@@ -1561,6 +1646,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		vrWorldAnchorY = Float.NaN;
 		vrLastZoomUpdateMs = 0L;
 		vrCamera.reset();
+		vrSpectatorCamera.reset();
+		vrSpectatorPose = null;
+		vrSpectatorWorldProj = null;
 	}
 
 	// -------------------------------------------------------------------------
@@ -1612,7 +1700,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private VrCamera.Pose getVrCameraPose(int eye, XrView view)
 	{
-		return vrCamera.eyePose(eye, view.pose(), VR_SPECTATOR_MODE, VR_SPECTATOR_CAMERA_SMOOTHING);
+		return vrCamera.livePose(view.pose());
 	}
 
 	// -------------------------------------------------------------------------
@@ -1825,6 +1913,52 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return debugRayFb.limit();
 	}
 
+	private int buildStageDebugRayVerts()
+	{
+		final float RAY_M = 5f;
+		final float RAY_R = 0.05f;
+		final float RAY_G = 0.18f;
+		final float RAY_B = 0.55f;
+
+		debugRayFb.clear();
+		controllerTriangleFloatCount = 0;
+
+		VrController[] arr = { controllers.left(), controllers.right() };
+		for (VrController c : arr)
+		{
+			if (!c.active)
+			{
+				continue;
+			}
+			boolean trig = c.triggerDown;
+			boolean sqz = c.squeezeDown;
+			float r = trig ? 1f : (sqz ? 1f : 0f);
+			float g = trig ? 1f : 1f;
+			float b = sqz || trig ? 0f : (c.hand == VrController.Hand.LEFT ? 0f : 1f);
+
+			controllerTriangleFloatCount += VrControllerModel.putStage(debugRayFb, c.hand == VrController.Hand.LEFT,
+				c.posX, c.posY, c.posZ,
+				c.oriX, c.oriY, c.oriZ, c.oriW,
+				r, g, b);
+		}
+
+		for (VrController c : arr)
+		{
+			if (!c.active)
+			{
+				continue;
+			}
+			debugRayFb.put(c.posX).put(c.posY).put(c.posZ).put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
+			debugRayFb.put(c.posX + c.dirX * RAY_M)
+				.put(c.posY + c.dirY * RAY_M)
+				.put(c.posZ + c.dirZ * RAY_M)
+				.put(RAY_R).put(RAY_G).put(RAY_B).put(1f);
+		}
+
+		debugRayFb.flip();
+		return debugRayFb.limit();
+	}
+
 	private void putDebugCross(float[] point, float size, float r, float g, float b, float a)
 	{
 		if (point == null)
@@ -1906,9 +2040,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private void drawDebugRays(int eye)
 	{
-		if (xrInput == null || controllers == null || Float.isNaN(vrWorldAnchorY)) return;
+		drawDebugRays(computeVrWorldProj(eye), false);
+	}
 
-		int n = buildDebugRayVerts();
+	private void drawDebugRays(float[] projection, boolean stageSpace)
+	{
+		if (xrInput == null || controllers == null || projection == null) return;
+
+		int n = stageSpace ? buildStageDebugRayVerts() : buildDebugRayVerts();
 		if (n == 0) return;
 
 		glBindVertexArray(debugVaoId);
@@ -1916,7 +2055,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glBufferSubData(GL_ARRAY_BUFFER, 0, debugRayFb);
 
 		glUseProgram(glDebugProgram);
-		glUniformMatrix4fv(uniDebugWorldProj, false, computeVrWorldProj(eye));
+		glUniformMatrix4fv(uniDebugWorldProj, false, projection);
 		if (controllerTriangleFloatCount > 0)
 		{
 			glEnable(GL_BLEND);
@@ -2348,6 +2487,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// instead of mirroring the left eye. This lets us validate staged WALK clicks
 			// against the same screen-space view the client consumes.
 			renderDesktopSpectatorPass();
+			renderVrSpectatorScenePass();
 
 			// ---- Right eye pass (T3.3) ----
 			int sky = client.getSkyboxColor();
@@ -2566,6 +2706,37 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Restore the main-scene camera uniforms before continuing with the stereo VR path.
 		uploadMainCameraUniforms(cameraYaw, cameraPitch, root.cameraX, root.cameraY, root.cameraZ);
+	}
+
+	private void renderVrSpectatorScenePass()
+	{
+		if (!VR_SPECTATOR_MODE || openXrFrame == null || !openXrFrame.isRendering() || getXrViews() == null)
+		{
+			vrSpectatorCamera.reset();
+			vrSpectatorPose = null;
+			vrSpectatorWorldProj = null;
+			return;
+		}
+
+		int width = openXrFrame.width(0);
+		int height = openXrFrame.height(0);
+		ensureVrSpectatorFbo(width, height);
+
+		XrView leftView = getXrViews().get(0);
+		vrSpectatorPose = vrSpectatorCamera.smoothedEyePose(0, leftView.pose(), VR_SPECTATOR_CAMERA_SMOOTHING);
+		vrSpectatorWorldProj = computeVrWorldProj(leftView, vrSpectatorPose);
+
+		// Replay the already captured left-eye scene into a separate target before right-eye replay resets buffers.
+		glUseProgram(glProgram);
+		setupScenePass(fboVrSpectator, 0, 0, width, height,
+			false, vrSpectatorWorldProj, client.getSkyboxColor(), GL_BACK);
+
+		replayScene(vrScene, primaryReplay, cameraYaw, cameraPitch, root.cameraX, root.cameraZ,
+			false, false, false);
+
+		glDisable(GL_BLEND);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
 	}
 
 	private float getSafeDesktopCameraYawRad()
@@ -3358,58 +3529,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrUiPointerV,
 			vrUiPointerLmbDown,
 			vrUiPointerRmbDown);
-		vrUi.renderCanvasPanel(
-			openXrFrame.fbo(0),
-			openXrFrame.width(0),
-			openXrFrame.height(0),
-			getXrViews(),
-			0,
-			interfaceTexture,
-			canvasWidth,
-			canvasHeight,
-			overlayColor);
-		vrUi.renderCanvasPanel(
-			openXrFrame.fbo(1),
-			openXrFrame.width(1),
-			openXrFrame.height(1),
-			getXrViews(),
-			1,
-			interfaceTexture,
-			canvasWidth,
-			canvasHeight,
-			overlayColor);
-
-		drawVrActorOverlays(0, openXrFrame.fbo(0));
-		drawVrActorOverlays(1, openXrFrame.fbo(1));
-		drawVrControllerRays(0, openXrFrame.fbo(0));
-		drawVrControllerRays(1, openXrFrame.fbo(1));
-
-		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
-	}
-
-	private void drawVrControllerRays(int eye, int framebuffer)
-	{
-		if (openXrFrame == null || !openXrFrame.isRendering() || framebuffer == -1)
-		{
-			return;
-		}
-
-		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-		glViewport(0, 0, openXrFrame.width(eye), openXrFrame.height(eye));
-		glDisable(GL_BLEND);
-		glDisable(GL_CULL_FACE);
-		glDisable(GL_DEPTH_TEST);
-		// Draw after VR UI/billboards so the controller ray remains visible on menu surfaces.
-		drawDebugRays(eye);
-	}
-
-	private void drawVrActorOverlays(int eye, int framebuffer)
-	{
-		if (openXrFrame == null || !openXrFrame.isRendering() || getXrViews() == null
-			|| framebuffer == -1 || Float.isNaN(vrWorldAnchorY))
-		{
-			return;
-		}
 
 		XrView leftView = getXrViews().get(0);
 		XrView rightView = getXrViews().get(1);
@@ -3417,11 +3536,72 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float centerEyeY = (leftView.pose().position$().y() + rightView.pose().position$().y()) * 0.5f;
 		float centerEyeZ = (leftView.pose().position$().z() + rightView.pose().position$().z()) * 0.5f;
 
+		drawVrTargetOverlays(
+			openXrFrame.fbo(0),
+			openXrFrame.width(0),
+			openXrFrame.height(0),
+			vrCamera.computeStageProjection(leftView, getVrCameraPose(0, leftView)),
+			computeVrWorldProj(0),
+			centerEyeX,
+			centerEyeY,
+			centerEyeZ,
+			canvasWidth,
+			canvasHeight,
+			overlayColor);
+		drawVrTargetOverlays(
+			openXrFrame.fbo(1),
+			openXrFrame.width(1),
+			openXrFrame.height(1),
+			vrCamera.computeStageProjection(rightView, getVrCameraPose(1, rightView)),
+			computeVrWorldProj(1),
+			centerEyeX,
+			centerEyeY,
+			centerEyeZ,
+			canvasWidth,
+			canvasHeight,
+			overlayColor);
+		drawVrSpectatorOverlays(canvasWidth, canvasHeight, overlayColor);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
+	}
+
+	private void drawVrTargetOverlays(int framebuffer, int viewportWidth, int viewportHeight,
+		float[] uiProjection, float[] worldProjection,
+		float centerEyeX, float centerEyeY, float centerEyeZ,
+		int canvasWidth, int canvasHeight, int overlayColor)
+	{
+		if (framebuffer == -1)
+		{
+			return;
+		}
+
+		vrUi.renderCanvasPanel(
+			framebuffer,
+			viewportWidth,
+			viewportHeight,
+			uiProjection,
+			interfaceTexture,
+			canvasWidth,
+			canvasHeight,
+			overlayColor);
+
+		if (worldProjection == null || Float.isNaN(vrWorldAnchorY))
+		{
+			// Splash/menu frames may have no OSRS world yet, but controllers still live in OpenXR stage space.
+			glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+			glViewport(0, 0, viewportWidth, viewportHeight);
+			glDisable(GL_BLEND);
+			glDisable(GL_CULL_FACE);
+			glDisable(GL_DEPTH_TEST);
+			drawDebugRays(uiProjection, true);
+			return;
+		}
+
 		vrBillboards.render(
 			framebuffer,
-			openXrFrame.width(eye),
-			openXrFrame.height(eye),
-			computeVrWorldProj(eye),
+			viewportWidth,
+			viewportHeight,
+			worldProjection,
 			centerEyeX,
 			centerEyeY,
 			centerEyeZ,
@@ -3431,6 +3611,63 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			getVrAnchorWorldX(),
 			getVrAnchorWorldY(),
 			getVrAnchorWorldZ());
+
+		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+		glViewport(0, 0, viewportWidth, viewportHeight);
+		glDisable(GL_BLEND);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
+		drawDebugRays(worldProjection, false);
+	}
+
+	private void drawVrSpectatorOverlays(int canvasWidth, int canvasHeight, int overlayColor)
+	{
+		if (!VR_SPECTATOR_MODE || openXrFrame == null || !openXrFrame.isRendering() || getXrViews() == null)
+		{
+			vrSpectatorWindow.close();
+			return;
+		}
+
+		XrView leftView = getXrViews().get(0);
+		if (fboVrSpectator == -1)
+		{
+			ensureVrSpectatorFbo(openXrFrame.width(0), openXrFrame.height(0));
+		}
+
+		if (vrSpectatorWorldProj == null)
+		{
+			// UI-only spectator frame: advance the smoothed camera and clear the target before drawing the panel.
+			vrSpectatorPose = vrSpectatorCamera.smoothedEyePose(0, leftView.pose(), VR_SPECTATOR_CAMERA_SMOOTHING);
+			glBindFramebuffer(GL_FRAMEBUFFER, fboVrSpectator);
+			glViewport(0, 0, vrSpectatorWidth, vrSpectatorHeight);
+			glClearColor(0, 0, 0, 1);
+			glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		}
+
+		drawVrTargetOverlays(
+			fboVrSpectator,
+			vrSpectatorWidth,
+			vrSpectatorHeight,
+			vrSpectatorCamera.computeStageProjection(leftView, vrSpectatorPose),
+			vrSpectatorWorldProj,
+			vrSpectatorPose.x,
+			vrSpectatorPose.y,
+			vrSpectatorPose.z,
+			canvasWidth,
+			canvasHeight,
+			overlayColor);
+
+		vrSpectatorWindow.present(
+			fboVrSpectator,
+			vrSpectatorWidth,
+			vrSpectatorHeight,
+			VR_SPECTATOR_ASPECT_RATIO,
+			VR_SPECTATOR_CROP_LEFT,
+			VR_SPECTATOR_CROP_RIGHT,
+			VR_SPECTATOR_CROP_TOP,
+			VR_SPECTATOR_CROP_BOTTOM,
+			VR_SPECTATOR_WINDOW_WIDTH,
+			VR_SPECTATOR_WINDOW_HEIGHT);
 	}
 
 	private boolean captureVrActorUi(Renderable renderable, boolean ui)
