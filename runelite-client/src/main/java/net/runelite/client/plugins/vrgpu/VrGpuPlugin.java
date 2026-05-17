@@ -196,19 +196,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	/**
 	 * Default world scale: meters per OSRS local unit.
-	 * 1 tile = 128 units ≈ 0.1 m → 0.1 / 128 ≈ 0.000781.
+	 * 1 tile = 128 units = 1 game-world meter.
 	 */
-	private static final float DEFAULT_WORLD_SCALE = 0.000781f;
+	private static final float DEFAULT_WORLD_SCALE = 1f / 128f;
+	/** Current approximation of the local player character head above the tile-height anchor. */
+	private static final float VR_PLAYER_HEAD_WORLD_UP_UNITS = 200f;
 	private static final float VR_STAGE_CHARACTER_OFFSET_Y = -1.5f;
-	private static final float VR_STAGE_CHARACTER_OFFSET_Z = -0.5f;
-	private static final float VR_ZOOM_BASE = 1.0f;
-	private static final float VR_ZOOM_MIN = 0.5f;
-	private static final float VR_ZOOM_MAX = 5.0f;
+	private static final float VR_ZOOM_OUT_BASE = 2.0f;
+	private static final float VR_ZOOM_OUT_MIN = 1.0f;
+	private static final float VR_ZOOM_OUT_MAX = 5.0f;
 	private static final float VR_ZOOM_SPEED_PER_SECOND = 3.0f;
+	private static final float VR_ZOOM_OUT_UP_SLOPE = 1.0f;
 	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
 	// Capture mode only: HMD rendering stays on live OpenXR poses, while the spectator pass can smooth.
 	private static final boolean VR_SPECTATOR_MODE = true;
-	private static final float VR_SPECTATOR_CAMERA_SMOOTHING = 0.8f;
+	private static final float VR_SPECTATOR_CAMERA_SMOOTHING = 0.85f;
 	// Keep the spectator render FBO at native eye aspect; crop only when presenting the desktop window.
 	private static final float VR_SPECTATOR_ASPECT_RATIO = 16f / 9f;
 	private static final float VR_SPECTATOR_CROP_LEFT = 0.03f;
@@ -219,12 +221,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_SPECTATOR_WINDOW_HEIGHT = 1080;
 
 	/**
-	 * Stage-space Y of the world anchor (where the OSRS camera maps to).
-	 * Sampled once from the first VR frame as (initialEyeY - 0.7 m).
+	 * Stage-space Y of the tile-height body anchor.
+	 * Sampled once from the first VR frame as (initialEyeY - 1.5 m).
 	 * NaN until that first frame runs.
 	 */
 	private float vrWorldAnchorY = Float.NaN;
-	private float vrZoom = VR_ZOOM_BASE;
+	private float vrZoomOut = VR_ZOOM_OUT_BASE;
 	private long vrLastZoomUpdateMs;
 
 	/** Which eye is currently being rendered: 0 = left, 1 = right, -1 = no VR. */
@@ -339,7 +341,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final Path VR_UI_CAPTURE_DEBUG_DIR = Paths.get("C:\\tmp\\captures");
 	private static final long VR_CONTEXT_HINT_STALE_MS = 500L;
 	static final long VR_CONTEXT_HINT_HOVER_INTERVAL_MS = 50L;
-	private static final float VR_CONTEXT_HINT_METERS_PER_PIXEL = 0.0017f;
+	private static final float VR_CONTEXT_HINT_METERS_PER_PIXEL = 0.00255f;
 	static final float VR_CONTEXT_HINT_WORLD_Y_OFFSET = -96f;
 	private static final float VR_CONTEXT_HINT_OFFSET_XM = 0.10f;
 	private static final float VR_CONTEXT_HINT_OFFSET_YM = 0.08f;
@@ -353,6 +355,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final long VR_DESKTOP_ACTIVATION_MARKER_STALE_MS = 2000L;
 	private static final int VR_DESKTOP_ACTIVATION_MARKER_COLOR = 0xffff00ff;
 	private static final long VR_MENU_STALE_MS = 5000L;
+	private static final boolean SHOW_DEBUG_CAMERA_RAYS = false;
 	private static final float VR_MENU_METERS_PER_PIXEL = VR_CONTEXT_HINT_METERS_PER_PIXEL;
 	static final float VR_MENU_WORLD_Y_OFFSET = -96f;
 	private static final float VR_MENU_OFFSET_XM = 0f;
@@ -518,6 +521,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
+	private static float getVrContextHintWidthMeters(int width)
+	{
+		return width * VR_CONTEXT_HINT_METERS_PER_PIXEL;
+	}
+
+	private static float getVrContextHintHeightMeters(int height)
+	{
+		return height * VR_CONTEXT_HINT_METERS_PER_PIXEL;
+	}
+
 	private static final class VrMenuOverlay
 	{
 		final int[] argbPixels;
@@ -544,11 +557,21 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			this.anchorX = anchorX;
 			this.anchorY = anchorY;
 			this.anchorZ = anchorZ;
-			this.widthMeters = width * VR_MENU_METERS_PER_PIXEL;
-			this.heightMeters = height * VR_MENU_METERS_PER_PIXEL;
+			this.widthMeters = getVrMenuWidthMeters(width);
+			this.heightMeters = getVrMenuHeightMeters(height);
 			this.offsetYM = offsetYM;
 			this.timeMs = timeMs;
 		}
+	}
+
+	private static float getVrMenuWidthMeters(int width)
+	{
+		return width * VR_MENU_METERS_PER_PIXEL;
+	}
+
+	private static float getVrMenuHeightMeters(int height)
+	{
+		return height * VR_MENU_METERS_PER_PIXEL;
 	}
 
 	static final class VrMenuHit
@@ -1657,12 +1680,36 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private float getVrWorldScale()
 	{
-		return DEFAULT_WORLD_SCALE * vrZoom;
+		// vrZoomOut is a pullback factor: 1.0 is 1:1 at the player head, larger values shrink the world.
+		return DEFAULT_WORLD_SCALE / vrZoomOut;
 	}
 
-	private float getVrStageCharacterOffsetZ()
+	private float getVrPlayerHeadWorldY()
 	{
-		return VR_STAGE_CHARACTER_OFFSET_Z * ((VR_ZOOM_MAX - vrZoom) / (VR_ZOOM_MAX - VR_ZOOM_BASE));
+		return getVrAnchorWorldY() - VR_PLAYER_HEAD_WORLD_UP_UNITS;
+	}
+
+	private float getVrPlayerHeadStageBaseY()
+	{
+		return vrWorldAnchorY + VR_PLAYER_HEAD_WORLD_UP_UNITS * DEFAULT_WORLD_SCALE;
+	}
+
+	private float getVrZoomOutDistance()
+	{
+		return vrZoomOut - VR_ZOOM_OUT_MIN;
+	}
+
+	private float getVrStageAnchorOffsetY()
+	{
+		// Zooming out moves the effective camera diagonally back and up from the player head.
+		// Because OSRS world Y is flipped into VR stage Y, moving the world anchor down makes the camera feel higher.
+		return getVrPlayerHeadStageBaseY() - getVrZoomOutDistance() * VR_ZOOM_OUT_UP_SLOPE;
+	}
+
+	private float getVrStageAnchorOffsetZ()
+	{
+		// Negative stage Z moves the player head forward, so the live HMD camera reads as pulled back.
+		return -getVrZoomOutDistance();
 	}
 
 	private XrView.Buffer getXrViews()
@@ -1694,8 +1741,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private float[] computeVrWorldProj(XrView view, VrCamera.Pose pose)
 	{
 		return vrCamera.computeVrWorldProj(view, pose,
-			vrWorldAnchorY, getVrWorldScale(), getVrStageCharacterOffsetZ(),
-			getVrAnchorWorldX(), getVrAnchorWorldY(), getVrAnchorWorldZ());
+			getVrStageAnchorOffsetY(), getVrWorldScale(), getVrStageAnchorOffsetZ(),
+			getVrAnchorWorldX(), getVrPlayerHeadWorldY(), getVrAnchorWorldZ());
 	}
 
 	private VrCamera.Pose getVrCameraPose(int eye, XrView view)
@@ -1738,10 +1785,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private int buildDebugRayVerts()
 	{
 		final float s = getVrWorldScale();
-		final float oy = vrWorldAnchorY;
-		final float oz = getVrStageCharacterOffsetZ();
+		final float oy = getVrStageAnchorOffsetY();
+		final float oz = getVrStageAnchorOffsetZ();
 		final float camX = getVrAnchorWorldX();
-		final float camY = getVrAnchorWorldY();
+		final float camY = getVrPlayerHeadWorldY();
 		final float camZ = getVrAnchorWorldZ();
 		final float RAY_M = 5f;          // ray length in metres
 		final float RAY_R = 0.05f;
@@ -1777,7 +1824,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// It is intentionally not the depth-buffer hit; the cursor must sit on the controller ray.
 			controllerTriangleFloatCount += VrControllerModel.putEndpointCube(debugRayFb,
 				vrInteractionHoverSceneHit[0], vrInteractionHoverSceneHit[1], vrInteractionHoverSceneHit[2],
-				MARKER_SIZE, markerColor[0], markerColor[1], markerColor[2]);
+				MARKER_SIZE * 3f, markerColor[0], markerColor[1], markerColor[2]);
 		}
 
 		for (VrController c : arr)
@@ -1800,27 +1847,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			final float BIG = 150f;
 			final float SMALL = BIG / 3f;
 
-			if (vrLastClickRay != null)
-			{
-				float rox = vrLastClickRay[0], roy = vrLastClickRay[1], roz = vrLastClickRay[2];
-				float rdx = vrLastClickRay[3], rdy = vrLastClickRay[4], rdz = vrLastClickRay[5];
-				float far = 6000f;
-				float rex = rox + rdx * far;
-				float rey = roy + rdy * far;
-				float rez = roz + rdz * far;
-				// Orange = actual VR click ray in OSRS coords.
-				debugRayFb.put(rox).put(roy).put(roz).put(1f).put(0.55f).put(0f).put(1f);
-				debugRayFb.put(rex).put(rey).put(rez).put(1f).put(0.55f).put(0f).put(1f);
-			}
-
 			if (vrLastGroundHit != null)
 			{
 				float gx = vrLastGroundHit[0], gy = vrLastGroundHit[1], gz = vrLastGroundHit[2];
 				// Yellow = resolved VR ground intersection point.
-				debugRayFb.put(gx - SMALL).put(gy).put(gz        ).put(1f).put(1f).put(0f).put(1f);
-				debugRayFb.put(gx + SMALL).put(gy).put(gz        ).put(1f).put(1f).put(0f).put(1f);
-				debugRayFb.put(gx        ).put(gy).put(gz - SMALL).put(1f).put(1f).put(0f).put(1f);
-				debugRayFb.put(gx        ).put(gy).put(gz + SMALL).put(1f).put(1f).put(0f).put(1f);
+				putDebugCross(new float[]{gx, gy, gz}, SMALL, 1f, 1f, 0f, 1f);
 			}
 
 			if (vrLastSceneRaycastHit != null)
@@ -1829,7 +1860,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				putDebugCross(vrLastSceneRaycastHit, BIG * 0.75f, 1f, 0.1f, 0.9f, 1f);
 			}
 
-			if (vrDesktopCameraAimTarget != null)
+			if (SHOW_DEBUG_CAMERA_RAYS && vrDesktopCameraAimTarget != null)
 			{
 				double cameraApiX = client.getCameraFpX();
 				double cameraApiY = client.getCameraFpY();
@@ -1840,12 +1871,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				float originY = (float) cameraApiZ;
 				float originZ = (float) cameraApiY;
 				// Blue cross = actual hidden desktop camera position after steering.
-				debugRayFb.put(originX - BIG).put(originY).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
-				debugRayFb.put(originX + BIG).put(originY).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
-				debugRayFb.put(originX).put(originY - BIG).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
-				debugRayFb.put(originX).put(originY + BIG).put(originZ).put(0.2f).put(0.5f).put(1f).put(1f);
-				debugRayFb.put(originX).put(originY).put(originZ - BIG).put(0.2f).put(0.5f).put(1f).put(1f);
-				debugRayFb.put(originX).put(originY).put(originZ + BIG).put(0.2f).put(0.5f).put(1f).put(1f);
+				putDebugCross(new float[]{originX, originY, originZ}, BIG, 0.2f, 0.5f, 1f, 1f);
 				float dirApiX = (float) (-Math.cos(cameraPitchFp) * Math.sin(cameraYawFp));
 				float dirApiY = (float) (Math.cos(cameraPitchFp) * Math.cos(cameraYawFp));
 				float dirApiZ = (float) Math.sin(cameraPitchFp);
@@ -1872,7 +1898,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				debugRayFb.put(tx).put(ty).put(tz).put(0.1f).put(0.9f).put(1f).put(0.9f);
 			}
 
-			if (vrLastDispatchSceneTile != null)
+			if (SHOW_DEBUG_CAMERA_RAYS && vrLastDispatchSceneTile != null)
 			{
 				float dtx = vrLastDispatchSceneTile[0] * TILE;
 				float dtz = vrLastDispatchSceneTile[1] * TILE;
@@ -1894,19 +1920,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				float dy2 = vrLastClientDestination[1];
 				float dz2 = vrLastClientDestination[2];
 				// Cyan = client local destination after the walk click.
-				debugRayFb.put(dx2 - BIG).put(dy2).put(dz2      ).put(0f).put(1f).put(1f).put(1f);
-				debugRayFb.put(dx2 + BIG).put(dy2).put(dz2      ).put(0f).put(1f).put(1f).put(1f);
-				debugRayFb.put(dx2      ).put(dy2).put(dz2 - BIG).put(0f).put(1f).put(1f).put(1f);
-				debugRayFb.put(dx2      ).put(dy2).put(dz2 + BIG).put(0f).put(1f).put(1f).put(1f);
+				putDebugCross(new float[]{dx2, dy2, dz2}, BIG, 0f, 1f, 1f, 1f);
 			}
 
 		}
 
 		if (System.currentTimeMillis() - vrInteractionHoverDebugTimeMs <= VR_CONTEXT_HINT_STALE_MS)
 		{
-			// Magenta = raycastScene result; green = intersectGround result.
+			// Purple = live controller scene/object intersection.
 			putDebugCross(vrInteractionHoverSceneHit, 90f, 1f, 0f, 1f, 1f);
-			putDebugCross(vrInteractionHoverGroundHit, 70f, 0.2f, 1f, 0.2f, 1f);
 		}
 
 		debugRayFb.flip();
@@ -1966,6 +1988,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
+		size *= 0.5f;
 		float x = point[0], y = point[1], z = point[2];
 		debugRayFb.put(x - size).put(y).put(z).put(r).put(g).put(b).put(a);
 		debugRayFb.put(x + size).put(y).put(z).put(r).put(g).put(b).put(a);
@@ -1983,8 +2006,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		controllers.update();
 		updateVrZoomFromJoystick();
 		controllers.computeOsrsRays(
-			getVrWorldScale(), vrWorldAnchorY, getVrStageCharacterOffsetZ(),
-			getVrAnchorWorldX(), getVrAnchorWorldY(), getVrAnchorWorldZ());
+			getVrWorldScale(), getVrStageAnchorOffsetY(), getVrStageAnchorOffsetZ(),
+			getVrAnchorWorldX(), getVrPlayerHeadWorldY(), getVrAnchorWorldZ());
 
 		if (!controllers.left().active && !controllers.right().active)
 		{
@@ -2179,19 +2202,19 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float direction;
 		if (controller.stickAction == VrController.StickAction.UP)
 		{
-			direction = 1f;
+			direction = -1f;
 		}
 		else if (controller.stickAction == VrController.StickAction.DOWN)
 		{
-			direction = -1f;
+			direction = 1f;
 		}
 		else
 		{
 			return;
 		}
 
-		vrZoom = Math.max(VR_ZOOM_MIN, Math.min(VR_ZOOM_MAX,
-			vrZoom + direction * VR_ZOOM_SPEED_PER_SECOND * dt));
+		vrZoomOut = Math.max(VR_ZOOM_OUT_MIN, Math.min(VR_ZOOM_OUT_MAX,
+			vrZoomOut + direction * VR_ZOOM_SPEED_PER_SECOND * dt));
 	}
 
 	private float[] queueVrHoverRay(VrController controller)
@@ -2286,8 +2309,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private Projection buildVrSorterProjection(XrView view, VrCamera.Pose pose)
 	{
 		return vrCamera.buildVrSorterProjection(view, pose,
-			vrWorldAnchorY, getVrWorldScale(), getVrStageCharacterOffsetZ(),
-			getVrAnchorWorldX(), getVrAnchorWorldY(), getVrAnchorWorldZ());
+			getVrStageAnchorOffsetY(), getVrWorldScale(), getVrStageAnchorOffsetZ(),
+			getVrAnchorWorldX(), getVrPlayerHeadWorldY(), getVrAnchorWorldZ());
 	}
 
 	private Projection buildDesktopSorterProjection()
@@ -3606,10 +3629,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			centerEyeY,
 			centerEyeZ,
 			getVrWorldScale(),
-			vrWorldAnchorY,
-			getVrStageCharacterOffsetZ(),
+			getVrStageAnchorOffsetY(),
+			getVrStageAnchorOffsetZ(),
 			getVrAnchorWorldX(),
-			getVrAnchorWorldY(),
+			getVrPlayerHeadWorldY(),
 			getVrAnchorWorldZ());
 
 		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
@@ -4082,8 +4105,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				hint.anchorX,
 				hint.anchorY,
 				hint.anchorZ,
-				hint.width * VR_CONTEXT_HINT_METERS_PER_PIXEL,
-				hint.height * VR_CONTEXT_HINT_METERS_PER_PIXEL,
+				getVrContextHintWidthMeters(hint.width),
+				getVrContextHintHeightMeters(hint.height),
 				VR_CONTEXT_HINT_OFFSET_XM,
 				VR_CONTEXT_HINT_OFFSET_YM,
 				hint.argbPixels,
@@ -4141,7 +4164,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			return VR_MENU_OFFSET_YM;
 		}
-		float hintHalfHeightM = hint.height * VR_CONTEXT_HINT_METERS_PER_PIXEL * 0.5f;
+		float hintHalfHeightM = getVrContextHintHeightMeters(hint.height) * 0.5f;
 		float menuHalfHeightM = menuHeightMeters * 0.5f;
 		return VR_CONTEXT_HINT_OFFSET_YM + hintHalfHeightM + VR_MENU_CONTEXT_HINT_GAP_M + menuHalfHeightM;
 	}
@@ -4246,7 +4269,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			ax = pending[0];
 			ay = pending[1];
 			az = pending[2];
-			offsetYM = getVrMenuOffsetYM(ax, ay, az, crop.height * VR_MENU_METERS_PER_PIXEL);
+			offsetYM = getVrMenuOffsetYM(ax, ay, az, getVrMenuHeightMeters(crop.height));
 		}
 		else if (existing != null)
 		{
@@ -4260,7 +4283,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			ax = getVrAnchorWorldX();
 			ay = getVrAnchorWorldY() + VR_MENU_WORLD_Y_OFFSET;
 			az = getVrAnchorWorldZ();
-			offsetYM = getVrMenuOffsetYM(ax, ay, az, crop.height * VR_MENU_METERS_PER_PIXEL);
+			offsetYM = getVrMenuOffsetYM(ax, ay, az, getVrMenuHeightMeters(crop.height));
 		}
 
 		vrMenuOverlay = new VrMenuOverlay(pixels, crop.width, crop.height,
@@ -5734,13 +5757,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	{
 		final float s = getVrWorldScale();
 		final float anchorWorldX = getVrAnchorWorldX();
-		final float anchorWorldY = getVrAnchorWorldY();
+		final float anchorWorldY = getVrPlayerHeadWorldY();
 		final float anchorWorldZ = getVrAnchorWorldZ();
 
 		// Anchor in stage coords (matches VrBillboardRenderer).
 		float anchorStageX = -(menu.anchorX - anchorWorldX) * s;
-		float anchorStageY = -(menu.anchorY - anchorWorldY) * s + vrWorldAnchorY;
-		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + getVrStageCharacterOffsetZ();
+		float anchorStageY = -(menu.anchorY - anchorWorldY) * s + getVrStageAnchorOffsetY();
+		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + getVrStageAnchorOffsetZ();
 
 		// Compute eye→anchor right vector in xz plane (matches drawBillboard).
 		org.lwjgl.openxr.XrView.Buffer views = getXrViews();

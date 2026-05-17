@@ -32,8 +32,8 @@ import static org.lwjgl.opengl.GL33C.*;
 final class VrUi
 {
 	// --- Tunable first-pass canvas panel placement ---
-	static final float PANEL_DISTANCE_M = 1.35f;
-	static final float PANEL_WIDTH_M = 1.7f;
+	static final float PANEL_DISTANCE_M = 1.85f;
+	static final float PANEL_WIDTH_M = 1.87f;
 	static final float PANEL_HORIZONTAL_OFFSET_M = 0.0f;
 	static final float PANEL_VERTICAL_OFFSET_M = 1.0f;
 
