@@ -21,13 +21,13 @@ We are building a RuneLite VR GPU plugin: OpenXR stereo rendering for the 3D wor
 
 ## Main VR Files
 
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrGpuPlugin.java`: plugin entry point, DrawCallbacks, scene rendering, UI capture, VR frame flow.
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrCamera.java`: VR camera pose/projection helpers, live HMD pose access, smoothed spectator pose, desktop camera helpers, and projection builders.
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrController.java`: per-hand controller snapshot, button hysteresis, edge detection, and OSRS-space ray derivation.
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllers.java`: owns both controllers, primary-hand selection, and context-menu owner state.
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllerModel.java`: controller mesh/debug ray vertex generation. Stage-space and OSRS-world-space rendering share one mesh generator and differ only by final coordinate transform.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrGpuPlugin.java`: plugin entry point, DrawCallbacks, scene rendering, UI capture, VR frame flow, joystick zoom/orbit state, and shared per-frame VR world transform inputs.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrCamera.java`: VR camera pose/projection helpers, live HMD pose access, smoothed spectator pose, desktop camera helpers, and projection builders. The VR world projection applies zoom pullback plus joystick yaw around the player-head anchor; sorter projections must mirror that transform.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrController.java`: per-hand controller snapshot, button hysteresis, edge detection, thumbstick sampling, and OSRS-space ray derivation. Ray derivation applies the inverse VR camera boom yaw so picking stays aligned with the rendered world.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllers.java`: owns both controllers, primary-hand selection, context-menu owner state, and per-frame OSRS ray recomputation with the current VR camera transform.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrControllerModel.java`: controller mesh/debug ray vertex generation. Stage-space and OSRS-world-space rendering share one mesh generator; the world-space sink applies the inverse camera boom yaw so controller models remain visually aligned.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrUi.java`: flat canvas UI panel and pointer rendering.
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrBillboardRenderer.java`: actor/context/menu billboard textures.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrBillboardRenderer.java`: actor/context/menu billboard textures. Billboard placement/facing mirrors the current VR camera boom yaw before converting stage offsets back to OSRS world vertices.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSpectatorWindow.java`: Swing desktop window for spectator capture; reads the spectator FBO, applies aspect/crop settings, and presents the capture image.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrInteraction.java`: controller interaction and click handling.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSceneRaycaster.java`: VR ray picking against scene/world objects.

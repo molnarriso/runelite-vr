@@ -155,6 +155,7 @@ final class VrBillboardRenderer
 		float worldScale,
 		float stageOffsetY,
 		float stageOffsetZ,
+		float cameraYaw,
 		float anchorWorldX,
 		float anchorWorldY,
 		float anchorWorldZ)
@@ -177,9 +178,11 @@ final class VrBillboardRenderer
 		glUniform1i(uniTex, 0);
 		glBindVertexArray(vao);
 
+		float yawSin = (float) Math.sin(cameraYaw);
+		float yawCos = (float) Math.cos(cameraYaw);
 		for (Billboard billboard : billboards)
 		{
-			drawBillboard(billboard, centerEyeX, centerEyeY, centerEyeZ, worldScale, stageOffsetY, stageOffsetZ, anchorWorldX, anchorWorldY, anchorWorldZ);
+			drawBillboard(billboard, centerEyeX, centerEyeY, centerEyeZ, worldScale, stageOffsetY, stageOffsetZ, yawSin, yawCos, anchorWorldX, anchorWorldY, anchorWorldZ);
 		}
 
 		glBindVertexArray(0);
@@ -197,13 +200,17 @@ final class VrBillboardRenderer
 		float worldScale,
 		float stageOffsetY,
 		float stageOffsetZ,
+		float yawSin,
+		float yawCos,
 		float anchorWorldX,
 		float anchorWorldY,
 		float anchorWorldZ)
 	{
-		float stageX = -(billboard.x - anchorWorldX) * worldScale;
+		float localStageX = -(billboard.x - anchorWorldX) * worldScale;
+		float localStageZ = (billboard.z - anchorWorldZ) * worldScale;
+		float stageX = localStageX * yawCos + localStageZ * yawSin;
 		float stageY = -(billboard.y - anchorWorldY) * worldScale + stageOffsetY;
-		float stageZ = (billboard.z - anchorWorldZ) * worldScale + stageOffsetZ;
+		float stageZ = localStageZ * yawCos - localStageX * yawSin + stageOffsetZ;
 
 		float fx = eyeX - stageX;
 		float fy = eyeY - stageY;
@@ -241,12 +248,12 @@ final class VrBillboardRenderer
 		float uy = 1f;
 		float uz = 0f;
 
-		putQuadVertex(billboard, -0.5f, -0.5f, 0f, 1f, rx, ry, rz, ux, uy, uz, worldScale);
-		putQuadVertex(billboard, 0.5f, -0.5f, 1f, 1f, rx, ry, rz, ux, uy, uz, worldScale);
-		putQuadVertex(billboard, 0.5f, 0.5f, 1f, 0f, rx, ry, rz, ux, uy, uz, worldScale);
-		putQuadVertex(billboard, -0.5f, -0.5f, 0f, 1f, rx, ry, rz, ux, uy, uz, worldScale);
-		putQuadVertex(billboard, 0.5f, 0.5f, 1f, 0f, rx, ry, rz, ux, uy, uz, worldScale);
-		putQuadVertex(billboard, -0.5f, 0.5f, 0f, 0f, rx, ry, rz, ux, uy, uz, worldScale);
+		putQuadVertex(billboard, -0.5f, -0.5f, 0f, 1f, rx, ry, rz, ux, uy, uz, worldScale, yawSin, yawCos);
+		putQuadVertex(billboard, 0.5f, -0.5f, 1f, 1f, rx, ry, rz, ux, uy, uz, worldScale, yawSin, yawCos);
+		putQuadVertex(billboard, 0.5f, 0.5f, 1f, 0f, rx, ry, rz, ux, uy, uz, worldScale, yawSin, yawCos);
+		putQuadVertex(billboard, -0.5f, -0.5f, 0f, 1f, rx, ry, rz, ux, uy, uz, worldScale, yawSin, yawCos);
+		putQuadVertex(billboard, 0.5f, 0.5f, 1f, 0f, rx, ry, rz, ux, uy, uz, worldScale, yawSin, yawCos);
+		putQuadVertex(billboard, -0.5f, 0.5f, 0f, 0f, rx, ry, rz, ux, uy, uz, worldScale, yawSin, yawCos);
 		vertexBuffer.flip();
 
 		glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -270,18 +277,22 @@ final class VrBillboardRenderer
 		float ux,
 		float uy,
 		float uz,
-		float worldScale)
+		float worldScale,
+		float yawSin,
+		float yawCos)
 	{
 		float localX = billboard.localOffsetXM + xMul * billboard.widthM;
 		float localY = billboard.localOffsetYM + yMul * billboard.heightM;
 		float stageDx = rx * localX + ux * localY;
 		float stageDy = ry * localX + uy * localY;
 		float stageDz = rz * localX + uz * localY;
+		float worldScaledDx = stageDx * yawCos - stageDz * yawSin;
+		float worldScaledDz = stageDx * yawSin + stageDz * yawCos;
 
 		vertexBuffer
-			.put(billboard.x - stageDx / worldScale)
+			.put(billboard.x - worldScaledDx / worldScale)
 			.put(billboard.y - stageDy / worldScale)
-			.put(billboard.z + stageDz / worldScale)
+			.put(billboard.z + worldScaledDz / worldScale)
 			.put(u).put(v)
 			.put(billboard.red).put(billboard.green).put(billboard.blue).put(billboard.alpha);
 	}

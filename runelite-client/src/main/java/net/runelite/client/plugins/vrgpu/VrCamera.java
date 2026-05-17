@@ -64,12 +64,13 @@ final class VrCamera
 	}
 
 	float[] computeVrWorldProj(XrView view, Pose pose,
-		float worldAnchorY, float worldScale, float stageCharacterOffsetZ,
+		float worldAnchorY, float worldScale, float stageCharacterOffsetZ, float cameraYaw,
 		float anchorWorldX, float anchorWorldY, float anchorWorldZ)
 	{
 		// Stage-space eye projection first, then the shared OSRS-world anchor transform.
 		float[] proj = computeStageProjection(view, pose);
 		Mat4.mul(proj, Mat4.translate(0f, worldAnchorY, stageCharacterOffsetZ));
+		Mat4.mul(proj, Mat4.rotateY(cameraYaw));
 		Mat4.mul(proj, Mat4.scale(-worldScale, -worldScale, worldScale));
 		Mat4.mul(proj, Mat4.translate(-anchorWorldX, -anchorWorldY, -anchorWorldZ));
 		return proj;
@@ -137,11 +138,13 @@ final class VrCamera
 	}
 
 	Projection buildVrSorterProjection(XrView view, Pose pose,
-		float worldAnchorY, float worldScale, float stageCharacterOffsetZ,
+		float worldAnchorY, float worldScale, float stageCharacterOffsetZ, float cameraYaw,
 		float anchorWorldX, float anchorWorldY, float anchorWorldZ)
 	{
 		// Mirrors computeVrWorldProj for billboard sorting without allocating a full matrix per point.
 		XrFovf fov = view.fov();
+		final float yawSin = (float) Math.sin(cameraYaw);
+		final float yawCos = (float) Math.cos(cameraYaw);
 
 		float qx = pose.qx;
 		float qy = pose.qy;
@@ -185,9 +188,11 @@ final class VrCamera
 			@Override
 			public float[] project(float wx, float wy, float wz, float[] out)
 			{
-				float vx = -(wx - anchorWorldX) * worldScale;
+				float sx = -(wx - anchorWorldX) * worldScale;
 				float vy = -(wy - anchorWorldY) * worldScale + worldAnchorY;
-				float vz = (wz - anchorWorldZ) * worldScale + stageCharacterOffsetZ;
+				float sz = (wz - anchorWorldZ) * worldScale;
+				float vx = sx * yawCos + sz * yawSin;
+				float vz = sz * yawCos - sx * yawSin + stageCharacterOffsetZ;
 
 				float ex = r00 * vx + r01 * vy + r02 * vz + tx;
 				float ey = r10 * vx + r11 * vy + r12 * vz + ty;

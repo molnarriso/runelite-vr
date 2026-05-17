@@ -207,6 +207,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final float VR_ZOOM_OUT_MAX = 5.0f;
 	private static final float VR_ZOOM_SPEED_PER_SECOND = 3.0f;
 	private static final float VR_ZOOM_OUT_UP_SLOPE = 1.0f;
+	private static final float VR_CAMERA_ROTATE_SPEED_PER_SECOND = (float) Math.toRadians(90.0);
+	private static final float VR_CAMERA_ROTATE_DEAD_ZONE = 0.30f;
 	private static final int VR_DESKTOP_AIM_PITCH = 256; // ~45 degrees from horizon in JAU
 	// Capture mode only: HMD rendering stays on live OpenXR poses, while the spectator pass can smooth.
 	private static final boolean VR_SPECTATOR_MODE = true;
@@ -227,6 +229,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private float vrWorldAnchorY = Float.NaN;
 	private float vrZoomOut = VR_ZOOM_OUT_BASE;
+	private float vrCameraYaw;
 	private long vrLastZoomUpdateMs;
 
 	/** Which eye is currently being rendered: 0 = left, 1 = right, -1 = no VR. */
@@ -1669,6 +1672,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			xrContext = null;
 		}
 		vrWorldAnchorY = Float.NaN;
+		vrCameraYaw = 0f;
 		vrLastZoomUpdateMs = 0L;
 		vrCamera.reset();
 		vrSpectatorCamera.reset();
@@ -1743,7 +1747,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private float[] computeVrWorldProj(XrView view, VrCamera.Pose pose)
 	{
 		return vrCamera.computeVrWorldProj(view, pose,
-			getVrStageAnchorOffsetY(), getVrWorldScale(), getVrStageAnchorOffsetZ(),
+			getVrStageAnchorOffsetY(), getVrWorldScale(), getVrStageAnchorOffsetZ(), vrCameraYaw,
 			getVrAnchorWorldX(), getVrPlayerHeadWorldY(), getVrAnchorWorldZ());
 	}
 
@@ -1815,7 +1819,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			controllerTriangleFloatCount += VrControllerModel.put(debugRayFb, c.hand == VrController.Hand.LEFT,
 				c.posX, c.posY, c.posZ,
 				c.oriX, c.oriY, c.oriZ, c.oriW,
-				r, g, b, s, oy, oz, camX, camY, camZ);
+				r, g, b, s, oy, oz, vrCameraYaw, camX, camY, camZ);
 		}
 
 		float[] markerColor = vrHoverMarkerColor;
@@ -2006,9 +2010,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Controller state is sampled once, then all consumers read the same frame snapshot.
 		controllers.update();
-		updateVrZoomFromJoystick();
+		updateVrCameraControlsFromJoystick();
 		controllers.computeOsrsRays(
-			getVrWorldScale(), getVrStageAnchorOffsetY(), getVrStageAnchorOffsetZ(),
+			getVrWorldScale(), getVrStageAnchorOffsetY(), getVrStageAnchorOffsetZ(), vrCameraYaw,
 			getVrAnchorWorldX(), getVrPlayerHeadWorldY(), getVrAnchorWorldZ());
 
 		if (!controllers.left().active && !controllers.right().active)
@@ -2187,7 +2191,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
-	private void updateVrZoomFromJoystick()
+	private void updateVrCameraControlsFromJoystick()
 	{
 		long now = System.currentTimeMillis();
 		if (vrLastZoomUpdateMs == 0L)
@@ -2216,11 +2220,35 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 		else
 		{
-			return;
+			direction = 0f;
 		}
 
-		vrZoomOut = Math.max(VR_ZOOM_OUT_MIN, Math.min(VR_ZOOM_OUT_MAX,
-			vrZoomOut + direction * VR_ZOOM_SPEED_PER_SECOND * dt));
+		if (direction != 0f)
+		{
+			vrZoomOut = Math.max(VR_ZOOM_OUT_MIN, Math.min(VR_ZOOM_OUT_MAX,
+				vrZoomOut + direction * VR_ZOOM_SPEED_PER_SECOND * dt));
+		}
+
+		float rotate = Math.abs(controller.thumbstickX) > VR_CAMERA_ROTATE_DEAD_ZONE ? controller.thumbstickX : 0f;
+		if (rotate != 0f)
+		{
+			vrCameraYaw = normalizeRadians(vrCameraYaw + rotate * VR_CAMERA_ROTATE_SPEED_PER_SECOND * dt);
+		}
+	}
+
+	private static float normalizeRadians(float radians)
+	{
+		float twoPi = (float) (Math.PI * 2.0);
+		radians %= twoPi;
+		if (radians > Math.PI)
+		{
+			radians -= twoPi;
+		}
+		else if (radians < -Math.PI)
+		{
+			radians += twoPi;
+		}
+		return radians;
 	}
 
 	private float[] queueVrHoverRay(VrController controller)
@@ -2315,7 +2343,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private Projection buildVrSorterProjection(XrView view, VrCamera.Pose pose)
 	{
 		return vrCamera.buildVrSorterProjection(view, pose,
-			getVrStageAnchorOffsetY(), getVrWorldScale(), getVrStageAnchorOffsetZ(),
+			getVrStageAnchorOffsetY(), getVrWorldScale(), getVrStageAnchorOffsetZ(), vrCameraYaw,
 			getVrAnchorWorldX(), getVrPlayerHeadWorldY(), getVrAnchorWorldZ());
 	}
 
@@ -3637,6 +3665,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			getVrWorldScale(),
 			getVrStageAnchorOffsetY(),
 			getVrStageAnchorOffsetZ(),
+			vrCameraYaw,
 			getVrAnchorWorldX(),
 			getVrPlayerHeadWorldY(),
 			getVrAnchorWorldZ());
@@ -5792,9 +5821,13 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final float anchorWorldZ = getVrAnchorWorldZ();
 
 		// Anchor in stage coords (matches VrBillboardRenderer).
-		float anchorStageX = -(menu.anchorX - anchorWorldX) * s;
+		float localStageX = -(menu.anchorX - anchorWorldX) * s;
+		float localStageZ = (menu.anchorZ - anchorWorldZ) * s;
+		float yawSin = (float) Math.sin(vrCameraYaw);
+		float yawCos = (float) Math.cos(vrCameraYaw);
+		float anchorStageX = localStageX * yawCos + localStageZ * yawSin;
 		float anchorStageY = -(menu.anchorY - anchorWorldY) * s + getVrStageAnchorOffsetY();
-		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + getVrStageAnchorOffsetZ();
+		float anchorStageZ = localStageZ * yawCos - localStageX * yawSin + getVrStageAnchorOffsetZ();
 
 		// Compute eye→anchor right vector in xz plane (matches drawBillboard).
 		org.lwjgl.openxr.XrView.Buffer views = getXrViews();

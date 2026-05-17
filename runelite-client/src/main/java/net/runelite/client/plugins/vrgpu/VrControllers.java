@@ -43,11 +43,11 @@ final class VrControllers
 		right.update();
 	}
 
-	void computeOsrsRays(float worldScale, float stageOffsetY, float stageOffsetZ,
+	void computeOsrsRays(float worldScale, float stageOffsetY, float stageOffsetZ, float cameraYaw,
 		float anchorX, float anchorY, float anchorZ)
 	{
-		left.computeOsrsRay(worldScale, stageOffsetY, stageOffsetZ, anchorX, anchorY, anchorZ);
-		right.computeOsrsRay(worldScale, stageOffsetY, stageOffsetZ, anchorX, anchorY, anchorZ);
+		left.computeOsrsRay(worldScale, stageOffsetY, stageOffsetZ, cameraYaw, anchorX, anchorY, anchorZ);
+		right.computeOsrsRay(worldScale, stageOffsetY, stageOffsetZ, cameraYaw, anchorX, anchorY, anchorZ);
 	}
 
 	void latchEdges()

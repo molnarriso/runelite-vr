@@ -109,7 +109,7 @@ final class VrController
 		stickAction = resolveStickAction(stickAction, thumbstickX, thumbstickY);
 	}
 
-	void computeOsrsRay(float worldScale, float stageOffsetY, float stageOffsetZ,
+	void computeOsrsRay(float worldScale, float stageOffsetY, float stageOffsetZ, float cameraYaw,
 		float anchorWorldX, float anchorWorldY, float anchorWorldZ)
 	{
 		// Null means this hand cannot drive world/UI hit testing this frame.
@@ -119,14 +119,21 @@ final class VrController
 			return;
 		}
 
-		float ox = anchorWorldX - posX / worldScale;
+		float yawSin = (float) Math.sin(cameraYaw);
+		float yawCos = (float) Math.cos(cameraYaw);
+		float localPosX = posX * yawCos - (posZ - stageOffsetZ) * yawSin;
+		float localPosZ = posX * yawSin + (posZ - stageOffsetZ) * yawCos;
+		float localDirX = dirX * yawCos - dirZ * yawSin;
+		float localDirZ = dirX * yawSin + dirZ * yawCos;
+
+		float ox = anchorWorldX - localPosX / worldScale;
 		float oy = anchorWorldY - (posY - stageOffsetY) / worldScale;
-		float oz = anchorWorldZ + (posZ - stageOffsetZ) / worldScale;
+		float oz = anchorWorldZ + localPosZ / worldScale;
 
 		// Canonical scene-interaction ray: raw XR controller direction mapped into OSRS coords.
-		float rdx = -dirX;
+		float rdx = -localDirX;
 		float rdy = -dirY;
-		float rdz = dirZ;
+		float rdz = localDirZ;
 		float len = (float) Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
 		if (len <= 1e-6f)
 		{

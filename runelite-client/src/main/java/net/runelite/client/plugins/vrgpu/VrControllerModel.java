@@ -51,17 +51,22 @@ final class VrControllerModel
 		float worldScale,
 		float stageOffsetY,
 		float stageOffsetZ,
+		float cameraYaw,
 		float anchorWorldX,
 		float anchorWorldY,
 		float anchorWorldZ)
 	{
+		float yawSin = (float) Math.sin(cameraYaw);
+		float yawCos = (float) Math.cos(cameraYaw);
 		// Final sink converts OpenXR stage meters into OSRS world coordinates.
 		return putMesh(out, px, py, pz, qx, qy, qz, qw,
 			(x, y, z, red, green, blue) ->
 			{
-				float wx = anchorWorldX - x / worldScale;
+				float localX = x * yawCos - (z - stageOffsetZ) * yawSin;
+				float localZ = x * yawSin + (z - stageOffsetZ) * yawCos;
+				float wx = anchorWorldX - localX / worldScale;
 				float wy = anchorWorldY - (y - stageOffsetY) / worldScale;
-				float wz = anchorWorldZ + (z - stageOffsetZ) / worldScale;
+				float wz = anchorWorldZ + localZ / worldScale;
 				putRawVertex(out, wx, wy, wz, red, green, blue);
 			});
 	}
