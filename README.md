@@ -1,4 +1,6 @@
-[![RuneLite VR Tutorial Island Playthrough](https://img.youtube.com/vi/O1FB-BpxEIw/0.jpg)](https://www.youtube.com/watch?v=O1FB-BpxEIw)
+<a href="https://www.youtube.com/watch?v=O1FB-BpxEIw">
+  <img src="https://img.youtube.com/vi/O1FB-BpxEIw/0.jpg" alt="RuneLite VR Tutorial Island Playthrough" width="300">
+</a>
 
 [RuneLite VR Tutorial Island Playthrough](https://www.youtube.com/watch?v=O1FB-BpxEIw)
 
