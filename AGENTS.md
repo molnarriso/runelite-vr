@@ -25,7 +25,7 @@ We are building a RuneLite VR GPU plugin: OpenXR stereo rendering for the 3D wor
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrBillboardRenderer.java`: actor/context/menu billboard textures.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrInteraction.java`: controller interaction and click handling.
 - `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/VrSceneRaycaster.java`: VR ray picking against scene/world objects.
-- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/openxr/`: OpenXR context, swapchains, and input.
+- `runelite-client/src/main/java/net/runelite/client/plugins/vrgpu/openxr/`: OpenXR context, frame lifecycle, swapchains, and input. `OpenXrFrame` owns the active frame state, view location, eye FBO acquire/release, eye clears, and submit decisions so XR eye targets are frame infrastructure, not a side effect of scene rendering.
 
 ## VR Interaction Rules
 

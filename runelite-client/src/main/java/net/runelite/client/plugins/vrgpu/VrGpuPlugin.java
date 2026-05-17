@@ -130,8 +130,8 @@ import org.lwjgl.openxr.XrPosef;
 import org.lwjgl.openxr.XrView;
 import org.lwjgl.system.Callback;
 import org.lwjgl.system.Configuration;
+import net.runelite.client.plugins.vrgpu.openxr.OpenXrFrame;
 import net.runelite.client.plugins.vrgpu.openxr.XrContext;
-import net.runelite.client.plugins.vrgpu.openxr.XrEyeSwapchain;
 import net.runelite.client.plugins.vrgpu.openxr.XrInput;
 import org.lwjgl.BufferUtils;
 
@@ -187,14 +187,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	/** OpenXR context — null if no VR runtime is available. */
 	private XrContext xrContext;
-	/** Per-eye swapchains — null if xrContext is null. Index 0 = left, 1 = right. */
-	private XrEyeSwapchain[] eyeSwapchains;
 	/** Controller input — null if xrContext is null. */
 	private XrInput xrInput;
+	/** Owns XR frame begin/acquire/release/submit; null if xrContext is null. */
+	private OpenXrFrame openXrFrame;
 	/** Controller snapshots and primary/menu ownership — null if xrContext is null. */
 	private VrControllers controllers;
-	/** True between a successful beginXrFrame() and the matching endXrFrame() call. */
-	private boolean xrFrameStarted;
 
 	// --- Stereo rendering state (T3.x) ---
 
@@ -223,11 +221,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	/** Which eye is currently being rendered: 0 = left, 1 = right, -1 = no VR. */
 	private int currentEye = -1;
 
-	/** FBO handle acquired for the left eye this frame (valid until releaseImage). */
-	private int vrLeftEyeFbo = -1;
-	/** FBO handle acquired for the right eye this frame (valid until releaseImage). */
-	private int vrRightEyeFbo = -1;
-
 	/** Opaque zone coords [zx, zz] recorded during the left-eye pass. */
 	private final List<int[]> vrOpaqueZones = new ArrayList<>(256);
 	/** Entity projections parallel to {@link #vrOpaqueZones}. */
@@ -240,9 +233,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	/** Toplevel scene saved during preSceneDrawToplevel, used in the right-eye replay. */
 	private Scene vrScene;
-
-	/** Eye views located this frame; comes from xrContext.locateViews(). */
-	private XrView.Buffer vrViews;
 
 	/**
 	 * Projection built from the left VR eye pose each frame, used by the face-priority sorter
@@ -817,17 +807,8 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 					xrInput.init(xrContext.getInstance(), xrContext.getSession());
 					controllers = new VrControllers(xrInput);
 
-					eyeSwapchains = new XrEyeSwapchain[2];
-					for (int eye = 0; eye < 2; eye++)
-					{
-						eyeSwapchains[eye] = new XrEyeSwapchain();
-						eyeSwapchains[eye].init(
-							xrContext.getInstance(),
-							xrContext.getSession(),
-							xrContext.getEyeWidth()[eye],
-							xrContext.getEyeHeight()[eye],
-							GL_RGBA8);
-					}
+					openXrFrame = new OpenXrFrame(xrContext, xrInput);
+					openXrFrame.initEyeSwapchains(GL_RGBA8);
 					log.info("OpenXR initialised — VR rendering enabled");
 				}
 				catch (Exception e)
@@ -1557,23 +1538,17 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private void destroyXr()
 	{
+		if (openXrFrame != null)
+		{
+			openXrFrame.destroy();
+			openXrFrame = null;
+		}
 		if (xrInput != null)
 		{
 			xrInput.destroy();
 			xrInput = null;
 		}
 		controllers = null;
-		if (eyeSwapchains != null)
-		{
-			for (XrEyeSwapchain sc : eyeSwapchains)
-			{
-				if (sc != null)
-				{
-					sc.destroy();
-				}
-			}
-			eyeSwapchains = null;
-		}
 		if (xrContext != null)
 		{
 			xrContext.destroy();
@@ -1597,6 +1572,25 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return VR_STAGE_CHARACTER_OFFSET_Z * ((VR_ZOOM_MAX - vrZoom) / (VR_ZOOM_MAX - VR_ZOOM_BASE));
 	}
 
+	private XrView.Buffer getXrViews()
+	{
+		return openXrFrame != null ? openXrFrame.views() : null;
+	}
+
+	private void ensureVrWorldAnchorY()
+	{
+		XrView.Buffer views = getXrViews();
+		if (!Float.isNaN(vrWorldAnchorY) || views == null)
+		{
+			return;
+		}
+
+		float initialEyeY = views.get(0).pose().position$().y();
+		vrWorldAnchorY = initialEyeY + VR_STAGE_CHARACTER_OFFSET_Y;
+		log.info("VR world anchor Y set to {} (eyeY={} {}m)",
+			vrWorldAnchorY, initialEyeY, String.format("%+.1f", VR_STAGE_CHARACTER_OFFSET_Y));
+	}
+
 	/**
 	 * Compute the worldProj matrix for the given eye from the located XrView.
 	 * <p>
@@ -1609,7 +1603,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private float[] computeVrWorldProj(int eye)
 	{
-		XrView view = vrViews.get(eye);
+		XrView view = getXrViews().get(eye);
 
 		// Character anchor: the local player is kept at a fixed room-space location.
 		// vrWorldAnchorY is sampled from the initial eye height on the first VR frame.
@@ -2247,7 +2241,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	 */
 	private Projection buildVrSorterProjection(int eye)
 	{
-		XrView view = vrViews.get(eye);
+		XrView view = getXrViews().get(eye);
 		XrPosef pose = view.pose();
 		XrFovf fov = view.fov();
 
@@ -2444,15 +2438,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		final int viewportHeight = client.getViewportHeight();
 		final int viewportWidth = client.getViewportWidth();
 
-		if (xrFrameStarted)
+		if (openXrFrame != null && openXrFrame.isRendering())
 		{
 			// VR path — left eye setup (T3.1)
-			vrViews = xrContext.locateViews();
-			if (xrInput != null)
-			{
-				xrInput.sync(xrContext.getSession(), xrContext.getStageSpace(),
-					xrContext.getPendingDisplayTime());
-			}
 			currentEye = 0;
 			vrOpaqueZones.clear();
 			vrOpaqueProjs.clear();
@@ -2462,18 +2450,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			primaryReplay.resetCounts();
 			desktopReplay.resetCounts();
 
-			// Sample world anchor Y from initial eye height (once per session).
-			if (Float.isNaN(vrWorldAnchorY))
-			{
-				float initialEyeY = vrViews.get(0).pose().position$().y();
-				vrWorldAnchorY = initialEyeY + VR_STAGE_CHARACTER_OFFSET_Y;
-				log.info("VR world anchor Y set to {} (eyeY={} {}m)", vrWorldAnchorY, initialEyeY, String.format("%+.1f", VR_STAGE_CHARACTER_OFFSET_Y));
-			}
+			ensureVrWorldAnchorY();
 
 			// Build sorter projection after vrWorldAnchorY is guaranteed non-NaN.
 			vrSorterProjection = buildVrSorterProjection(0);
 
-			vrLeftEyeFbo = eyeSwapchains[0].acquireImage();
 		}
 		else
 		{
@@ -2504,7 +2485,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		// VR clip_w is in metres; desktop clip_w is in OSRS units (~1/worldScale larger).
 		// Scaling the bias by worldScale in VR keeps the NDC depth offset identical
 		// to desktop mode, preventing decal faces from clipping through walls and NPCs.
-		glUniform1f(uniBiasScale, xrFrameStarted ? getVrWorldScale() : 1.0f);
+		glUniform1f(uniBiasScale, openXrFrame != null && openXrFrame.isRendering() ? getVrWorldScale() : 1.0f);
 
 		// Brightness happens to also be stored in the texture provider, so we use that
 		TextureProvider textureProvider = client.getTextureProvider();
@@ -2519,7 +2500,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		// Calculate projection matrix
 		final float[] projectionMatrix;
-		if (xrFrameStarted)
+		if (openXrFrame != null && openXrFrame.isRendering())
 		{
 			// VR: per-eye perspective from HMD pose + world anchor (T3.2)
 			projectionMatrix = computeVrWorldProj(0);
@@ -2533,7 +2514,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			Mat4.mul(projectionMatrix, Mat4.translate(-cameraX, -cameraY, -cameraZ));
 		}
 		ScenePassViewport scenePassViewport = getMainSceneViewport(canvasWidth, canvasHeight, viewportWidth, viewportHeight);
-		int drawFramebuffer = xrFrameStarted ? vrLeftEyeFbo : fboScene;
+		int drawFramebuffer = openXrFrame != null && openXrFrame.isRendering() ? openXrFrame.fbo(0) : fboScene;
 		setupScenePass(drawFramebuffer, scenePassViewport.x, scenePassViewport.y, scenePassViewport.width, scenePassViewport.height,
 			scenePassViewport.dpiAware, projectionMatrix, sky, GL_BACK);
 
@@ -2563,7 +2544,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		glDisable(GL_CULL_FACE);
 		glDisable(GL_DEPTH_TEST);
 
-		if (xrFrameStarted)
+		if (openXrFrame != null && openXrFrame.isRendering())
 		{
 			// Render a true desktop spectator pass from the vanilla/staged desktop camera
 			// instead of mirroring the left eye. This lets us validate staged WALK clicks
@@ -2571,10 +2552,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			renderDesktopSpectatorPass();
 
 			// ---- Right eye pass (T3.3) ----
-			int rightFbo = eyeSwapchains[1].acquireImage();
 			int sky = client.getSkyboxColor();
 			glUseProgram(glProgram);
-			setupScenePass(rightFbo, 0, 0, eyeSwapchains[1].getWidth(), eyeSwapchains[1].getHeight(),
+			setupScenePass(openXrFrame.fbo(1), 0, 0, openXrFrame.width(1), openXrFrame.height(1),
 				false, computeVrWorldProj(1), sky, GL_BACK);
 
 			// Replay left-eye-captured scene content into the right-eye target.
@@ -2588,7 +2568,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 			// Sample controller ray hits and process input before the late UI pass draws over the scene.
 			updateControllerRayInput();
-			vrRightEyeFbo = rightFbo;
 			currentEye = -1;
 
 			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, awtContext.getFramebuffer(false));
@@ -2665,9 +2644,9 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private ScenePassViewport getMainSceneViewport(int canvasWidth, int canvasHeight, int viewportWidth, int viewportHeight)
 	{
-		if (xrFrameStarted)
+		if (openXrFrame != null && openXrFrame.isRendering())
 		{
-			return new ScenePassViewport(0, 0, eyeSwapchains[0].getWidth(), eyeSwapchains[0].getHeight(), false);
+			return new ScenePassViewport(0, 0, openXrFrame.width(0), openXrFrame.height(0), false);
 		}
 
 		int renderWidthOff = client.getViewportXOffset();
@@ -2928,6 +2907,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			return;
 		}
+		boolean xrFrameRendering = openXrFrame != null && openXrFrame.isRendering();
 
 		updateEntityProjection(projection);
 
@@ -2939,10 +2919,10 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			if (scene.getWorldViewId() == WorldView.TOPLEVEL)
 			{
 				glUniform3i(uniBase, 0, 0, 0);
-				drawImmediateOpaque(primaryReplay, xrFrameStarted);
-				drawImmediateSortedOpaque(primaryReplay, xrFrameStarted);
+				drawImmediateOpaque(primaryReplay, xrFrameRendering);
+				drawImmediateSortedOpaque(primaryReplay, xrFrameRendering);
 
-				if (xrFrameStarted)
+				if (xrFrameRendering)
 				{
 					desktopReplay.opaqueCount = desktopReplay.opaque.unmap();
 					desktopReplay.sortedOpaqueCount = desktopReplay.sortedOpaque.unmap();
@@ -2953,7 +2933,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			// In VR left-eye pass, defer removeTemp() so the right eye can still draw temp alpha models.
 			// For sub-scenes (non-TOPLEVEL) there is no right-eye replay, so clean up immediately.
-			if (xrFrameStarted && scene.getWorldViewId() == WorldView.TOPLEVEL)
+			if (xrFrameRendering && scene.getWorldViewId() == WorldView.TOPLEVEL)
 			{
 				return;
 			}
@@ -2983,13 +2963,14 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			return;
 		}
+		boolean xrFrameRendering = openXrFrame != null && openXrFrame.isRendering();
 
 		int size = m.getFaceCount() * 3 * VAO.VERT_SIZE;
 		if (m.getFaceTransparencies() == null)
 		{
 			VAO o = primaryReplay.opaque.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
-			if (xrFrameStarted)
+			if (xrFrameRendering)
 			{
 				VAO desktopO = desktopReplay.opaque.get(size);
 				clientUploader.uploadTempModel(m, orient, x, y, z, desktopO.vbo.vb);
@@ -2999,11 +2980,11 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			m.calculateBoundsCylinder();
 			VAO o = primaryReplay.opaque.get(size), a = vaoA.get(size);
-			VAO desktopO = xrFrameStarted ? desktopReplay.opaque.get(size) : null;
-			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
+			VAO desktopO = xrFrameRendering ? desktopReplay.opaque.get(size) : null;
+			VAO desktopA = xrFrameRendering ? vaoDesktopA.get(size) : null;
 			SortedUploadTarget primaryTarget = createSortedUploadTarget(worldProjection, o, a, "error drawing entity");
 			SortedUploadTarget desktopTarget = createSortedUploadTarget(
-				xrFrameStarted ? buildDesktopSorterProjection() : null,
+				xrFrameRendering ? buildDesktopSorterProjection() : null,
 				desktopO,
 				desktopA,
 				"error drawing desktop spectator dynamic entity");
@@ -3021,7 +3002,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				// tileObject.getPlane()>maxLevel if visbelow is set - lower the object to the max level
 				int plane = Math.min(ctx.maxLevel, tileObject.getPlane());
 				// renderable modelheight is typically not set here because DynamicObject doesn't compute it on the returned model
-				zone.addTempAlphaModel(a.vao, primaryTarget.alphaStart, primaryTarget.alphaEnd, plane, x & 1023, y, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
+				zone.addTempAlphaModel(a.vao, primaryTarget.alphaStart, primaryTarget.alphaEnd, plane, x & 1023, y, z & 1023, xrFrameRendering ? Zone.AlphaModel.VR_ONLY : 0);
 				if (desktopTarget != null && desktopTarget.hasAlphaFaces())
 				{
 					zone.addTempAlphaModel(desktopA.vao, desktopTarget.alphaStart, desktopTarget.alphaEnd, plane, x & 1023, y, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
@@ -3043,6 +3024,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			return;
 		}
+		boolean xrFrameRendering = openXrFrame != null && openXrFrame.isRendering();
 
 		Renderable renderable = gameObject.getRenderable();
 		int size = m.getFaceCount() * 3 * VAO.VERT_SIZE;
@@ -3053,23 +3035,23 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			// because they are not depth tested. transparent player faces don't need their own vao because normal
 			// transparent faces are already not depth tested
 			VAO o = renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH ? primaryReplay.sortedOpaque.get(size) : primaryReplay.opaque.get(size);
-			VAO desktopPlayerVao = xrFrameStarted && renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH
+			VAO desktopPlayerVao = xrFrameRendering && renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH
 				? desktopReplay.sortedOpaque.get(size)
 				: null;
 			VAO a = vaoA.get(size);
-			VAO desktopA = xrFrameStarted ? vaoDesktopA.get(size) : null;
-			VAO desktopO = xrFrameStarted && renderMode != Renderable.RENDERMODE_SORTED_NO_DEPTH
+			VAO desktopA = xrFrameRendering ? vaoDesktopA.get(size) : null;
+			VAO desktopO = xrFrameRendering && renderMode != Renderable.RENDERMODE_SORTED_NO_DEPTH
 				? desktopReplay.opaque.get(size)
 				: null;
 
 			m.calculateBoundsCylinder();
 			// In VR mode use the VR eye's projection for face sorting/culling instead of the
 			// OSRS 2D camera projection, which only shows faces visible from one fixed direction.
-			Projection sortProj = xrFrameStarted ? vrSorterProjection : worldProjection;
+			Projection sortProj = xrFrameRendering ? vrSorterProjection : worldProjection;
 			VAO desktopOpaqueVao = desktopPlayerVao != null ? desktopPlayerVao : desktopO;
 			SortedUploadTarget primaryTarget = createSortedUploadTarget(sortProj, o, a, "error drawing entity");
 			SortedUploadTarget desktopTarget = createSortedUploadTarget(
-				xrFrameStarted ? buildDesktopSorterProjection() : null,
+				xrFrameRendering ? buildDesktopSorterProjection() : null,
 				desktopOpaqueVao,
 				desktopA,
 				"error drawing desktop spectator entity");
@@ -3083,7 +3065,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				int zz = (gameObject.getY() >> 10) + offset;
 				Zone zone = ctx.zones[zx][zz];
 				int plane = Math.min(ctx.maxLevel, gameObject.getPlane());
-				zone.addTempAlphaModel(a.vao, primaryTarget.alphaStart, primaryTarget.alphaEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, xrFrameStarted ? Zone.AlphaModel.VR_ONLY : 0);
+				zone.addTempAlphaModel(a.vao, primaryTarget.alphaStart, primaryTarget.alphaEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, xrFrameRendering ? Zone.AlphaModel.VR_ONLY : 0);
 				if (desktopTarget != null && desktopTarget.hasAlphaFaces())
 				{
 					zone.addTempAlphaModel(desktopA.vao, desktopTarget.alphaStart, desktopTarget.alphaEnd, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, Zone.AlphaModel.DESKTOP_ONLY);
@@ -3094,7 +3076,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		{
 			VAO o = primaryReplay.opaque.get(size);
 			clientUploader.uploadTempModel(m, orient, x, y, z, o.vbo.vb);
-			if (xrFrameStarted)
+			if (xrFrameRendering)
 			{
 				VAO desktopO = desktopReplay.opaque.get(size);
 				clientUploader.uploadTempModel(m, orient, x, y, z, desktopO.vbo.vb);
@@ -3467,18 +3449,15 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		// --- OpenXR event polling (frame begin moved to end of draw) ---
 		if (xrContext != null)
 		{
 			if (!xrContext.pollEvents())
 			{
 				// Runtime signalled EXITING or LOSS_PENDING — stop the plugin.
 				// End any in-flight frame before stopping.
-				if (xrFrameStarted)
+				if (openXrFrame != null && openXrFrame.hasFrame())
 				{
-					releaseXrEyeImagesIfAcquired();
-					xrContext.endXrFrame();
-					xrFrameStarted = false;
+					openXrFrame.submitEmpty();
 				}
 				SwingUtilities.invokeLater(() ->
 				{
@@ -3519,6 +3498,12 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		prepareVrContextHintOverlay();
 		prepareVrActorOverlayBillboards();
 		prepareInterfaceTexture(canvasWidth, canvasHeight, false);
+		if (openXrFrame != null && openXrFrame.isRendering() && !sceneFboValid)
+		{
+			openXrFrame.clearEyes();
+			ensureVrWorldAnchorY();
+			updateControllerRayInput();
+		}
 		drawVrUi(overlayColor, canvasWidth, canvasHeight);
 		prepareInterfaceTexture(canvasWidth, canvasHeight, true);
 
@@ -3567,32 +3552,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
 
-		// Submit the XR frame with stereo projection layers when the scene was rendered,
-		// or with empty layers on the login/loading screen.
-		if (xrFrameStarted)
+		if (openXrFrame != null && openXrFrame.hasFrame())
 		{
-			if (sceneFboValid && xrContext.getViews() != null)
-			{
-				releaseXrEyeImagesIfAcquired();
-				xrContext.endXrFrameStereo(
-					xrContext.getViews(),
-					eyeSwapchains[0].getSwapchain(),
-					eyeSwapchains[1].getSwapchain());
-			}
-			else
-			{
-				releaseXrEyeImagesIfAcquired();
-				xrContext.endXrFrame();
-			}
-			xrFrameStarted = false;
+			openXrFrame.submit();
 		}
 
-		// Begin the NEXT frame now so xrFrameStarted=true when preSceneDraw fires.
+		// Begin the NEXT frame now so scene callbacks can render into acquired eye targets.
 		// xrWaitFrame inside beginXrFrame will pace us to the display rate.
-		if (xrContext != null && xrContext.isSessionRunning())
+		if (openXrFrame != null && xrContext != null && xrContext.isSessionRunning())
 		{
-			xrContext.beginXrFrame();
-			xrFrameStarted = true;
+			openXrFrame.begin();
 		}
 
 		checkGLErrors();
@@ -3600,8 +3569,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private void drawVrUi(int overlayColor, int canvasWidth, int canvasHeight)
 	{
-		if (!xrFrameStarted || !sceneFboValid || xrContext == null || xrContext.getViews() == null
-			|| eyeSwapchains == null || vrLeftEyeFbo == -1 || vrRightEyeFbo == -1)
+		if (openXrFrame == null || !openXrFrame.isRendering() || getXrViews() == null)
 		{
 			return;
 		}
@@ -3613,43 +3581,43 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			vrUiPointerLmbDown,
 			vrUiPointerRmbDown);
 		vrUi.renderCanvasPanel(
-			vrLeftEyeFbo,
-			eyeSwapchains[0].getWidth(),
-			eyeSwapchains[0].getHeight(),
-			xrContext.getViews(),
+			openXrFrame.fbo(0),
+			openXrFrame.width(0),
+			openXrFrame.height(0),
+			getXrViews(),
 			0,
 			interfaceTexture,
 			canvasWidth,
 			canvasHeight,
 			overlayColor);
 		vrUi.renderCanvasPanel(
-			vrRightEyeFbo,
-			eyeSwapchains[1].getWidth(),
-			eyeSwapchains[1].getHeight(),
-			xrContext.getViews(),
+			openXrFrame.fbo(1),
+			openXrFrame.width(1),
+			openXrFrame.height(1),
+			getXrViews(),
 			1,
 			interfaceTexture,
 			canvasWidth,
 			canvasHeight,
 			overlayColor);
 
-		drawVrActorOverlays(0, vrLeftEyeFbo);
-		drawVrActorOverlays(1, vrRightEyeFbo);
-		drawVrControllerRays(0, vrLeftEyeFbo);
-		drawVrControllerRays(1, vrRightEyeFbo);
+		drawVrActorOverlays(0, openXrFrame.fbo(0));
+		drawVrActorOverlays(1, openXrFrame.fbo(1));
+		drawVrControllerRays(0, openXrFrame.fbo(0));
+		drawVrControllerRays(1, openXrFrame.fbo(1));
 
 		glBindFramebuffer(GL_FRAMEBUFFER, awtContext.getFramebuffer(false));
 	}
 
 	private void drawVrControllerRays(int eye, int framebuffer)
 	{
-		if (!xrFrameStarted || xrContext == null || eyeSwapchains == null || framebuffer == -1)
+		if (openXrFrame == null || !openXrFrame.isRendering() || framebuffer == -1)
 		{
 			return;
 		}
 
 		glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-		glViewport(0, 0, eyeSwapchains[eye].getWidth(), eyeSwapchains[eye].getHeight());
+		glViewport(0, 0, openXrFrame.width(eye), openXrFrame.height(eye));
 		glDisable(GL_BLEND);
 		glDisable(GL_CULL_FACE);
 		glDisable(GL_DEPTH_TEST);
@@ -3659,22 +3627,22 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 	private void drawVrActorOverlays(int eye, int framebuffer)
 	{
-		if (!xrFrameStarted || xrContext == null || xrContext.getViews() == null || eyeSwapchains == null
+		if (openXrFrame == null || !openXrFrame.isRendering() || getXrViews() == null
 			|| framebuffer == -1 || Float.isNaN(vrWorldAnchorY))
 		{
 			return;
 		}
 
-		XrView leftView = xrContext.getViews().get(0);
-		XrView rightView = xrContext.getViews().get(1);
+		XrView leftView = getXrViews().get(0);
+		XrView rightView = getXrViews().get(1);
 		float centerEyeX = (leftView.pose().position$().x() + rightView.pose().position$().x()) * 0.5f;
 		float centerEyeY = (leftView.pose().position$().y() + rightView.pose().position$().y()) * 0.5f;
 		float centerEyeZ = (leftView.pose().position$().z() + rightView.pose().position$().z()) * 0.5f;
 
 		vrBillboards.render(
 			framebuffer,
-			eyeSwapchains[eye].getWidth(),
-			eyeSwapchains[eye].getHeight(),
+			openXrFrame.width(eye),
+			openXrFrame.height(eye),
 			computeVrWorldProj(eye),
 			centerEyeX,
 			centerEyeY,
@@ -3696,7 +3664,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 
 		Actor actor = (Actor) renderable;
 		finishPendingVrActorUiCapture();
-		if (!xrFrameStarted || xrContext == null)
+		if (openXrFrame == null || !openXrFrame.isRendering())
 		{
 			return true;
 		}
@@ -4667,26 +4635,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float tileHeight = Perspective.getTileHeight(client, lp, plane);
 		float y = tileHeight - actor.getLogicalHeight() - actor.getAnimationHeightOffset();
 		return new float[]{lp.getX(), y, lp.getY()};
-	}
-
-	private void releaseXrEyeImagesIfAcquired()
-	{
-		if (eyeSwapchains == null)
-		{
-			vrLeftEyeFbo = -1;
-			vrRightEyeFbo = -1;
-			return;
-		}
-		if (vrRightEyeFbo != -1)
-		{
-			eyeSwapchains[1].releaseImage();
-			vrRightEyeFbo = -1;
-		}
-		if (vrLeftEyeFbo != -1)
-		{
-			eyeSwapchains[0].releaseImage();
-			vrLeftEyeFbo = -1;
-		}
 	}
 
 	private void drawUi(final int overlayColor, final int canvasHeight, final int canvasWidth)
@@ -5786,7 +5734,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		float anchorStageZ = (menu.anchorZ - anchorWorldZ) * s + getVrStageCharacterOffsetZ();
 
 		// Compute eye→anchor right vector in xz plane (matches drawBillboard).
-		org.lwjgl.openxr.XrView.Buffer views = xrContext != null ? xrContext.getViews() : null;
+		org.lwjgl.openxr.XrView.Buffer views = getXrViews();
 		float eyeX;
 		float eyeY;
 		float eyeZ;
