@@ -329,7 +329,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 	private static final int VR_ACTOR_UI_CAPTURE_ABOVE_ANCHOR = 156;
 	private static final int VR_ACTOR_UI_CAPTURE_BELOW_ANCHOR = 36;
 	private static final int VR_ACTOR_UI_CAPTURE_HEIGHT = VR_ACTOR_UI_CAPTURE_ABOVE_ANCHOR + VR_ACTOR_UI_CAPTURE_BELOW_ANCHOR;
-	private static final int VR_ACTOR_UI_CAPTURE_KEY_COLOR = 0xffff00ff;
 	private static final float VR_ACTOR_UI_METERS_PER_PIXEL = 0.0022f;
 	private static final int VR_ACTOR_UI_ACCEPT_MAX_WIDTH = 72;
 	private static final int VR_ACTOR_UI_ACCEPT_MAX_HEIGHT = 48;
@@ -3753,7 +3752,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		BufferProvider bufferProvider = client.getBufferProvider();
 		int[] original = copyVrActorUiCrop(bufferProvider, crop);
 		writeVrUiCaptureDebugImage("actor-" + actor.getName() + "-before", original, crop.width, crop.height);
-		fillVrActorUiCrop(bufferProvider, crop, VR_ACTOR_UI_CAPTURE_KEY_COLOR);
 		vrPendingActorUiCapture = new VrPendingActorUiCapture(actor, crop, original, canvasAnchor.getX(), canvasAnchor.getY(), anchor);
 		logVrActorUiCapture("armed", actor, canvasAnchor, crop, anchor);
 		return true;
@@ -4017,7 +4015,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		BufferProvider bufferProvider = client.getBufferProvider();
 		int[] captured = copyVrActorUiCrop(bufferProvider, pending.crop);
 		writeVrUiCaptureDebugImage("actor-" + pending.actor.getName() + "-after", captured, pending.crop.width, pending.crop.height);
-		Rectangle bounds = findVrActorUiCapturedBounds(captured, pending.crop.width, pending.crop.height);
+		Rectangle bounds = findVrActorUiCapturedBounds(pending.originalPixels, captured, pending.crop.width, pending.crop.height);
 		if (bounds != null)
 		{
 			String rejectReason = getVrActorUiCaptureRejectReason(pending, bounds);
@@ -4040,7 +4038,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 						pending.crop,
 						new float[]{pending.anchorX, pending.anchorY, pending.anchorZ});
 				}
-				int[] argb = copyVrActorUiCapturedSubRect(captured, pending.crop.width, bounds);
+				int[] argb = copyVrActorUiCapturedSubRect(pending.originalPixels, captured, pending.crop.width, bounds);
 				writeVrUiCaptureDebugImage("actor-" + pending.actor.getName() + "-diff", argb, bounds.width, bounds.height);
 				float offsetXM = (pending.crop.x + bounds.x + bounds.width * 0.5f - pending.canvasX)
 					* VR_ACTOR_UI_METERS_PER_PIXEL;
@@ -4061,7 +4059,6 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 				}
 			}
 		}
-		restoreVrActorUiCrop(bufferProvider, pending.crop, pending.originalPixels);
 	}
 
 	private String getVrActorUiCaptureRejectReason(VrPendingActorUiCapture pending, Rectangle bounds)
@@ -4644,28 +4641,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
-	private void fillVrActorUiCrop(BufferProvider bufferProvider, Rectangle crop, int color)
-	{
-		int[] pixels = bufferProvider.getPixels();
-		int width = bufferProvider.getWidth();
-		for (int row = 0; row < crop.height; row++)
-		{
-			int offset = (crop.y + row) * width + crop.x;
-			Arrays.fill(pixels, offset, offset + crop.width, color);
-		}
-	}
-
-	private void restoreVrActorUiCrop(BufferProvider bufferProvider, Rectangle crop, int[] original)
-	{
-		int[] pixels = bufferProvider.getPixels();
-		int width = bufferProvider.getWidth();
-		for (int row = 0; row < crop.height; row++)
-		{
-			System.arraycopy(original, row * crop.width, pixels, (crop.y + row) * width + crop.x, crop.width);
-		}
-	}
-
-	private Rectangle findVrActorUiCapturedBounds(int[] captured, int width, int height)
+	private Rectangle findVrActorUiCapturedBounds(int[] original, int[] captured, int width, int height)
 	{
 		int minX = width;
 		int minY = height;
@@ -4676,7 +4652,7 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 			int row = y * width;
 			for (int x = 0; x < width; x++)
 			{
-				if (captured[row + x] == VR_ACTOR_UI_CAPTURE_KEY_COLOR)
+				if (captured[row + x] == original[row + x])
 				{
 					continue;
 				}
@@ -4706,15 +4682,16 @@ public class VrGpuPlugin extends Plugin implements DrawCallbacks
 		return new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
 	}
 
-	private int[] copyVrActorUiCapturedSubRect(int[] captured, int sourceWidth, Rectangle bounds)
+	private int[] copyVrActorUiCapturedSubRect(int[] original, int[] captured, int sourceWidth, Rectangle bounds)
 	{
 		int[] out = new int[bounds.width * bounds.height];
 		for (int row = 0; row < bounds.height; row++)
 		{
 			for (int x = 0; x < bounds.width; x++)
 			{
-				int pixel = captured[(bounds.y + row) * sourceWidth + bounds.x + x];
-				out[row * bounds.width + x] = pixel == VR_ACTOR_UI_CAPTURE_KEY_COLOR ? 0 : pixel;
+				int sourceIndex = (bounds.y + row) * sourceWidth + bounds.x + x;
+				int pixel = captured[sourceIndex];
+				out[row * bounds.width + x] = pixel == original[sourceIndex] ? 0 : pixel;
 			}
 		}
 		return out;
