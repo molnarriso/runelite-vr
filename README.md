@@ -1,25 +1,50 @@
-![](https://runelite.net/img/logo.png)
-# runelite [![CI](https://github.com/runelite/runelite/workflows/CI/badge.svg)](https://github.com/runelite/runelite/actions?query=workflow%3ACI+branch%3Amaster) [![Discord](https://img.shields.io/discord/301497432909414422.svg)](https://discord.gg/ArdAhnN)
+[![RuneLite VR Tutorial Island Playthrough](https://img.youtube.com/vi/O1FB-BpxEIw/0.jpg)](https://www.youtube.com/watch?v=O1FB-BpxEIw)
 
-RuneLite is a free, open source OldSchool RuneScape client.
+[RuneLite VR Tutorial Island Playthrough](https://www.youtube.com/watch?v=O1FB-BpxEIw)
 
-If you have any questions, please join our IRC channel on [irc.rizon.net #runelite](http://qchat.rizon.net/?channels=runelite&uio=d4) or alternatively our [Discord](https://runelite.net/discord) server.
+# RuneLite VR
 
-## Project Layout
+This is a VR mod of RuneLite.
 
-- [cache](cache/src/main/java/net/runelite/cache) - Libraries used for reading/writing cache files, as well as the data in it
-- [runelite-api](runelite-api/src/main/java/net/runelite/api) - RuneLite API, interfaces for accessing the client
-- [runelite-client](runelite-client/src/main/java/net/runelite/client) - Game client with plugins
+This project is a fork of [RuneLite](https://github.com/runelite/runelite), licensed under BSD 2 Clause. See the original repo for the underlying client.
 
-## Usage
+It uses OpenXR for VR rendering.
 
-Open the project in your IDE as a Gradle project, and then run the RuneLite class in runelite-client.  
-For more information visit the [RuneLite Wiki](https://github.com/runelite/runelite/wiki).
+It is very crude right now. Currently in MVP phase. The goal is to get OpenXR stereo world rendering working, present the normal RuneLite UI in VR, and gather feedback from people who are willing to try an early build.
 
-### License
+Feedback is very welcome, especially around comfort, controls, UI placement, readability, and what feels broken in real play.
 
-RuneLite is licensed under the BSD 2-clause license. See the license header in the respective file to be sure.
+For mod discussion, join the Discord: [https://discord.gg/mguXmu6FKw](https://discord.gg/mguXmu6FKw)
 
-## Contribute and Develop
+> [!WARNING]
+> Do not do anything risky with this build. Do not go to the Wilderness. Do not boss. Do not do dangerous activities. Do not bring items you care about.
+>
+> This is very clunky and still experimental. Input, menus, camera comfort, UI interaction, and rendering can all be awkward or unreliable.
 
-Please view our [Developer Guide](https://github.com/runelite/runelite/wiki/Developer-Guide) on the RuneLite Wiki.
+
+## Running The VR Mod
+
+Open the project in your IDE as a Gradle project.
+
+Run configuration used for development:
+
+* Java: 25
+* Module classpath: runelite.client.main
+* Main class: net.runelite.client.RuneLite
+* Working directory: project root
+
+For CLI users, run:
+
+```powershell
+./gradlew :client:compileJava
+./gradlew :client:shadowJar
+java -jar runelite-client/build/libs/client-1.12.27-SNAPSHOT-shaded.jar
+```
+
+Enable the VR GPU plugin in the RuneLite plugin list.
+
+**Make sure your headset is connected during app startup.** Start your OpenXR runtime before launching the client.
+
+This has been tested with Oculus Quest + Virtual Desktop.
+
+This project is a fork of RuneLite, licensed under BSD 2-Clause. See the [original repo](https://github.com/runelite/runelite/) for the underlying client.
