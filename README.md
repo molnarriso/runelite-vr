@@ -21,6 +21,7 @@ For mod discussion, join the Discord: [https://discord.gg/mguXmu6FKw](https://di
 > [!WARNING]
 > Do not do anything risky with this build. Do not go to the Wilderness. Do not boss. Do not do dangerous activities. Do not bring items you care about.
 >
+> Compliance with OSRS ToS is unclear and you might get banned. Don't use this on your main until this gets cleared with Jagex. 
 > This is very clunky and still experimental. Input, menus, camera comfort, UI interaction, and rendering can all be awkward or unreliable.
 
 
