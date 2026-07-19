@@ -2,13 +2,13 @@ plugins {
     java
 }
 
-// The released client to compile against. Must match the client jar that will
-// actually load the plugin -- see README.md.
-val runeliteVersion = providers.gradleProperty("runeliteVersion").getOrElse("1.12.33")
+// Defaults for these live in gradle.properties; override with -P to build against
+// a different client. See README.md.
+val runeliteVersion = providers.gradleProperty("runeliteVersion").get()
+val lwjglVersion = providers.gradleProperty("lwjglVersion").get()
 
-// Must match the lwjgl version bundled in that client, or the openxr bindings
-// will not agree with the lwjgl core loaded by the host.
-val lwjglVersion = providers.gradleProperty("lwjglVersion").getOrElse("3.3.2")
+// Set by the release workflow from the git tag. Local builds are "dev".
+val pluginVersion = providers.gradleProperty("pluginVersion").getOrElse("dev")
 
 val lombokVersion = "1.18.30"
 
@@ -69,5 +69,6 @@ tasks.jar {
         "**/module-info.class"
     )
 
-    archiveFileName = "vrgpu.jar"
+    // Name carries both versions: which build it is, and which client it targets.
+    archiveFileName = "vrgpu-$pluginVersion-rl$runeliteVersion.jar"
 }

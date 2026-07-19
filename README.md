@@ -34,8 +34,11 @@ For mod discussion, join the Discord: [https://discord.gg/mguXmu6FKw](https://di
 
 ## Installing
 
-Download `vrgpu.jar` from the [Releases](../../releases) page. There is nothing to clone and nothing
-to compile — this works with your existing RuneLite and does not modify it.
+Download the jar from the [Releases](../../releases) page. There is nothing to clone and nothing to
+compile — this works with your existing RuneLite and does not modify it.
+
+The filename tells you what it is: `vrgpu-0.1.1-rl1.12.33.jar` is VR build 0.1.1, for RuneLite
+client 1.12.33.
 
 Close RuneLite, then open **PowerShell** (Start menu → type "powershell") and run these three steps.
 
@@ -53,7 +56,7 @@ reg add "HKCU\SOFTWARE\Microsoft\DirectX\UserGpuPreferences" /v "$env:LOCALAPPDA
 
 ### Step 2 — Install the plugin
 
-Replace `vrgpu.jar` with the path to where you saved it.
+Replace `vrgpu.jar` with the path to the file you downloaded.
 
 ```powershell
 mkdir -Force "$env:USERPROFILE\.runelite\sideloaded-plugins"
@@ -134,12 +137,16 @@ same sources in place, so there is only ever one copy of the code.
 ./gradlew -p vrgpu-plugin jar
 ```
 
-Produces `vrgpu-plugin/build/libs/vrgpu.jar`, built against the released `net.runelite:client`.
-Override the targets when they drift from the client being shipped against:
+Produces `vrgpu-plugin/build/libs/vrgpu-dev-rl<version>.jar`. The client and LWJGL versions it
+targets live in `vrgpu-plugin/gradle.properties`; override them per build when needed:
 
 ```powershell
 ./gradlew -p vrgpu-plugin jar -PruneliteVersion=1.12.33 -PlwjglVersion=3.3.2
 ```
+
+Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml), triggered by
+pushing a `v*` tag. It builds from the tagged commit and opens a **draft** release with the jar and
+`LICENSE` attached, which you then review and publish.
 
 ## License
 
