@@ -141,15 +141,18 @@ Produces `vrgpu-plugin/build/libs/vrgpu-dev-rl<version>.jar`. The client and LWJ
 targets live in `vrgpu-plugin/gradle.properties`; override them per build when needed:
 
 ```powershell
-./gradlew -p vrgpu-plugin jar -PruneliteVersion=1.12.33 -PlwjglVersion=3.3.2
+./gradlew -p vrgpu-plugin jar "-PruneliteVersion=1.12.33" "-PlwjglVersion=3.3.2"
 ```
 
 To build a jar for a release, pass the version so the filename is right, then attach it to a new
 GitHub release along with `LICENSE`:
 
 ```powershell
-./gradlew -p vrgpu-plugin jar -PpluginVersion=0.1.1
+./gradlew -p vrgpu-plugin jar "-PpluginVersion=0.1.1"
 ```
+
+Quote the `-P` arguments — PowerShell otherwise splits them at the dots in the version number and
+Gradle reads the fragments as task names.
 
 ## License
 
