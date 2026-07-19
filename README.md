@@ -144,9 +144,12 @@ targets live in `vrgpu-plugin/gradle.properties`; override them per build when n
 ./gradlew -p vrgpu-plugin jar -PruneliteVersion=1.12.33 -PlwjglVersion=3.3.2
 ```
 
-Releases are built by [`.github/workflows/release.yml`](.github/workflows/release.yml), triggered by
-pushing a `v*` tag. It builds from the tagged commit and opens a **draft** release with the jar and
-`LICENSE` attached, which you then review and publish.
+To build a jar for a release, pass the version so the filename is right, then attach it to a new
+GitHub release along with `LICENSE`:
+
+```powershell
+./gradlew -p vrgpu-plugin jar -PpluginVersion=0.1.1
+```
 
 ## License
 
