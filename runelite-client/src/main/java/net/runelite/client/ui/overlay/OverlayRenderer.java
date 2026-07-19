@@ -51,10 +51,10 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.KeyCode;
 import net.runelite.api.events.BeforeRender;
-import net.runelite.api.events.ClientTick;
+import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.FocusChanged;
-import net.runelite.api.gameval.InterfaceID;
-import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.PostMenuSort;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetItem;
 import net.runelite.client.chat.ChatMessageManager;
@@ -78,13 +78,8 @@ import org.slf4j.MarkerFactory;
 public class OverlayRenderer extends MouseAdapter
 {
 	private static final Marker DEDUPLICATE = MarkerFactory.getMarker("DEDUPLICATE");
-	private static final int BORDER = 5;
-	private static final int BORDER_TOP = BORDER + 15;
 	private static final int PADDING = 2;
 	private static final int OVERLAY_RESIZE_TOLERANCE = 5;
-	private static final Dimension SNAP_CORNER_SIZE = new Dimension(80, 80);
-	private static final Color SNAP_CORNER_COLOR = new Color(0, 255, 255, 50);
-	private static final Color SNAP_CORNER_ACTIVE_COLOR = new Color(0, 255, 0, 100);
 	private static final Color MOVING_OVERLAY_COLOR = new Color(255, 255, 0, 100);
 	private static final Color MOVING_OVERLAY_ACTIVE_COLOR = new Color(255, 255, 0, 200);
 	private static final Color MOVING_OVERLAY_TARGET_COLOR = Color.RED;
@@ -96,6 +91,7 @@ public class OverlayRenderer extends MouseAdapter
 	private final ClientUI clientUI;
 	private final EventBus eventBus;
 	private final ChatMessageManager chatMessageManager;
+	private final SnapCorners snapCorners;
 
 	private Font font, tooltipFont, interfaceFont;
 
@@ -112,7 +108,6 @@ public class OverlayRenderer extends MouseAdapter
 	private Overlay curHoveredOverlay; // for building menu entries
 	private Overlay lastHoveredOverlay; // for off-thread access
 
-	private final SnapCorners snapCorners = new SnapCorners();
 	private boolean dragWarn;
 
 	@Inject
@@ -124,7 +119,8 @@ public class OverlayRenderer extends MouseAdapter
 		final KeyManager keyManager,
 		final ClientUI clientUI,
 		final EventBus eventBus,
-		final ChatMessageManager chatMessageManager
+		final ChatMessageManager chatMessageManager,
+		final SnapCorners snapCorners
 	)
 	{
 		this.client = client;
@@ -133,6 +129,7 @@ public class OverlayRenderer extends MouseAdapter
 		this.clientUI = clientUI;
 		this.eventBus = eventBus;
 		this.chatMessageManager = chatMessageManager;
+		this.snapCorners = snapCorners;
 
 		HotkeyListener hotkeyListener = new HotkeyListener(runeLiteConfig::dragHotkey)
 		{
@@ -140,6 +137,12 @@ public class OverlayRenderer extends MouseAdapter
 			public void hotkeyPressed()
 			{
 				inOverlayManagingMode = true;
+				snapCorners.getSnapCorners().forEach(s ->
+				{
+					s.overlay = s.new CornerOverlay();
+					overlayManager.saveOverlay(s.overlay); // avoid loadOverlay moving the overlay
+					overlayManager.add(s.overlay);
+				});
 			}
 
 			@Override
@@ -148,6 +151,12 @@ public class OverlayRenderer extends MouseAdapter
 				if (inOverlayManagingMode)
 				{
 					inOverlayManagingMode = false;
+					snapCorners.getSnapCorners().forEach(s ->
+					{
+						overlayManager.remove(s.overlay);
+						s.overlay = null;
+						snapCorners.saveSnapcorner(s);
+					});
 					resetOverlayManagementMode();
 				}
 			}
@@ -174,7 +183,16 @@ public class OverlayRenderer extends MouseAdapter
 	}
 
 	@Subscribe
-	protected void onClientTick(ClientTick t)
+	private void onMenuOpened(MenuOpened event)
+	{
+		if (client.isKeyPressed(KeyCode.KC_SHIFT) && curHoveredOverlay != null)
+		{
+			overlayManager.addOriginMenu(curHoveredOverlay);
+		}
+	}
+
+	@Subscribe
+	protected void onPostMenuSort(PostMenuSort event)
 	{
 		lastHoveredOverlay = curHoveredOverlay;
 
@@ -201,7 +219,7 @@ public class OverlayRenderer extends MouseAdapter
 		{
 			OverlayMenuEntry overlayMenuEntry = menuEntries.get(i);
 
-			client.createMenuEntry(-1)
+			client.createMenuEntry(-2)
 				.setOption(overlayMenuEntry.getOption())
 				.setTarget(ColorUtil.wrapWithColorTag(overlayMenuEntry.getTarget(), JagexColors.MENU_TARGET))
 				.setType(overlayMenuEntry.getMenuAction())
@@ -217,6 +235,15 @@ public class OverlayRenderer extends MouseAdapter
 		if (client.getGameState() == GameState.LOGGED_IN)
 		{
 			positionSnapcorners();
+		}
+	}
+
+	@Subscribe
+	private void onCommandExecuted(CommandExecuted evt)
+	{
+		if (evt.getCommand().equals("resetanchors"))
+		{
+			snapCorners.reset();
 		}
 	}
 
@@ -253,21 +280,6 @@ public class OverlayRenderer extends MouseAdapter
 
 		OverlayUtil.setGraphicProperties(graphics);
 
-		// Draw snap corners
-		if (inOverlayDraggingMode && layer == OverlayLayer.UNDER_WIDGETS && currentManagedOverlay != null && currentManagedOverlay.isSnappable())
-		{
-			final Color previous = graphics.getColor();
-
-			for (SnapCorner snapCorner : snapCorners.getSnapCorners())
-			{
-				Rectangle corner = snapCorner.corner(SNAP_CORNER_SIZE);
-				graphics.setColor(corner.contains(mousePosition) ? SNAP_CORNER_ACTIVE_COLOR : SNAP_CORNER_COLOR);
-				graphics.fill(corner);
-			}
-
-			graphics.setColor(previous);
-		}
-
 		// Save graphics2d properties so we can restore them later
 		final AffineTransform transform = graphics.getTransform();
 		final Stroke stroke = graphics.getStroke();
@@ -284,12 +296,12 @@ public class OverlayRenderer extends MouseAdapter
 		final Rectangle clip = clipBounds(layer);
 		graphics.setClip(clip);
 
+		final Point location = new Point();
 		for (Overlay overlay : overlays)
 		{
 			final OverlayPosition overlayPosition = getCorrectedOverlayPosition(overlay);
 			final Rectangle bounds = overlay.getBounds();
 			final Point preferredLocation = overlay.getPreferredLocation();
-			Point location;
 			SnapCorner snapCorner = null;
 
 			// If the final position is not modified, layout it
@@ -297,15 +309,19 @@ public class OverlayRenderer extends MouseAdapter
 				&& overlayPosition != OverlayPosition.DETACHED && preferredLocation == null)
 			{
 				snapCorner = snapCorners.forPosition(overlayPosition);
-				location = snapCorner.getNextDrawPosition(bounds);
+				snapCorner.getNextDrawPosition(bounds, location);
+			}
+			else if (preferredLocation != null)
+			{
+				overlayManager.computeAbsolutePosition(overlay.getOrigin(), overlay.getOriginX(), overlay.getOriginY(), overlay.getPreferredLocation(), location);
 			}
 			else
 			{
-				location = preferredLocation != null ? preferredLocation : bounds.getLocation();
+				location.setLocation(bounds.x, bounds.y);
 			}
 
 			// Clamp the overlay position to ensure it is on screen or within parent bounds
-			location = clampOverlayLocation(location.x, location.y, bounds.width, bounds.height, overlay);
+			clampOverlayLocation(location.x, location.y, bounds.width, bounds.height, overlay.getParentBounds(), location);
 
 			if (overlay.getPreferredSize() != null)
 			{
@@ -364,7 +380,10 @@ public class OverlayRenderer extends MouseAdapter
 
 				if (!client.isMenuOpen() && !client.isWidgetSelected() && bounds.contains(mousePosition))
 				{
-					curHoveredOverlay = overlay;
+					if (curHoveredOverlay == null || bounds.width * bounds.height <= curHoveredOverlay.getBounds().width * curHoveredOverlay.getBounds().height)
+					{
+						curHoveredOverlay = overlay;
+					}
 					overlay.onMouseOver();
 				}
 			}
@@ -559,8 +578,6 @@ public class OverlayRenderer extends MouseAdapter
 			final int minOverlaySize = currentManagedOverlay.getMinimumSize();
 			final int widthOverflow = Math.max(0, minOverlaySize - width);
 			final int heightOverflow = Math.max(0, minOverlaySize - height);
-			final int dx = x - originalX;
-			final int dy = y - originalY;
 
 			// If this resize operation would cause the dimensions to go below the minimum width/height, reset the
 			// dimensions and adjust the x/y position accordingly as needed
@@ -568,7 +585,7 @@ public class OverlayRenderer extends MouseAdapter
 			{
 				width = minOverlaySize;
 
-				if (dx > 0)
+				if (x > originalX)
 				{
 					x -= widthOverflow;
 				}
@@ -577,7 +594,7 @@ public class OverlayRenderer extends MouseAdapter
 			{
 				height = minOverlaySize;
 
-				if (dy > 0)
+				if (y > originalY)
 				{
 					y -= heightOverflow;
 				}
@@ -586,9 +603,10 @@ public class OverlayRenderer extends MouseAdapter
 			currentManagedBounds.setRect(x, y, width, height);
 			currentManagedOverlay.setPreferredSize(new Dimension(currentManagedBounds.width, currentManagedBounds.height));
 
-			if (currentManagedOverlay.getPreferredLocation() != null)
+			Point l = currentManagedOverlay.getPreferredLocation();
+			if (l != null)
 			{
-				currentManagedOverlay.setPreferredLocation(currentManagedBounds.getLocation());
+				l.translate(x - originalX, y -  originalY);
 			}
 		}
 		else if (inOverlayDraggingMode)
@@ -598,9 +616,21 @@ public class OverlayRenderer extends MouseAdapter
 
 			// Clamp drag to parent component
 			final Rectangle overlayBounds = currentManagedOverlay.getBounds();
-			overlayPosition = clampOverlayLocation(overlayPosition.x, overlayPosition.y, overlayBounds.width, overlayBounds.height, currentManagedOverlay);
+			clampOverlayLocation(overlayPosition.x, overlayPosition.y, overlayBounds.width, overlayBounds.height, currentManagedOverlay.getParentBounds(), overlayPosition);
+
+			if (currentManagedOverlay.getOrigin() == OverlayOrigin.AUTO)
+			{
+				// Compute the new origins for the overlay
+				overlayManager.computeOverlayOrigins(currentManagedOverlay, overlayPosition.x, overlayPosition.y, overlayBounds.width, overlayBounds.height);
+			}
+
+			// Compute new relative position
+			overlayPosition = overlayManager.computeOriginPosition(overlayPosition, currentManagedOverlay.getOrigin(), currentManagedOverlay.getOriginX(), currentManagedOverlay.getOriginY());
+
 			currentManagedOverlay.setPreferredPosition(null);
 			currentManagedOverlay.setPreferredLocation(overlayPosition);
+
+			currentManagedOverlay.onDrag();
 		}
 		else
 		{
@@ -643,7 +673,7 @@ public class OverlayRenderer extends MouseAdapter
 		{
 			for (SnapCorner snapCorner : snapCorners.getSnapCorners())
 			{
-				if (snapCorner.corner(SNAP_CORNER_SIZE).contains(mousePosition))
+				if (snapCorner.corner().contains(mousePosition))
 				{
 					OverlayPosition position = snapCorner.position;
 
@@ -653,15 +683,31 @@ public class OverlayRenderer extends MouseAdapter
 						position = null;
 					}
 
+					if (overlayManager.cycleCheck(currentManagedOverlay, OverlayOrigin.AUTO, position))
+					{
+						// the only overlays which can be used as origins are widget overlays & snap corners, but
+						// snap corners can't be put into other snapcorners.
+						assert currentManagedOverlay instanceof WidgetOverlays.WidgetOverlay;
+						chatMessageManager.queue(QueuedMessage.builder()
+							.type(ChatMessageType.CONSOLE)
+							.runeLiteFormattedMessage("The origin of this anchor is already linked to this overlay, either directly, or indirectly through multiple other overlays. " +
+								"Introducing a circular dependency is not permitted.")
+							.build());
+						break;
+					}
+
 					currentManagedOverlay.setPreferredPosition(position);
 					currentManagedOverlay.setPreferredLocation(null); // from dragging
+					currentManagedOverlay.setOrigin(OverlayOrigin.AUTO);
+					currentManagedOverlay.setOriginX(OverlayOriginX.LEFT);
+					currentManagedOverlay.setOriginY(OverlayOriginY.TOP);
 					currentManagedOverlay.revalidate();
 					break;
 				}
 			}
 		}
 
-		if (inOverlayDraggingMode && currentManagedOverlay instanceof WidgetOverlay && !dragWarn)
+		if (inOverlayDraggingMode && currentManagedOverlay instanceof WidgetOverlays.WidgetOverlay && !dragWarn)
 		{
 			dragWarn = true;
 			chatMessageManager.queue(QueuedMessage.builder()
@@ -773,83 +819,32 @@ public class OverlayRenderer extends MouseAdapter
 		clientUI.setCursor(clientUI.getDefaultCursor());
 	}
 
-	private Widget getViewportLayer()
-	{
-		if (client.isResized())
-		{
-			if (client.getVarbitValue(VarbitID.RESIZABLE_STONE_ARRANGEMENT) == 1)
-			{
-				return client.getWidget(InterfaceID.ToplevelPreEoc.HUD_CONTAINER_FRONT);
-			}
-			else
-			{
-				return client.getWidget(InterfaceID.ToplevelOsrsStretch.HUD_CONTAINER_FRONT);
-			}
-		}
-		return client.getWidget(InterfaceID.Toplevel.OVERLAY_HUD);
-	}
-
 	private void positionSnapcorners()
 	{
-		final Widget viewportWidget = getViewportLayer();
-		final Rectangle viewportBounds = viewportWidget != null ? viewportWidget.getBounds() : new Rectangle();
-		final boolean isResizeable = client.isResized();
-		final Widget chatbox = client.getWidget(InterfaceID.Chatbox.CHATAREA);
-		final boolean chatboxHidden = chatbox == null || chatbox.isHidden();
-		final Rectangle chatboxBounds = chatbox != null ? chatbox.getBounds() : new Rectangle();
-
-		snapCorners.topLeft.setPosition(
-			viewportBounds.x + BORDER,
-			viewportBounds.y + BORDER_TOP);
-
-		snapCorners.topCenter.setPosition(
-			viewportBounds.x + viewportBounds.width / 2,
-			viewportBounds.y + BORDER
-		);
-
-		snapCorners.topRight.setPosition(
-			viewportBounds.x + viewportBounds.width - BORDER,
-			viewportBounds.y + BORDER);
-
-		int bottomLeftX = viewportBounds.x + BORDER;
-		int bottomLeftY = viewportBounds.y + viewportBounds.height - BORDER;
-		// Check to see if chat box is minimized
-		if (isResizeable && chatboxHidden)
+		var location = new Point();
+		for (SnapCorner s : snapCorners.getSnapCorners())
 		{
-			bottomLeftY += chatboxBounds.height;
-		}
-		snapCorners.bottomLeft.setPosition(bottomLeftX, bottomLeftY);
-
-		snapCorners.bottomRight.setPosition(
-			viewportBounds.x + viewportBounds.width - BORDER,
-			viewportBounds.y + viewportBounds.height - BORDER);
-
-		if (isResizeable)
-		{
-			snapCorners.aboveChatboxRight.setPosition(viewportBounds.x + chatboxBounds.width - BORDER, bottomLeftY);
-			snapCorners.canvasTopRight.setPosition((int) client.getRealDimensions().getWidth(), 0);
-		}
-		else
-		{
-			snapCorners.aboveChatboxRight.setPosition(snapCorners.bottomRight.getPositionX(), snapCorners.bottomRight.getPositionY());
-			snapCorners.canvasTopRight.setPosition(snapCorners.topRight.getPositionX(), snapCorners.topRight.getPositionY());
+			location.setLocation(s.curx, s.cury); // relative x,y of align corner
+			overlayManager.computeAbsolutePosition(OverlayOrigin.MANUAL, s.originX, s.originY, location, location);
+			int cx = location.x, cy = location.y; // absolute x,y of the align corner
+			s.translateOffsetForAlignment(location);
+			int ax = location.x, ay = location.y; // absolute x,y of the top-left corner
+			clampOverlayLocation(ax, ay, s.lastsx, s.lastsy, null, location);
+			// apply clamp delta to aligned corner
+			cx += location.x - ax;
+			cy += location.y - ay;
+			s.setPosition(cx, cy);
 		}
 	}
 
 	/**
 	 * Adjust the given overlay position to be within its parent's bounds.
 	 *
-	 * @param overlayX
-	 * @param overlayY
-	 * @param overlayWidth
-	 * @param overlayHeight
-	 * @param overlay       the overlay
-	 * @return the clamped position
+	 * @param out the clamped position
 	 */
-	private Point clampOverlayLocation(int overlayX, int overlayY, int overlayWidth, int overlayHeight, Overlay overlay)
+	private void clampOverlayLocation(int overlayX, int overlayY, int overlayWidth, int overlayHeight, Rectangle parentBounds, Point out)
 	{
 		int px, py, pw, ph;
-		Rectangle parentBounds = overlay.getParentBounds();
 		if (parentBounds == null || parentBounds.isEmpty())
 		{
 			// If no bounds are set, use the full client bounds
@@ -867,7 +862,7 @@ public class OverlayRenderer extends MouseAdapter
 		}
 
 		// Constrain overlay position to be within the parent bounds
-		return new Point(
+		out.setLocation(
 			Ints.constrainToRange(overlayX, px,
 				Math.max(px, px + pw - overlayWidth)),
 			Ints.constrainToRange(overlayY, py,
