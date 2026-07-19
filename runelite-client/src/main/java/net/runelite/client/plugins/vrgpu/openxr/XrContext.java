@@ -59,6 +59,8 @@ import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 
+import static org.lwjgl.opengl.GL11C.GL_RENDERER;
+import static org.lwjgl.opengl.GL11C.glGetString;
 import static org.lwjgl.openxr.KHROpenGLEnable.XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR;
 import static org.lwjgl.openxr.KHROpenGLEnable.XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR;
 import static org.lwjgl.openxr.KHROpenGLEnable.xrGetOpenGLGraphicsRequirementsKHR;
@@ -433,7 +435,22 @@ public class XrContext
 				.systemId(systemId);
 
 			PointerBuffer pp = stack.mallocPointer(1);
-			checkXr("xrCreateSession", xrCreateSession(instance, sessionInfo, pp));
+			int result = xrCreateSession(instance, sessionInfo, pp);
+			if (result == XR_ERROR_GRAPHICS_DEVICE_INVALID)
+			{
+				// The runtime can only present from the GPU the headset is wired to. Which
+				// adapter we get is decided by Windows when the process starts, so there is
+				// nothing to fix from in here -- the user has to set it per-executable.
+				throw new RuntimeException(
+					"OpenXR rejected the graphics device: the game is rendering on \""
+						+ glGetString(GL_RENDERER) + "\", which is not the GPU your headset is"
+						+ " connected to. This is usual on laptops with switchable graphics,"
+						+ " where the process defaults to the integrated GPU. Set the executable"
+						+ " running RuneLite to \"High performance\" under Windows Settings >"
+						+ " System > Display > Graphics (and in the NVIDIA Control Panel's"
+						+ " Program Settings if Windows is overridden there), then restart.");
+			}
+			checkXr("xrCreateSession", result);
 			session = new XrSession(pp.get(0), instance);
 		}
 	}
